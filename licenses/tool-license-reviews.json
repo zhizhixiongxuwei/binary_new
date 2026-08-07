@@ -1,0 +1,93 @@
+{
+  "schemaVersion": 1,
+  "purpose": "BinaryScan release-distribution compliance; not sample license analysis",
+  "reviewedAt": "2026-08-02",
+  "tools": [
+    {
+      "name": "libarchive",
+      "license": "BSD-2-Clause",
+      "evidence": ["https://github.com/libarchive/libarchive/blob/master/COPYING"],
+      "decision": "redistribution-permitted",
+      "requirements": ["include upstream license text", "retain copyright notices"]
+    },
+    {
+      "name": "seven_zip",
+      "license": "mixed: LGPL-2.1-or-later, BSD-3-Clause, unRAR restriction",
+      "evidence": ["https://www.7-zip.org/license.txt"],
+      "decision": "redistribution-permitted-with-conditions",
+      "requirements": ["include every applicable license", "do not use restricted unRAR code to recreate a RAR compressor", "publish modifications to LGPL-covered code when required"]
+    },
+    {
+      "name": "ghidra",
+      "license": "Apache-2.0 with bundled third-party notices",
+      "evidence": ["https://github.com/NationalSecurityAgency/ghidra/blob/master/LICENSE", "https://github.com/NationalSecurityAgency/ghidra/blob/master/NOTICE", "https://github.com/NationalSecurityAgency/ghidra/tree/master/licenses"],
+      "decision": "redistribution-permitted-with-notices",
+      "requirements": ["include LICENSE", "include NOTICE", "include Ghidra third-party license bundle unchanged"]
+    },
+    {
+      "name": "jdk",
+      "license": "distribution-specific",
+      "decision": "distribution-selection-required",
+      "requirements": ["record the selected JDK distribution", "include its license and notices", "review cryptography and font/native-library notices"]
+    },
+    {
+      "name": "vineflower",
+      "license": "Apache-2.0",
+      "evidence": ["https://github.com/Vineflower/vineflower/blob/master/LICENSE.md"],
+      "decision": "redistribution-permitted-with-notices",
+      "requirements": ["include LICENSE", "include NOTICE when present"]
+    },
+    {
+      "name": "cfr",
+      "license": "MIT",
+      "evidence": ["https://github.com/leibnitz27/cfr/blob/master/LICENSE"],
+      "decision": "redistribution-permitted",
+      "requirements": ["include copyright and permission notice"]
+    },
+    {
+      "name": "jadx",
+      "license": "Apache-2.0 with bundled dependencies",
+      "evidence": ["https://github.com/skylot/jadx/blob/master/LICENSE"],
+      "decision": "redistribution-permitted-with-notices",
+      "requirements": ["include LICENSE", "include NOTICE and dependency notices from the selected distribution"]
+    },
+    {
+      "name": "trivy",
+      "license": "Apache-2.0 with bundled dependencies",
+      "decision": "redistribution-permitted-with-notices",
+      "requirements": ["include LICENSE", "include upstream dependency notices from the selected release"]
+    },
+    {
+      "name": "sleuthkit",
+      "license": "mixed",
+      "decision": "distribution-review-required-after-version-selection",
+      "requirements": ["include COPYING and licenses for bundled libraries", "record the exact source revision"]
+    },
+    {
+      "name": "squashfs_tools",
+      "license": "GPL-2.0-or-later",
+      "decision": "redistribution-permitted-with-corresponding-source",
+      "requirements": ["include GPL text", "include corresponding source or a compliant written offer", "include build and modification information"]
+    },
+    {
+      "name": "uncompyle6",
+      "license": "GPL-3.0-only",
+      "evidence": ["https://github.com/rocky/python-uncompyle6/blob/master/COPYING"],
+      "decision": "redistribution-permitted-with-corresponding-source",
+      "requirements": ["include GPLv3 text", "include corresponding source", "include installation information when legally required"]
+    },
+    {
+      "name": "pycdc",
+      "license": "GPL-3.0-only",
+      "evidence": ["https://github.com/zrax/pycdc/blob/master/LICENSE"],
+      "decision": "redistribution-permitted-with-corresponding-source",
+      "requirements": ["include GPLv3 text", "include corresponding source and local patches", "include reproducible build instructions"]
+    },
+    {
+      "name": "rardecode",
+      "license": "BSD-2-Clause",
+      "decision": "redistribution-permitted",
+      "requirements": ["include upstream license text"]
+    }
+  ]
+}

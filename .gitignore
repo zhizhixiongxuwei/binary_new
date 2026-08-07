@@ -1,0 +1,11 @@
+.DS_Store
+.env
+bin/
+dist/
+release/
+runtime/
+web/dist/
+web/node_modules
+web/coverage/
+web/playwright-report*/
+web/test-results*/

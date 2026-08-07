@@ -1,0 +1,129 @@
+name: binaryscan
+
+x-product-service: &product-service
+  platform: ${BINARYSCAN_PLATFORM:-linux/amd64}
+  restart: unless-stopped
+  init: true
+  read_only: true
+  user: "10001:10001"
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  networks:
+    - binaryscan
+  volumes:
+    - binaryscan-data:/data
+    - ./config/app.yaml:/etc/binaryscan/app.yaml:ro
+  secrets:
+    - mysql_app_password
+  environment:
+    BINARYSCAN_CONFIG_FILE: /etc/binaryscan/app.yaml
+    BINARYSCAN_LOG_LEVEL: ${BINARYSCAN_LOG_LEVEL:-info}
+  tmpfs:
+    - /tmp:rw,nosuid,nodev,noexec,size=512m,mode=1777
+  stop_grace_period: 45s
+
+services:
+  mysql:
+    platform: ${BINARYSCAN_PLATFORM:-linux/amd64}
+    image: ${BINARYSCAN_MYSQL_IMAGE:-mysql:9.7.1}
+    restart: unless-stopped
+    networks:
+      - binaryscan
+    volumes:
+      - mysql-data:/var/lib/mysql
+    secrets:
+      - mysql_root_password
+      - mysql_app_password
+    environment:
+      MYSQL_DATABASE: binaryscan
+      MYSQL_USER: binaryscan
+      MYSQL_PASSWORD_FILE: /run/secrets/mysql_app_password
+      MYSQL_ROOT_PASSWORD_FILE: /run/secrets/mysql_root_password
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - mysqladmin ping --host=127.0.0.1 --user=root --password="$$(cat /run/secrets/mysql_root_password)" --silent
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    stop_grace_period: 60s
+
+  app:
+    <<: *product-service
+    image: ${BINARYSCAN_APP_IMAGE:-binaryscan/app:0.1.0}
+    ports:
+      - "127.0.0.1:${BINARYSCAN_HTTP_PORT:-8080}:8080"
+    secrets:
+      - mysql_app_password
+      - initial_admin_password
+    environment:
+      BINARYSCAN_CONFIG_FILE: /etc/binaryscan/app.yaml
+      BINARYSCAN_LOG_LEVEL: ${BINARYSCAN_LOG_LEVEL:-info}
+      BINARYSCAN_INITIAL_ADMIN_PASSWORD_FILE: /run/secrets/initial_admin_password
+    depends_on:
+      mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/binaryscan-supervisor", "healthcheck", "app"]
+      interval: 10s
+      timeout: 8s
+      retries: 12
+      start_period: 20s
+
+  scanner:
+    <<: *product-service
+    image: ${BINARYSCAN_SCANNER_IMAGE:-binaryscan/scanner:0.1.0}
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/binaryscan-supervisor", "healthcheck", "scanner"]
+      interval: 20s
+      timeout: 15s
+      retries: 6
+      start_period: 30s
+
+  java:
+    <<: *product-service
+    image: ${BINARYSCAN_JAVA_IMAGE:-binaryscan/java:0.1.0}
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/binaryscan-worker", "healthcheck", "--role", "bytecode"]
+      interval: 20s
+      timeout: 15s
+      retries: 6
+      start_period: 30s
+
+  ghidra:
+    <<: *product-service
+    image: ${BINARYSCAN_GHIDRA_IMAGE:-binaryscan/ghidra:0.1.0}
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/binaryscan-worker", "healthcheck", "--role", "native"]
+      interval: 20s
+      timeout: 15s
+      retries: 6
+      start_period: 45s
+
+networks:
+  binaryscan:
+    internal: true
+
+volumes:
+  mysql-data:
+  binaryscan-data:
+
+secrets:
+  mysql_root_password:
+    file: ./runtime/secrets/mysql_root_password
+  mysql_app_password:
+    file: ./runtime/secrets/mysql_app_password
+  initial_admin_password:
+    file: ./runtime/secrets/initial_admin_password

@@ -1,0 +1,90 @@
+server:
+  listen: ":8081"
+  trusted_proxies: []
+
+database:
+  driver: mysql
+  host: mysql
+  port: 3306
+  name: binaryscan
+  user: binaryscan
+  password_file: /run/secrets/mysql_app_password
+  max_open_connections: 24
+  max_idle_connections: 8
+
+storage:
+  uploads_root: /data/uploads
+  repository_root: /data/repository
+  task_work_root: /data/task-work
+  min_free_bytes: 1073741824
+
+archive_sandbox:
+  enabled: false
+
+trivy:
+  executable: /usr/local/bin/trivy
+  version: 0.72.0
+  database_root: /opt/trivy-cache
+  max_duration_seconds: 1200
+  termination_grace_seconds: 10
+  max_standard_output_bytes: 1048576
+  max_standard_error_bytes: 1048576
+  max_report_bytes: 67108864
+  max_results: 20000
+  max_findings: 20000
+
+ghidra:
+  executable: /opt/ghidra/support/analyzeHeadless
+  script_directory: /opt/binaryscan/analyzers/ghidra
+  version: 12.1.2
+  java_executable: /opt/java/openjdk/bin/java
+  java_version_line: 'openjdk version "21.0.7" 2025-04-15 LTS'
+  max_duration_seconds: 1200
+  termination_grace_seconds: 10
+  max_standard_output_bytes: 8388608
+  max_standard_error_bytes: 8388608
+  max_index_bytes: 33554432
+  max_output_bytes: 134217728
+  max_functions: 3000
+
+queue:
+  lease_seconds: 60
+  heartbeat_seconds: 10
+  poll_seconds: 2
+  heavy_slots: 1
+  trivy_slots: 1
+  native_slots: 1
+
+limits:
+  max_upload_bytes: 2147483648
+  max_expanded_bytes: 10737418240
+  max_archive_ratio: 50
+  max_depth: 6
+  max_file_nodes: 20000
+  max_nested_images: 3
+
+retention:
+  incomplete_upload_hours: 12
+  sample_days: 15
+
+auth:
+  cookie_secure: false
+  session_ttl_hours: 12
+  login_failure_threshold: 5
+  login_lock_minutes: 15
+  login_rate_limit_threshold: 10
+  login_rate_limit_window_seconds: 60
+  login_rate_limit_block_seconds: 300
+  password_minimum_bytes: 11
+  argon2_memory_kib: 65536
+  argon2_iterations: 3
+  argon2_parallelism: 2
+
+features:
+  raw_sample_download_enabled: false
+
+logging:
+  format: json
+  max_size_mb: 100
+  max_backups: 5
+  max_age_days: 15
