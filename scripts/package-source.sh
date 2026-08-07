@@ -15,6 +15,10 @@ output_directory=${2:-$PROJECT_ROOT/release}
 case "$version" in
 ''|*[!A-Za-z0-9._-]*) fail "version contains unsafe characters" ;;
 esac
+case "$output_directory" in
+/*) ;;
+*) output_directory="$PROJECT_ROOT/$output_directory" ;;
+esac
 
 git -C "$PROJECT_ROOT" rev-parse --verify HEAD >/dev/null 2>&1 ||
 	fail "source repository has no commit to seal"
