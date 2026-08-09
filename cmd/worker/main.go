@@ -184,6 +184,7 @@ func checkAnalyzerRuntimeReady(
 	if kind == string(queue.KindNative) {
 		if err := ghidra.ProbeInstallation(
 			cfg.GhidraExecutable,
+			cfg.GhidraScriptDirectory,
 			cfg.GhidraVersion,
 			cfg.GhidraJavaExecutable,
 			cfg.GhidraJavaVersionLine,

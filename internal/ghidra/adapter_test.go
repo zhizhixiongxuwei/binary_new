@@ -514,10 +514,12 @@ func TestProbeVersionRequiresExactLine(t *testing.T) {
 func TestProbeInstallationUsesMetadataWithoutStartingJava(t *testing.T) {
 	root := t.TempDir()
 	ghidraRoot := filepath.Join(root, "ghidra")
+	scriptDirectory := filepath.Join(root, "scripts")
 	javaRoot := filepath.Join(root, "jdk")
 	for _, directory := range []string{
 		filepath.Join(ghidraRoot, "support"),
 		filepath.Join(ghidraRoot, "Ghidra"),
+		scriptDirectory,
 		filepath.Join(javaRoot, "bin"),
 	} {
 		if err := os.MkdirAll(directory, 0o700); err != nil {
@@ -547,16 +549,31 @@ func TestProbeInstallationUsesMetadataWithoutStartingJava(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(
+		filepath.Join(scriptDirectory, exportScriptFilename),
+		[]byte("// Ghidra export script\n"), 0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
 	if err := ProbeInstallation(
-		ghidraExecutable, "12.1.2", javaExecutable,
+		ghidraExecutable, scriptDirectory, "12.1.2", javaExecutable,
 		`openjdk version "21.0.7" 2025-04-15 LTS`,
 	); err != nil {
 		t.Fatal(err)
 	}
 	if err := ProbeInstallation(
-		ghidraExecutable, "12.1.1", javaExecutable,
+		ghidraExecutable, scriptDirectory, "12.1.1", javaExecutable,
 		`openjdk version "21.0.7" 2025-04-15 LTS`,
 	); err == nil {
 		t.Fatal("ProbeInstallation accepted mismatched Ghidra metadata")
+	}
+	if err := os.Remove(filepath.Join(scriptDirectory, exportScriptFilename)); err != nil {
+		t.Fatal(err)
+	}
+	if err := ProbeInstallation(
+		ghidraExecutable, scriptDirectory, "12.1.2", javaExecutable,
+		`openjdk version "21.0.7" 2025-04-15 LTS`,
+	); err == nil {
+		t.Fatal("ProbeInstallation accepted a missing Ghidra export script")
 	}
 }

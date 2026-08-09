@@ -23,10 +23,12 @@ var javaVersionLinePattern = regexp.MustCompile(
 	`^(?:openjdk|java) version "([^"]+)"(?: ([0-9]{4}-[0-9]{2}-[0-9]{2}))?(?: .*)?$`,
 )
 
-// ProbeInstallation verifies immutable runtime metadata without starting Java.
-// The native worker stays lightweight until it claims a decompilation job.
+// ProbeInstallation verifies immutable runtime metadata and the export script
+// without starting Java. The native worker stays lightweight until it claims a
+// decompilation job.
 func ProbeInstallation(
 	ghidraExecutable string,
+	ghidraScriptDirectory string,
 	expectedGhidraVersion string,
 	javaExecutable string,
 	expectedJavaVersionLine string,
@@ -41,6 +43,9 @@ func ProbeInstallation(
 		if err := verifyExecutableFile(value, name == "Java executable"); err != nil {
 			return fmt.Errorf("%s is invalid: %w", name, err)
 		}
+	}
+	if err := verifyScriptDirectory(ghidraScriptDirectory); err != nil {
+		return fmt.Errorf("Ghidra script directory is invalid: %w", err)
 	}
 	if expectedGhidraVersion == "" || strings.TrimSpace(expectedGhidraVersion) != expectedGhidraVersion {
 		return errors.New("expected Ghidra version is invalid")
@@ -73,6 +78,34 @@ func ProbeInstallation(
 		return errors.New("Java release metadata does not match the configured runtime")
 	}
 	return nil
+}
+
+func verifyScriptDirectory(directory string) error {
+	if !filepath.IsAbs(directory) || filepath.Clean(directory) != directory ||
+		directory == string(filepath.Separator) {
+		return errors.New("path is not canonical and absolute")
+	}
+	info, err := os.Lstat(directory)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("path is not a real directory")
+	}
+	filename := filepath.Join(directory, exportScriptFilename)
+	info, err = os.Lstat(filename)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 ||
+		info.Size() <= 0 || info.Size() > installationMetadataLimit {
+		return errors.New("export script is not a bounded regular file")
+	}
+	file, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	return file.Close()
 }
 
 func verifyExecutableFile(filename string, requireELFAMD64 bool) error {

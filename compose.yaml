@@ -54,6 +54,9 @@ services:
   app:
     <<: *product-service
     image: ${BINARYSCAN_APP_IMAGE:-binaryscan/app:0.1.0}
+    networks:
+      - binaryscan
+      - access
     ports:
       - "127.0.0.1:${BINARYSCAN_HTTP_PORT:-8080}:8080"
     secrets:
@@ -115,6 +118,7 @@ services:
 networks:
   binaryscan:
     internal: true
+  access:
 
 volumes:
   mysql-data:

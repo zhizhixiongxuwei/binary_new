@@ -26,6 +26,8 @@ ARG BINARYSCAN_REVISION
 ARG BINARYSCAN_SOURCE_MANIFEST_SHA256
 USER root
 COPY --from=build --chmod=0555 /out/binaryscan-worker /usr/local/bin/binaryscan-worker
+RUN install -d -m 0555 /opt/binaryscan/analyzers/ghidra \
+    && chmod 0555 /opt/binaryscan /opt/binaryscan/analyzers
 COPY --chmod=0444 analyzers/ghidra/ExportDecompiledFunctions.java /opt/binaryscan/analyzers/ghidra/ExportDecompiledFunctions.java
 COPY --chown=10001:10001 licenses/ /usr/share/licenses/binaryscan/
 ENV HOME=/tmp TMPDIR=/tmp JAVA_HOME=/opt/java/openjdk

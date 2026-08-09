@@ -293,10 +293,12 @@ func TestNativeAnalyzerReadinessRequiresExactGhidraAndJavaVersions(t *testing.T)
 	mock.ExpectPing()
 	root := t.TempDir()
 	ghidraRoot := filepath.Join(root, "ghidra")
+	scriptDirectory := filepath.Join(root, "scripts")
 	javaRoot := filepath.Join(root, "jdk")
 	for _, directory := range []string{
 		filepath.Join(ghidraRoot, "support"),
 		filepath.Join(ghidraRoot, "Ghidra"),
+		scriptDirectory,
 		filepath.Join(javaRoot, "bin"),
 	} {
 		if err := os.MkdirAll(directory, 0o700); err != nil {
@@ -328,8 +330,15 @@ func TestNativeAnalyzerReadinessRequiresExactGhidraAndJavaVersions(t *testing.T)
 	); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(
+		filepath.Join(scriptDirectory, "ExportDecompiledFunctions.java"),
+		[]byte("// Ghidra export script\n"), 0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
 	cfg := testWorkerConfig()
 	cfg.GhidraExecutable = ghidraExecutable
+	cfg.GhidraScriptDirectory = scriptDirectory
 	cfg.GhidraVersion = "12.1.2"
 	cfg.GhidraJavaVersionLine = `openjdk version "21.0.7" 2025-04-15 LTS`
 	cfg.GhidraJavaExecutable = javaExecutable

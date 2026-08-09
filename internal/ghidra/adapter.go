@@ -47,6 +47,7 @@ var (
 const (
 	IndexSchemaVersion          = 3
 	exportScriptContractVersion = 5
+	exportScriptFilename        = "ExportDecompiledFunctions.java"
 	functionTimeoutSeconds      = 60
 	maxDerivedSegments          = 8_192
 	maxDerivedCallEdges         = 1_000_000
@@ -254,7 +255,7 @@ func (a *Adapter) Analyze(ctx context.Context, request Request) (Result, error) 
 		projectDir, "project-" + privateName,
 		"-import", filepath.Join(runRoot, sourceSnapshotName),
 		"-scriptPath", a.config.ScriptDirectory,
-		"-postScript", "ExportDecompiledFunctions.java",
+		"-postScript", exportScriptFilename,
 		filepath.Join(outputDir, "index.json"), outputDir,
 		strconv.Itoa(parameters.MaxFunctions),
 		strconv.FormatInt(parameters.MaxOutputBytes, 10),
