@@ -8,7 +8,11 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 require_command docker
 load_settings
-verify_dependency_images
+verify_image "$BINARYSCAN_BUILDER_IMAGE" ""
+verify_image "$BINARYSCAN_MYSQL_IMAGE" ""
+verify_image "$BINARYSCAN_TRIVY_RUNTIME_DB_IMAGE" ""
+verify_image "$BINARYSCAN_JAVA_RUNTIME_IMAGE" ""
+verify_image "$BINARYSCAN_GHIDRA_RUNTIME_IMAGE" ""
 
 image_id() {
 	docker image inspect "$1" --format '{{.Id}}' 2>/dev/null ||

@@ -16,6 +16,25 @@
 
 系统没有 Trivy 数据库上传、签名、激活、回滚或安装标识流程。数据库更新方式只有一种：更换经过封存的新 `scanner` 基础镜像并重新构建。
 
+项目不实现 license key、授权服务器、有效期、机器码或功能解锁检查。`licenses/` 只保存第三方开源组件的法律告知文件，不参与启动、登录、扫描或反编译流程。
+
+## 制备机生成依赖镜像包
+
+有网络的制备机先加载固定的 Java/Ghidra 工具源镜像，然后运行：
+
+```sh
+./scripts/prepare-dependency-images.sh release/dependency-images
+```
+
+若已有审核过的 Trivy 主库和 Java 库缓存，可避免重复下载：
+
+```sh
+./scripts/prepare-dependency-images.sh \
+  release/dependency-images /path/to/trivy-cache
+```
+
+脚本会准备 Go 1.25/Node 22 离线 builder、MySQL、Trivy 0.72.0 双数据库、Java 工具和 Ghidra 运行时共 5 个依赖镜像，冻结 image ID，并输出带 SHA-256 清单的 `binaryscan-dependency-images.tar`。Java/Ghidra 源镜像名可分别通过 `BINARYSCAN_JAVA_SOURCE_IMAGE` 和 `BINARYSCAN_GHIDRA_SOURCE_IMAGE` 指定。
+
 ## 检测机快速部署
 
 Linux、macOS 或 Windows WSL/Git Bash：

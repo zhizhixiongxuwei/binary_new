@@ -8,7 +8,7 @@
 
 `BINARYSCAN_BUILDER_IMAGE` 必须包含：
 
-- Linux amd64、Go 1.24.x、Node.js 22.x、npm；
+- Linux amd64、Go 1.25.x、Node.js 22.x、npm；
 - `go.sum` 对应的完整 Go module cache；
 - `web/package-lock.json` 对应的完整 npm cache，路径 `/opt/binaryscan/npm-cache`；
 - `go mod download` 和 `npm ci --offline` 在 `--network=none` 下可成功执行；
@@ -32,14 +32,14 @@
 {
   "schema_version": 1,
   "id": "UUIDv4",
-  "version": "2026.08.07",
-  "generated_at": "2026-08-07T00:00:00Z",
+  "version": "2026.08.05",
+  "generated_at": "2026-08-05T00:00:00Z",
   "content_sha256": "64 lowercase hex",
   "databases": [
     {
       "id": "UUIDv4",
       "database_type": "trivy-db",
-      "version": "2026.08.07",
+      "version": "2026.08.05",
       "schema_version": 2,
       "storage_key": "trivy/db/versions/<uuid>",
       "files": []
@@ -47,7 +47,7 @@
     {
       "id": "UUIDv4",
       "database_type": "trivy-java-db",
-      "version": "2026.08.07",
+      "version": "2026.08.05",
       "schema_version": 1,
       "storage_key": "trivy/java-db/versions/<uuid>",
       "files": []
