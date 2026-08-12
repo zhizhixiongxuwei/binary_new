@@ -1,0 +1,44 @@
+server:
+  port: 8080
+  shutdown: graceful
+  error:
+    include-message: never
+  tomcat:
+    max-swallow-size: 134217728
+
+spring:
+  application:
+    name: java-checker
+  jackson:
+    deserialization:
+      fail-on-unknown-properties: true
+  servlet:
+    multipart:
+      enabled: true
+      file-size-threshold: 0
+      location: /tmp
+      max-file-size: 128MB
+      max-request-size: 146MB
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: never
+
+java-checker:
+  limits:
+    max-source-bytes: 134217728
+    max-files: 3000
+    max-file-bytes: 8388608
+    max-findings: 10000
+    max-diagnostics: 1000
+    max-snippet-bytes: 1024
+    max-response-bytes: 33554432
+    analysis-timeout: 10m
+    force-kill-grace: 2s
