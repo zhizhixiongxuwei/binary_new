@@ -1,22 +1,94 @@
 <script setup lang="ts">
-import { AlertTriangle, Upload } from 'lucide-vue-next'
-import { shallowRef } from 'vue'
-import { useRouter } from 'vue-router'
+import { Replace } from 'lucide-vue-next'
+import {
+  computed,
+  onScopeDispose,
+  shallowRef,
+  watch,
+} from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 
+import type { InputCategory } from '@/api/types'
 import PageHeader from '@/components/common/PageHeader.vue'
-import FileDropzone from '@/components/uploads/FileDropzone.vue'
-import SupportedUploadTypes from '@/components/uploads/SupportedUploadTypes.vue'
-import UploadQueue from '@/components/uploads/UploadQueue.vue'
-import { useChunkUpload } from '@/composables/useChunkUpload'
+import TaskInputCategoryDialog from '@/components/tasks/TaskInputCategoryDialog.vue'
+import CategorizedUploadWorkspace from '@/components/uploads/CategorizedUploadWorkspace.vue'
+import { useTaskCreationLauncher } from '@/composables/useTaskCreationLauncher'
 
-const uploads = useChunkUpload()
+const route = useRoute()
 const router = useRouter()
-const warningMessage = shallowRef('')
+const { cancelTaskCreation } = useTaskCreationLauncher()
+const categoryDialogOpen = shallowRef(false)
+const categoryLocked = shallowRef(false)
+let navigationGeneration = 0
 
-function addFiles(files: File[]): void {
-  const rejected = uploads.addFiles(files)
-  warningMessage.value = rejected.join('；')
+const routeCategory = computed<InputCategory | null>(() => {
+  const value = route.query.category
+  return value === 'binary' || value === 'archive' || value === 'container'
+    ? value
+    : null
+})
+const category = shallowRef<InputCategory | null>(routeCategory.value)
+
+watch(
+  routeCategory,
+  (value) => {
+    if (
+      categoryLocked.value &&
+      category.value !== null &&
+      value !== category.value
+    ) {
+      const protectedCategory = category.value
+      const requestGeneration = ++navigationGeneration
+      void router
+        .replace({
+          name: 'task-create',
+          query: { ...route.query, category: protectedCategory },
+        })
+        .catch(() => {
+          if (requestGeneration === navigationGeneration) {
+            categoryDialogOpen.value = false
+          }
+        })
+      return
+    }
+    if (value !== category.value) categoryLocked.value = false
+    category.value = value
+    categoryDialogOpen.value = value === null
+  },
+  { immediate: true },
+)
+
+async function selectCategory(value: InputCategory): Promise<void> {
+  if (categoryLocked.value && category.value !== null) return
+  const requestGeneration = ++navigationGeneration
+  try {
+    await router.replace({
+      name: 'task-create',
+      query: { ...route.query, category: value },
+    })
+  } catch {
+    if (requestGeneration === navigationGeneration) {
+      categoryDialogOpen.value = true
+    }
+  }
 }
+
+function requestCategoryChange(): void {
+  if (categoryLocked.value) return
+  categoryDialogOpen.value = true
+}
+
+function cancelCategorySelection(): void {
+  if (category.value === null) {
+    void cancelTaskCreation()
+    return
+  }
+  categoryDialogOpen.value = false
+}
+
+onScopeDispose(() => {
+  navigationGeneration += 1
+})
 </script>
 
 <template>
@@ -24,110 +96,30 @@ function addFiles(files: File[]): void {
     <PageHeader title="新建任务" eyebrow="TASKS / CREATE">
       <template #actions>
         <el-button
-          type="primary"
-          :icon="Upload"
-          :loading="uploads.isUploading.value"
-          :disabled="uploads.readyCount.value === 0"
-          @click="uploads.startAll"
+          v-if="category"
+          :icon="Replace"
+          :disabled="categoryLocked"
+          @click="requestCategoryChange"
         >
-          开始上传
+          更换类别
         </el-button>
       </template>
     </PageHeader>
 
-    <section class="upload-workspace surface-panel">
-      <div class="upload-workspace__header">
-        <h2>待检测文件</h2>
-        <span class="mono" aria-live="polite">
-          {{ uploads.queue.value.length }} 个文件
-        </span>
-      </div>
-      <div class="upload-workspace__body">
-        <SupportedUploadTypes />
-        <div v-if="warningMessage" class="upload-warning" role="alert">
-          <AlertTriangle :size="16" aria-hidden="true" />
-          <span>{{ warningMessage }}</span>
-        </div>
-        <FileDropzone @selected="addFiles" />
-        <UploadQueue
-          v-if="uploads.queue.value.length"
-          :items="uploads.queue.value"
-          :active-id="uploads.activeId.value"
-          @remove="uploads.remove"
-          @pause="uploads.pause"
-          @resume="uploads.uploadItem"
-          @retry="uploads.uploadItem"
-          @open-task="router.push({ name: 'task-detail', params: { id: $event } })"
-        />
-      </div>
-    </section>
+    <CategorizedUploadWorkspace
+      v-if="category"
+      :key="category"
+      :category="category"
+      @lock-change="categoryLocked = $event"
+    />
+
+    <TaskInputCategoryDialog
+      v-model="categoryDialogOpen"
+      :current-category="category"
+      :required="category === null"
+      :locked="categoryLocked"
+      @select="selectCategory"
+      @cancel="cancelCategorySelection"
+    />
   </div>
 </template>
-
-<style scoped>
-.upload-workspace__header {
-  display: flex;
-  min-height: 52px;
-  align-items: center;
-  justify-content: space-between;
-  padding: 0 18px;
-  border-bottom: 1px solid var(--line);
-}
-
-.upload-workspace__header h2 {
-  margin: 0;
-  color: var(--ink-800);
-  font-size: 14px;
-}
-
-.upload-workspace__header span {
-  color: var(--ink-400);
-  font-size: 10px;
-  white-space: nowrap;
-}
-
-.upload-workspace__body {
-  padding: 18px;
-}
-
-.upload-warning {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  margin-bottom: 12px;
-  padding: 9px 12px;
-  border: 1px solid #dfc8a2;
-  border-left: 3px solid var(--amber);
-  border-radius: 4px;
-  color: #7f541b;
-  background: #fffaf1;
-  font-size: 12px;
-}
-
-.upload-warning svg {
-  flex: 0 0 auto;
-  margin-top: 1px;
-}
-
-.upload-warning span {
-  min-width: 0;
-  overflow-wrap: anywhere;
-}
-
-@media (max-width: 620px) {
-  .upload-workspace__header {
-    min-height: 48px;
-    padding: 0 14px;
-  }
-
-  .upload-workspace__body {
-    padding: 14px;
-  }
-}
-
-@media (max-width: 380px) {
-  .upload-workspace__body {
-    padding: 10px;
-  }
-}
-</style>

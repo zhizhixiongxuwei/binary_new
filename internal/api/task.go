@@ -264,6 +264,8 @@ func writeTaskError(c *gin.Context, err error) {
 		WriteError(c, http.StatusNotFound, "task_not_found", "The task or upload was not found.", nil)
 	case errors.Is(err, task.ErrUploadNotCompleted):
 		WriteError(c, http.StatusConflict, "upload_not_completed", "The upload must be completed first.", nil)
+	case errors.Is(err, task.ErrUploadNotEligible):
+		WriteError(c, http.StatusUnprocessableEntity, "upload_not_task_eligible", "The upload is not eligible for direct task creation.", nil)
 	case errors.Is(err, task.ErrConflict):
 		WriteError(c, http.StatusConflict, "task_conflict", "The task conflicts with an existing request.", nil)
 	case errors.Is(err, task.ErrInvalidState):

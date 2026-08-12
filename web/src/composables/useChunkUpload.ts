@@ -5,7 +5,7 @@ import type { UploadSession } from '@/api/types'
 import { sha256Blob } from '@/utils/hash'
 import { createIdempotencyKey } from '@/utils/idempotency'
 
-const MAX_FILE_SIZE = 10 * 1024 ** 3
+const MAX_FILE_SIZE = 2 * 1024 ** 3
 
 export type UploadItemStatus =
   | 'ready'
@@ -156,7 +156,7 @@ export function useChunkUpload() {
     const additions: UploadQueueItem[] = []
     for (const file of files) {
       if (file.size > MAX_FILE_SIZE) {
-        rejected.push(`${file.name} 超过 10 GB`)
+        rejected.push(`${file.name} 超过 2 GiB`)
         continue
       }
       additions.push({
@@ -225,6 +225,7 @@ export function useChunkUpload() {
         filename: item.file.name,
         size: item.file.size,
         content_type: item.file.type || 'application/octet-stream',
+        input_category: 'binary',
       },
       item.localId,
     )
@@ -274,6 +275,7 @@ export function useChunkUpload() {
         throw new UploadStateError('上传会话已取消，请移除后重新选择文件', false)
       }
 
+      let completedSession = session
       if (session.status === 'created' || session.status === 'uploading') {
         const partCount = totalPartCount(initial.file.size, session.part_size)
         for (let partNumber = 1; partNumber <= partCount; partNumber += 1) {
@@ -305,22 +307,26 @@ export function useChunkUpload() {
           return
         }
         stage = 'complete'
-        await api.completeUpload(session.id)
+        completedSession = await api.completeUpload(session.id)
         queue.value = replaceItem(queue.value, localId, {
           serverStatus: 'completed',
         })
       }
 
-      stage = 'task'
-      const task = await api.createTask(
-        { upload_id: session.id, name: initial.file.name },
-        initial.taskIdempotencyKey,
-      )
+      let taskId = completedSession.task_id
+      if (!taskId) {
+        stage = 'task'
+        const task = await api.createTask(
+          { upload_id: session.id, name: initial.file.name },
+          initial.taskIdempotencyKey,
+        )
+        taskId = task.id
+      }
       queue.value = replaceItem(queue.value, localId, {
         status: 'completed',
         progress: 100,
         uploadedBytes: initial.file.size,
-        taskId: task.id,
+        taskId,
         canRetry: false,
       })
     } catch (error) {

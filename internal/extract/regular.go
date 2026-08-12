@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
+	"strings"
 )
 
 const streamBufferSize = 32 << 10
@@ -213,13 +215,22 @@ func (state *operationState) materializeRegular(
 			WorkPath:    tempPath,
 		})
 	}
+	if state.logicalPackage {
+		state.materializedFiles = append(
+			state.materializedFiles,
+			MaterializedFile{
+				LocalID:  state.nodes[index].LocalID,
+				WorkPath: tempPath,
+			},
+		)
+	}
 	retainTemp = true
 	return &materializedRegular{
 		file:      temp,
 		path:      tempPath,
 		nodeIndex: index,
 		size:      written,
-		retained:  retainForContainerScan,
+		retained:  retainForContainerScan || state.logicalPackage,
 		// Scan depth follows archive containment, not the display-tree
 		// parent. Quarantine may move a node to a shorter safe ancestor and
 		// must never reset the recursive extraction limit.
@@ -284,6 +295,9 @@ func (state *operationState) expandMaterializedRegular(
 ) (*limitError, error) {
 	index := materialized.nodeIndex
 	detectedFormat := state.nodes[index].Format
+	if state.logicalPackage && !state.shouldExpandLogicalWrapper(index) {
+		return nil, nil
+	}
 	if !state.engine.Supports(detectedFormat) {
 		if isKnownContainerFormat(detectedFormat) {
 			state.nodes[index].ExtractionStatus = StatusUnsupported
@@ -334,6 +348,52 @@ func (state *operationState) expandMaterializedRegular(
 		return nil, err
 	}
 	return nil, err
+}
+
+func (state *operationState) shouldExpandLogicalWrapper(index int) bool {
+	if index < 0 || index >= len(state.nodes) {
+		return false
+	}
+	node := state.nodes[index]
+	parentFormat := ""
+	if parent := state.nodeByLocalID(node.ParentLocalID); parent != nil {
+		parentFormat = parent.Format
+	}
+	// A member produced by TAR/CPIO is a logical leaf even when it is itself
+	// another archive. This is the boundary that prevents recursive imports.
+	if isTARFamilyFormat(parentFormat) || parentFormat == "cpio" {
+		return false
+	}
+	switch state.rootFormat {
+	case "gzip", "bzip2", "xz", "zstd":
+		return node.ParentLocalID == 0 && isTARFamilyFormat(node.Format)
+	case "rpm":
+		return node.ParentLocalID == 0 && node.Format == "cpio"
+	case "deb":
+		if node.ParentLocalID == 0 {
+			base := path.Base(node.LogicalPath)
+			return (strings.HasPrefix(base, "control.tar") ||
+				strings.HasPrefix(base, "data.tar")) &&
+				isLogicalPackageWrapperFormat(node.Format)
+		}
+		return isLogicalPackageStreamFormat(parentFormat) &&
+			isTARFamilyFormat(node.Format)
+	default:
+		return false
+	}
+}
+
+func isLogicalPackageStreamFormat(format string) bool {
+	switch format {
+	case "gzip", "bzip2", "xz", "zstd", "lzma":
+		return true
+	default:
+		return false
+	}
+}
+
+func isLogicalPackageWrapperFormat(format string) bool {
+	return isLogicalPackageStreamFormat(format) || isTARFamilyFormat(format)
 }
 
 func isKnownContainerFormat(format string) bool {

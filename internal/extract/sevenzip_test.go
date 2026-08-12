@@ -591,7 +591,7 @@ func assertTrustedSevenZipInvocation(
 		t.Fatalf("7zz directories are not isolated siblings: %+v", invocation)
 	}
 	wantPrefix := []string{
-		"x", "-y", "-aoa", "-bd", "-bb0", "-bso0", "-bsp0", "-spf-",
+		"x", "-y", "-aoa", "-bd", "-bb0", "-bso0", "-bsp0",
 		"-o" + invocation.OutputPath,
 		"--",
 	}

@@ -31,6 +31,14 @@ type ExternalArchiveSession interface {
 	Close() error
 }
 
+// ExternalArchiveRootSession pins the sandbox output by descriptor. Linux
+// implementations should provide this instead of asking the consumer to
+// reopen a /proc/self/fd path, whose directory entry is intentionally a
+// symlink even though the descriptor itself names a real directory.
+type ExternalArchiveRootSession interface {
+	OpenOutputRoot() (*os.Root, os.FileInfo, error)
+}
+
 // ExternalArchiveAdapter executes archive tools in an independently confined
 // service. Implementations must stage the source into a read-only sandbox
 // input and expose output through a separate capacity-limited mount.
@@ -97,19 +105,34 @@ func (state *operationState) extractWithArchiveSandbox(
 	defer session.Close()
 
 	outputPath := session.OutputPath()
-	if outputPath == "" || !filepath.IsAbs(outputPath) ||
-		filepath.Clean(outputPath) != outputPath ||
-		outputPath == string(filepath.Separator) {
-		return state.appendCorruptArchiveNode(
-			parentID,
-			prefix,
-			parentDepth+1,
-			format+"_sandbox_output_unsafe",
-			errors.New("archive sandbox returned an unsafe output path"),
-		)
+	var (
+		root            *os.Root
+		info            os.FileInfo
+		descriptorBound bool
+	)
+	if rootSession, ok := session.(ExternalArchiveRootSession); ok {
+		root, info, err = rootSession.OpenOutputRoot()
+		descriptorBound = true
+	} else {
+		if outputPath == "" || !filepath.IsAbs(outputPath) ||
+			filepath.Clean(outputPath) != outputPath ||
+			outputPath == string(filepath.Separator) {
+			err = errors.New("archive sandbox returned an unsafe output path")
+		} else {
+			info, err = os.Lstat(outputPath)
+			if err == nil && (!info.IsDir() || info.Mode()&os.ModeSymlink != 0) {
+				err = errors.New("archive sandbox output root is not a directory")
+			}
+			if err == nil {
+				root, err = os.OpenRoot(outputPath)
+			}
+		}
 	}
-	info, err := os.Lstat(outputPath)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+	if err != nil || root == nil || info == nil || !info.IsDir() ||
+		info.Mode()&os.ModeSymlink != 0 {
+		if root != nil {
+			_ = root.Close()
+		}
 		return state.appendCorruptArchiveNode(
 			parentID,
 			prefix,
@@ -118,21 +141,12 @@ func (state *operationState) extractWithArchiveSandbox(
 			fmt.Errorf("archive sandbox output root is invalid: %w", err),
 		)
 	}
-	root, err := os.OpenRoot(outputPath)
-	if err != nil {
-		return state.appendCorruptArchiveNode(
-			parentID,
-			prefix,
-			parentDepth+1,
-			format+"_sandbox_output_unsafe",
-			err,
-		)
-	}
 	defer root.Close()
 	stage := &sevenZipStage{
-		outputPath: outputPath,
-		outputRoot: root,
-		outputInfo: info,
+		outputPath:            outputPath,
+		outputRoot:            root,
+		outputInfo:            info,
+		outputDescriptorBound: descriptorBound,
 	}
 	maximumEntries := state.engine.limits.MaxNodes - len(state.nodes)
 	first, err := snapshotSevenZipTree(state.ctx, stage, maximumEntries)

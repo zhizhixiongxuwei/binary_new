@@ -7,13 +7,22 @@ import (
 	"fmt"
 	"time"
 
+	"binaryscan/internal/inputcategory"
+
 	"github.com/go-sql-driver/mysql"
 )
 
 type Repository interface {
 	ResolveCreate(context.Context, uint64, string, string, string) (Upload, bool, error)
 	Create(context.Context, Upload, string, string, string) (Upload, bool, error)
+	RecordValidation(context.Context, string, ValidationResult) error
+	SetArchiveImportID(context.Context, string, string) error
+	CreateDerivedCompleted(context.Context, DerivedCompletedRecord) (Upload, bool, error)
 	Get(context.Context, string) (Upload, error)
+	UploadHasTask(context.Context, string) (bool, error)
+	TaskIDForUpload(context.Context, string) (string, bool, error)
+	ListDirectTaskCandidates(context.Context, string, int) ([]DirectTaskCandidate, error)
+	ListArchiveImportCandidates(context.Context, string, int) ([]ArchiveImportCandidate, error)
 	ListParts(context.Context, string) ([]Part, error)
 	InsertPart(context.Context, Part) error
 	PrepareCompletion(context.Context, string, string, int64, string) error
@@ -24,8 +33,10 @@ type Repository interface {
 }
 
 const (
-	maxCreateAttempts      = 3
-	initialCreateRetryWait = 10 * time.Millisecond
+	maxCreateAttempts          = 3
+	initialCreateRetryWait     = 10 * time.Millisecond
+	MaxDirectTaskRecoveryBatch = 1000
+	MaxArchiveRecoveryBatch    = 1000
 )
 
 type MySQLRepository struct {
@@ -151,8 +162,221 @@ INSERT INTO uploads (
 	if err != nil {
 		return Upload{}, false, fmt.Errorf("create upload: %w", err)
 	}
+	if value.IntakeProfile == nil ||
+		value.IntakeProfile.UploadID != value.ID ||
+		value.IntakeProfile.ValidationStatus != ValidationPending ||
+		value.IntakeProfile.SourceKind != SourceDirect {
+		return Upload{}, false, ErrInvalidInput
+	}
+	if _, err := transaction.ExecContext(ctx, `
+INSERT INTO upload_intake_profiles (
+    upload_id, input_category, validation_status, source_kind
+) VALUES (?, ?, 'pending', 'direct')`,
+		value.ID,
+		string(value.IntakeProfile.InputCategory),
+	); err != nil {
+		return Upload{}, false, fmt.Errorf("create upload intake profile: %w", err)
+	}
 	if err := transaction.Commit(); err != nil {
 		return Upload{}, false, fmt.Errorf("commit upload creation: %w", err)
+	}
+	return value, true, nil
+}
+
+func (r *MySQLRepository) CreateDerivedCompleted(
+	ctx context.Context,
+	record DerivedCompletedRecord,
+) (Upload, bool, error) {
+	for attempt := 0; attempt < maxCreateAttempts; attempt++ {
+		stored, created, err := r.createDerivedCompletedOnce(ctx, record)
+		if err == nil {
+			return stored, created, nil
+		}
+		if isDuplicateCreateKey(err) {
+			existing, found, resolveErr := r.resolveDerivedCompleted(
+				ctx,
+				record.Upload.CreatedBy,
+				record.IdempotencyKey,
+				record.RequestFingerprint,
+			)
+			if resolveErr != nil {
+				return Upload{}, false, resolveErr
+			}
+			if found {
+				return existing, false, nil
+			}
+			return Upload{}, false, err
+		}
+		if !isRetryableCreateTransaction(err) || attempt == maxCreateAttempts-1 {
+			return Upload{}, false, err
+		}
+		if err := waitForCreateRetry(ctx, attempt); err != nil {
+			return Upload{}, false, err
+		}
+	}
+	return Upload{}, false, errors.New("derived upload creation exhausted transaction attempts")
+}
+
+func (r *MySQLRepository) createDerivedCompletedOnce(
+	ctx context.Context,
+	record DerivedCompletedRecord,
+) (Upload, bool, error) {
+	value := record.Upload
+	profile := value.IntakeProfile
+	if profile == nil {
+		return Upload{}, false, ErrInvalidInput
+	}
+	transaction, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Upload{}, false, fmt.Errorf("begin derived upload creation transaction: %w", err)
+	}
+	defer transaction.Rollback()
+
+	existing, found, err := findIdempotentCreate(
+		ctx,
+		transaction,
+		value.CreatedBy,
+		archiveEntryCreateOperation,
+		record.IdempotencyKey,
+		record.RequestFingerprint,
+		true,
+	)
+	if err != nil {
+		return Upload{}, false, err
+	}
+	if found {
+		existing, err = getUpload(ctx, transaction, existing.ID)
+		if err != nil {
+			return Upload{}, false, err
+		}
+		if err := transaction.Commit(); err != nil {
+			return Upload{}, false, fmt.Errorf("commit derived upload creation replay: %w", err)
+		}
+		return existing, false, nil
+	}
+
+	if value.BlobID == nil || *value.BlobID == 0 || value.CompletedAt == nil ||
+		value.PartsCleanedAt == nil || profile.ValidatedAt == nil {
+		return Upload{}, false, ErrInvalidInput
+	}
+	var (
+		storedSHA  string
+		storedSize int64
+		blobState  string
+		deletedAt  sql.NullTime
+	)
+	err = transaction.QueryRowContext(ctx, `
+SELECT sha256, size_bytes, state, deleted_at
+FROM blobs
+WHERE id = ?
+LIMIT 1
+FOR UPDATE`, *value.BlobID).Scan(
+		&storedSHA,
+		&storedSize,
+		&blobState,
+		&deletedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Upload{}, false, ErrConflict
+	}
+	if err != nil {
+		return Upload{}, false, fmt.Errorf("lock derived upload blob: %w", err)
+	}
+	if storedSHA != value.ActualSHA256 || storedSize != value.DeclaredSize ||
+		blobState != "available" || deletedAt.Valid {
+		return Upload{}, false, ErrConflict
+	}
+
+	result, err := transaction.ExecContext(ctx, `
+UPDATE blobs
+SET reference_count = reference_count + 1
+WHERE id = ?
+  AND state = 'available'
+  AND deleted_at IS NULL`, *value.BlobID)
+	if err != nil {
+		return Upload{}, false, fmt.Errorf("retain derived upload blob: %w", err)
+	}
+	retained, err := result.RowsAffected()
+	if err != nil {
+		return Upload{}, false, fmt.Errorf("inspect derived upload blob retention: %w", err)
+	}
+	if retained != 1 {
+		return Upload{}, false, ErrConflict
+	}
+
+	_, err = transaction.ExecContext(ctx, `
+INSERT INTO uploads (
+    id, created_by, original_name, display_name, content_type,
+    declared_size_bytes, part_size_bytes, actual_sha256, status, blob_id,
+    expires_at, completed_at, parts_cleaned_at,
+    idempotency_key, idempotency_operation, request_fingerprint, created_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?, ?, ?)`,
+		value.ID,
+		value.CreatedBy,
+		value.OriginalName,
+		value.DisplayName,
+		value.ContentType,
+		value.DeclaredSize,
+		value.PartSize,
+		value.ActualSHA256,
+		*value.BlobID,
+		value.ExpiresAt,
+		*value.CompletedAt,
+		*value.PartsCleanedAt,
+		record.IdempotencyKey,
+		archiveEntryCreateOperation,
+		record.RequestFingerprint,
+		value.CreatedAt,
+	)
+	if err != nil {
+		return Upload{}, false, fmt.Errorf("create derived upload: %w", err)
+	}
+	_, err = transaction.ExecContext(ctx, `
+INSERT INTO upload_intake_profiles (
+    upload_id, input_category, detected_category, detected_format,
+    validation_status, source_kind, source_parent_upload_id,
+    source_archive_name, source_entry_path, validated_at, created_at
+) VALUES (?, ?, ?, ?, 'valid', 'archive_entry', ?, ?, ?, ?, ?)`,
+		value.ID,
+		string(profile.InputCategory),
+		string(profile.DetectedCategory),
+		profile.DetectedFormat,
+		profile.SourceParentUploadID,
+		profile.SourceArchiveName,
+		profile.SourceEntryPath,
+		*profile.ValidatedAt,
+		profile.CreatedAt,
+	)
+	if err != nil {
+		return Upload{}, false, fmt.Errorf("create derived upload intake profile: %w", err)
+	}
+	if err := transaction.Commit(); err != nil {
+		return Upload{}, false, fmt.Errorf("commit derived upload creation: %w", err)
+	}
+	return value, true, nil
+}
+
+func (r *MySQLRepository) resolveDerivedCompleted(
+	ctx context.Context,
+	createdBy uint64,
+	idempotencyKey string,
+	requestFingerprint string,
+) (Upload, bool, error) {
+	existing, found, err := findIdempotentCreate(
+		ctx,
+		r.db,
+		createdBy,
+		archiveEntryCreateOperation,
+		idempotencyKey,
+		requestFingerprint,
+		false,
+	)
+	if err != nil || !found {
+		return existing, found, err
+	}
+	value, err := getUpload(ctx, r.db, existing.ID)
+	if err != nil {
+		return Upload{}, false, err
 	}
 	return value, true, nil
 }
@@ -204,6 +428,11 @@ LIMIT 1`+suffix, createdBy, operation, idempotencyKey).Scan(
 		return Upload{}, false, ErrIdempotencyConflict
 	}
 	value.Status = "created"
+	profile, err := loadIntakeProfile(ctx, query, value.ID)
+	if err != nil {
+		return Upload{}, false, err
+	}
+	value.IntakeProfile = profile
 	return value, true, nil
 }
 
@@ -236,10 +465,157 @@ func waitForCreateRetry(ctx context.Context, attempt int) error {
 }
 
 func (r *MySQLRepository) Get(ctx context.Context, id string) (Upload, error) {
+	return getUpload(ctx, r.executor(ctx), id)
+}
+
+func (r *MySQLRepository) UploadHasTask(ctx context.Context, uploadID string) (bool, error) {
+	var retained bool
+	if err := r.executor(ctx).QueryRowContext(ctx, `
+SELECT EXISTS (
+    SELECT 1
+    FROM tasks
+    WHERE upload_id = ?
+)`, uploadID).Scan(&retained); err != nil {
+		return false, fmt.Errorf("check upload task dependency: %w", err)
+	}
+	return retained, nil
+}
+
+func (r *MySQLRepository) TaskIDForUpload(
+	ctx context.Context,
+	uploadID string,
+) (string, bool, error) {
+	// A DELETED task row is still the permanent exactly-once tombstone for its
+	// upload and must remain visible to callers.
+	var taskID string
+	err := r.executor(ctx).QueryRowContext(ctx, `
+SELECT id
+FROM tasks
+WHERE upload_id = ?
+LIMIT 1`, uploadID).Scan(&taskID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("find upload task: %w", err)
+	}
+	return taskID, true, nil
+}
+
+func (r *MySQLRepository) ListDirectTaskCandidates(
+	ctx context.Context,
+	afterID string,
+	limit int,
+) ([]DirectTaskCandidate, error) {
+	if r == nil || r.db == nil || limit < 1 || limit > MaxDirectTaskRecoveryBatch ||
+		(afterID != "" && !uuidPattern.MatchString(afterID)) {
+		return nil, ErrInvalidInput
+	}
+	// Every task status, including DELETED, permanently consumes the upload.
+	rows, err := r.db.QueryContext(ctx, `
+SELECT upload.id, upload.created_by, upload.display_name,
+       intake.input_category, intake.detected_format
+FROM uploads upload
+JOIN upload_intake_profiles intake ON intake.upload_id = upload.id
+JOIN blobs stored_blob ON stored_blob.id = upload.blob_id
+WHERE upload.id > ?
+  AND upload.status = 'completed'
+  AND intake.source_kind = 'direct'
+  AND intake.validation_status = 'valid'
+  AND intake.input_category IN ('binary', 'container')
+  AND intake.detected_category = intake.input_category
+  AND intake.detected_format IS NOT NULL
+  AND stored_blob.state = 'available'
+  AND NOT EXISTS (
+      SELECT 1
+      FROM tasks
+      WHERE tasks.upload_id = upload.id
+  )
+ORDER BY upload.id
+LIMIT ?`, afterID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list direct task recovery candidates: %w", err)
+	}
+	defer rows.Close()
+	result := make([]DirectTaskCandidate, 0, limit)
+	for rows.Next() {
+		var candidate DirectTaskCandidate
+		var category string
+		if err := rows.Scan(
+			&candidate.UploadID,
+			&candidate.CreatedBy,
+			&candidate.Filename,
+			&category,
+			&candidate.DetectedFormat,
+		); err != nil {
+			return nil, fmt.Errorf("scan direct task recovery candidate: %w", err)
+		}
+		candidate.InputCategory = inputcategory.Category(category)
+		result = append(result, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate direct task recovery candidates: %w", err)
+	}
+	return result, nil
+}
+
+func (r *MySQLRepository) ListArchiveImportCandidates(
+	ctx context.Context,
+	afterID string,
+	limit int,
+) ([]ArchiveImportCandidate, error) {
+	if r == nil || r.db == nil || limit < 1 || limit > MaxArchiveRecoveryBatch ||
+		(afterID != "" && !uuidPattern.MatchString(afterID)) {
+		return nil, ErrInvalidInput
+	}
+	rows, err := r.db.QueryContext(ctx, `
+SELECT upload.id, upload.created_by, upload.display_name,
+       upload.declared_size_bytes, upload.actual_sha256, intake.detected_format
+FROM uploads upload
+JOIN upload_intake_profiles intake ON intake.upload_id = upload.id
+JOIN blobs stored_blob ON stored_blob.id = upload.blob_id
+WHERE upload.id > ?
+  AND upload.status = 'completed'
+  AND intake.source_kind = 'direct'
+  AND intake.validation_status = 'valid'
+  AND intake.input_category = 'archive'
+  AND intake.detected_category = 'archive'
+  AND intake.detected_format IS NOT NULL
+  AND intake.archive_import_id IS NULL
+  AND upload.actual_sha256 IS NOT NULL
+  AND stored_blob.state = 'available'
+ORDER BY upload.id
+LIMIT ?`, afterID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list archive import recovery candidates: %w", err)
+	}
+	defer rows.Close()
+	result := make([]ArchiveImportCandidate, 0, limit)
+	for rows.Next() {
+		var candidate ArchiveImportCandidate
+		if err := rows.Scan(
+			&candidate.UploadID,
+			&candidate.CreatedBy,
+			&candidate.Filename,
+			&candidate.Size,
+			&candidate.SHA256,
+			&candidate.DetectedFormat,
+		); err != nil {
+			return nil, fmt.Errorf("scan archive import recovery candidate: %w", err)
+		}
+		result = append(result, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate archive import recovery candidates: %w", err)
+	}
+	return result, nil
+}
+
+func getUpload(ctx context.Context, query sqlExecutor, id string) (Upload, error) {
 	var value Upload
 	var expectedSHA, actualSHA sql.NullString
 	var blobID sql.NullInt64
-	err := r.executor(ctx).QueryRowContext(ctx, `
+	err := query.QueryRowContext(ctx, `
 SELECT id, created_by, original_name, display_name, content_type,
        declared_size_bytes, part_size_bytes, expected_sha256, actual_sha256,
        status, blob_id, expires_at, completed_at, parts_cleaned_at, created_at
@@ -263,7 +639,277 @@ LIMIT 1`, id).Scan(
 		id := uint64(blobID.Int64)
 		value.BlobID = &id
 	}
+	profile, err := loadIntakeProfile(ctx, query, id)
+	if err != nil {
+		return Upload{}, err
+	}
+	value.IntakeProfile = profile
 	return value, nil
+}
+
+func (r *MySQLRepository) RecordValidation(
+	ctx context.Context,
+	uploadID string,
+	result ValidationResult,
+) error {
+	transaction, err := r.beginTx(ctx)
+	if err != nil {
+		return fmt.Errorf("begin upload validation transaction: %w", err)
+	}
+	defer transaction.Rollback()
+
+	var (
+		uploadStatus           string
+		inputCategory          string
+		storedDetectedCategory sql.NullString
+		storedDetectedFormat   sql.NullString
+		storedStatus           string
+		storedErrorCode        sql.NullString
+		storedErrorMessage     sql.NullString
+	)
+	err = transaction.QueryRowContext(ctx, `
+SELECT upload.status, intake.input_category, intake.detected_category,
+       intake.detected_format, intake.validation_status,
+       intake.validation_error_code, intake.validation_error_message
+FROM uploads upload
+JOIN upload_intake_profiles intake ON intake.upload_id = upload.id
+WHERE upload.id = ?
+LIMIT 1
+FOR UPDATE`, uploadID).Scan(
+		&uploadStatus,
+		&inputCategory,
+		&storedDetectedCategory,
+		&storedDetectedFormat,
+		&storedStatus,
+		&storedErrorCode,
+		&storedErrorMessage,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("lock upload validation: %w", err)
+	}
+	if inputCategory != string(result.InputCategory) {
+		return ErrConflict
+	}
+	if storedStatus != ValidationPending {
+		if storedStatus != result.Status ||
+			storedDetectedCategory.String != string(result.DetectedCategory) ||
+			storedDetectedFormat.String != result.DetectedFormat ||
+			storedErrorCode.String != result.ErrorCode ||
+			storedErrorMessage.String != result.ErrorMessage {
+			return ErrConflict
+		}
+		if err := transaction.Commit(); err != nil {
+			return fmt.Errorf("commit idempotent upload validation: %w", err)
+		}
+		return nil
+	}
+	if uploadStatus != "created" && uploadStatus != "uploading" {
+		return ErrInvalidState
+	}
+	if result.Status != ValidationValid &&
+		result.Status != ValidationMismatch &&
+		result.Status != ValidationUnsupported {
+		return ErrInvalidInput
+	}
+
+	var detectedCategory any
+	if result.DetectedCategory != "" {
+		detectedCategory = string(result.DetectedCategory)
+	}
+	var errorCode any
+	var errorMessage any
+	if result.ErrorCode != "" {
+		errorCode = result.ErrorCode
+		errorMessage = result.ErrorMessage
+	}
+	update, err := transaction.ExecContext(ctx, `
+UPDATE upload_intake_profiles
+SET detected_category = ?,
+    detected_format = ?,
+    validation_status = ?,
+    validation_error_code = ?,
+    validation_error_message = ?,
+    validated_at = ?
+WHERE upload_id = ?
+  AND validation_status = 'pending'`,
+		detectedCategory,
+		result.DetectedFormat,
+		result.Status,
+		errorCode,
+		errorMessage,
+		result.ValidatedAt,
+		uploadID,
+	)
+	if err != nil {
+		return fmt.Errorf("record upload validation: %w", err)
+	}
+	updated, err := update.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("inspect upload validation update: %w", err)
+	}
+	if updated != 1 {
+		return ErrConflict
+	}
+	if result.Status == ValidationMismatch || result.Status == ValidationUnsupported {
+		update, err = transaction.ExecContext(ctx, `
+UPDATE uploads
+SET status = 'failed'
+WHERE id = ?
+  AND status = ?`, uploadID, uploadStatus)
+		if err != nil {
+			return fmt.Errorf("reject invalid upload completion: %w", err)
+		}
+		updated, err = update.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("inspect invalid upload completion: %w", err)
+		}
+		if updated != 1 {
+			return ErrConflict
+		}
+	}
+	if err := transaction.Commit(); err != nil {
+		return fmt.Errorf("commit upload validation: %w", err)
+	}
+	return nil
+}
+
+func (r *MySQLRepository) SetArchiveImportID(
+	ctx context.Context,
+	uploadID string,
+	archiveImportID string,
+) error {
+	transaction, err := r.beginTx(ctx)
+	if err != nil {
+		return fmt.Errorf("begin archive import association: %w", err)
+	}
+	defer transaction.Rollback()
+	var (
+		status           string
+		inputCategory    string
+		validationStatus string
+		storedID         sql.NullString
+	)
+	err = transaction.QueryRowContext(ctx, `
+SELECT upload.status, intake.input_category, intake.validation_status,
+       intake.archive_import_id
+FROM uploads upload
+JOIN upload_intake_profiles intake ON intake.upload_id = upload.id
+WHERE upload.id = ?
+LIMIT 1
+FOR UPDATE`, uploadID).Scan(
+		&status,
+		&inputCategory,
+		&validationStatus,
+		&storedID,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("lock archive import association: %w", err)
+	}
+	if status != "completed" || inputCategory != string(inputcategory.Archive) ||
+		validationStatus != ValidationValid {
+		return ErrInvalidState
+	}
+	if storedID.Valid {
+		if storedID.String != archiveImportID {
+			return ErrConflict
+		}
+		if err := transaction.Commit(); err != nil {
+			return fmt.Errorf("commit idempotent archive import association: %w", err)
+		}
+		return nil
+	}
+	result, err := transaction.ExecContext(ctx, `
+UPDATE upload_intake_profiles
+SET archive_import_id = ?
+WHERE upload_id = ?
+  AND archive_import_id IS NULL`, archiveImportID, uploadID)
+	if err != nil {
+		return fmt.Errorf("associate archive import: %w", err)
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("inspect archive import association: %w", err)
+	}
+	if updated != 1 {
+		return ErrConflict
+	}
+	if err := transaction.Commit(); err != nil {
+		return fmt.Errorf("commit archive import association: %w", err)
+	}
+	return nil
+}
+
+func loadIntakeProfile(
+	ctx context.Context,
+	query rowQuerier,
+	uploadID string,
+) (*IntakeProfile, error) {
+	var profile IntakeProfile
+	var (
+		detectedCategory sql.NullString
+		detectedFormat   sql.NullString
+		errorCode        sql.NullString
+		errorMessage     sql.NullString
+		parentUploadID   sql.NullString
+		archiveName      sql.NullString
+		entryPath        sql.NullString
+		archiveImportID  sql.NullString
+		validatedAt      sql.NullTime
+	)
+	err := query.QueryRowContext(ctx, `
+SELECT upload_id, input_category, detected_category, detected_format,
+       validation_status, validation_error_code, validation_error_message,
+       source_kind, source_parent_upload_id, source_archive_name,
+       source_entry_path, archive_import_id, validated_at, created_at, updated_at
+FROM upload_intake_profiles
+WHERE upload_id = ?
+LIMIT 1`, uploadID).Scan(
+		&profile.UploadID,
+		&profile.InputCategory,
+		&detectedCategory,
+		&detectedFormat,
+		&profile.ValidationStatus,
+		&errorCode,
+		&errorMessage,
+		&profile.SourceKind,
+		&parentUploadID,
+		&archiveName,
+		&entryPath,
+		&archiveImportID,
+		&validatedAt,
+		&profile.CreatedAt,
+		&profile.UpdatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get upload intake profile: %w", err)
+	}
+	profile.DetectedCategory = inputCategoryFromString(detectedCategory.String)
+	profile.DetectedFormat = detectedFormat.String
+	profile.ValidationErrorCode = errorCode.String
+	profile.ValidationErrorMessage = errorMessage.String
+	profile.SourceParentUploadID = parentUploadID.String
+	profile.SourceArchiveName = archiveName.String
+	profile.SourceEntryPath = entryPath.String
+	profile.ArchiveImportID = archiveImportID.String
+	if validatedAt.Valid {
+		value := validatedAt.Time
+		profile.ValidatedAt = &value
+	}
+	return &profile, nil
+}
+
+func inputCategoryFromString(value string) inputcategory.Category {
+	category, _ := inputcategory.Parse(value)
+	return category
 }
 
 func (r *MySQLRepository) ListParts(ctx context.Context, uploadID string) ([]Part, error) {
@@ -715,6 +1361,19 @@ FOR UPDATE`, uploadID).Scan(&status, &blobID)
 	}
 	switch status {
 	case "created", "uploading", "assembling", "failed", "expired":
+	case "completed":
+		var taskID string
+		err := transaction.QueryRowContext(ctx, `
+SELECT id
+FROM tasks
+WHERE upload_id = ?
+LIMIT 1`, uploadID).Scan(&taskID)
+		if err == nil {
+			return ErrInvalidState
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("check completed upload task dependency: %w", err)
+		}
 	default:
 		return ErrInvalidState
 	}

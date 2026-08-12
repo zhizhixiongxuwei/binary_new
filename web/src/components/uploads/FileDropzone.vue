@@ -1,18 +1,61 @@
 <script setup lang="ts">
 import { FileUp } from 'lucide-vue-next'
-import { shallowRef, useTemplateRef } from 'vue'
+import { onScopeDispose, shallowRef, useTemplateRef, watch } from 'vue'
+
+import type { InputCategory } from '@/api/types'
+import {
+  inputCategoryAccept,
+  inputCategoryLabels,
+  preflightUploadFile,
+} from '@/utils/uploadPreflight'
+
+const props = withDefaults(
+  defineProps<{
+    category?: InputCategory
+    disabled?: boolean
+  }>(),
+  {
+    category: 'binary',
+    disabled: false,
+  },
+)
 
 const emit = defineEmits<{
   selected: [files: File[]]
+  rejected: [messages: string[]]
 }>()
 
 const input = useTemplateRef<HTMLInputElement>('input')
 const dragging = shallowRef(false)
+const prechecking = shallowRef(false)
+let generation = 0
 
-function emitFiles(fileList: FileList | null): void {
-  if (!fileList?.length) return
-  emit('selected', Array.from(fileList))
-  if (input.value) input.value.value = ''
+async function emitFiles(fileList: FileList | null): Promise<void> {
+  if (!fileList?.length || props.disabled || prechecking.value) return
+  const files = Array.from(fileList)
+  const category = props.category
+  const requestGeneration = ++generation
+  prechecking.value = true
+  try {
+    const settled = await Promise.allSettled(
+      files.map((file) => preflightUploadFile(file, category)),
+    )
+    if (requestGeneration !== generation || category !== props.category) return
+    const results = settled.map((result) =>
+      result.status === 'fulfilled' ? result.value : { accepted: true },
+    )
+    const accepted = files.filter((_, index) => results[index]?.accepted)
+    const rejected = results.flatMap((result) =>
+      result.message ? [result.message] : [],
+    )
+    if (accepted.length) emit('selected', accepted)
+    if (rejected.length) emit('rejected', rejected)
+  } finally {
+    if (requestGeneration === generation) {
+      prechecking.value = false
+      if (input.value) input.value.value = ''
+    }
+  }
 }
 
 function onDrop(event: DragEvent): void {
@@ -21,18 +64,36 @@ function onDrop(event: DragEvent): void {
 }
 
 function openFilePicker(): void {
+  if (props.disabled || prechecking.value) return
   input.value?.click()
 }
+
+watch(
+  () => props.category,
+  () => {
+    generation += 1
+    prechecking.value = false
+    dragging.value = false
+    if (input.value) input.value.value = ''
+  },
+)
+
+onScopeDispose(() => {
+  generation += 1
+})
 </script>
 
 <template>
   <div
     class="dropzone"
-    :class="{ 'dropzone--dragging': dragging }"
+    :class="{
+      'dropzone--dragging': dragging,
+      'dropzone--disabled': disabled,
+    }"
     role="group"
     aria-label="待检测文件选择"
-    @dragenter.prevent="dragging = true"
-    @dragover.prevent="dragging = true"
+    @dragenter.prevent="dragging = !disabled"
+    @dragover.prevent="dragging = !disabled"
     @dragleave.prevent="dragging = false"
     @drop.prevent="onDrop"
   >
@@ -41,6 +102,8 @@ function openFilePicker(): void {
       class="sr-only"
       type="file"
       multiple
+      :data-accept-hint="inputCategoryAccept[category]"
+      :disabled="disabled || prechecking"
       tabindex="-1"
       aria-label="选择待检测文件"
       @change="emitFiles(($event.target as HTMLInputElement).files)"
@@ -49,14 +112,16 @@ function openFilePicker(): void {
       <FileUp :size="25" aria-hidden="true" />
     </span>
     <div class="dropzone__copy">
-      <strong>选择待检测文件</strong>
-      <span>系统按文件内容识别格式，可多选；单文件上限 10 GB</span>
+      <strong>{{ inputCategoryLabels[category] }}</strong>
+      <span>单文件上限 2 GiB</span>
     </div>
     <el-button
       class="dropzone__button"
       type="primary"
       native-type="button"
       plain
+      :loading="prechecking"
+      :disabled="disabled || prechecking"
       @click="openFilePicker"
     >
       选择文件
@@ -83,6 +148,12 @@ function openFilePicker(): void {
 .dropzone--dragging {
   border-color: var(--teal);
   background: #eff7f6;
+}
+
+.dropzone--disabled {
+  color: var(--ink-400);
+  background: #f2f4f4;
+  cursor: not-allowed;
 }
 
 .dropzone__icon {

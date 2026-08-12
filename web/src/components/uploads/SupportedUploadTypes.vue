@@ -1,23 +1,56 @@
 <script setup lang="ts">
-import { Box, CodeXml } from 'lucide-vue-next'
+import { Archive, Box, CodeXml } from 'lucide-vue-next'
+import { computed } from 'vue'
+
+import type { InputCategory } from '@/api/types'
+
+const props = defineProps<{
+  category?: InputCategory
+}>()
+
+const groups = [
+  {
+    category: 'binary',
+    icon: CodeXml,
+    title: '反编译分析',
+    formats: 'EXE、DLL、SYS、ELF、Mach-O、CLASS、JAR、WAR、EAR、DEX、APK、PYC',
+  },
+  {
+    category: 'archive',
+    icon: Archive,
+    title: '归档导入',
+    formats: 'ZIP、7Z、RAR、TAR、GZIP、BZIP2、XZ、ZSTD、CAB、CPIO、AR、DEB、RPM',
+  },
+  {
+    category: 'container',
+    icon: Box,
+    title: '镜像漏洞扫描',
+    formats: 'Docker Save TAR、OCI Image Layout TAR',
+  },
+] as const
+
+const visibleGroups = computed(() =>
+  props.category
+    ? groups.filter((group) => group.category === props.category)
+    : groups.filter((group) => group.category !== 'archive'),
+)
 </script>
 
 <template>
-  <div class="supported-types" aria-label="支持的检测文件类型">
-    <div class="supported-types__group">
-      <CodeXml :size="17" aria-hidden="true" />
+  <div
+    class="supported-types"
+    :class="{ 'supported-types--single': category }"
+    aria-label="支持的检测文件类型"
+  >
+    <div
+      v-for="group in visibleGroups"
+      :key="group.category"
+      class="supported-types__group"
+    >
+      <component :is="group.icon" :size="17" aria-hidden="true" />
       <div>
-        <strong>反编译分析</strong>
-        <p>EXE、DLL、SYS、ELF、Mach-O、CLASS、JAR、WAR、EAR、PYC</p>
-        <small>原生程序输出类 C 代码；Java 归档优先输出 Java 源码，源码引擎不可用时降级为类与字节码结构。</small>
-      </div>
-    </div>
-    <div class="supported-types__group">
-      <Box :size="17" aria-hidden="true" />
-      <div>
-        <strong>镜像漏洞扫描</strong>
-        <p>Docker Save TAR、OCI Image Layout TAR</p>
-        <small>普通 TAR 不是容器镜像；漏洞检测使用部署时预装的离线 Trivy 漏洞库。</small>
+        <strong>{{ group.title }}</strong>
+        <p>{{ group.formats }}</p>
       </div>
     </div>
   </div>
@@ -31,6 +64,10 @@ import { Box, CodeXml } from 'lucide-vue-next'
   margin-bottom: 14px;
   border-block: 1px solid var(--line);
   background: #f7f9f9;
+}
+
+.supported-types--single {
+  grid-template-columns: 1fr;
 }
 
 .supported-types__group {
@@ -51,8 +88,7 @@ import { Box, CodeXml } from 'lucide-vue-next'
 }
 
 .supported-types__group strong,
-.supported-types__group p,
-.supported-types__group small {
+.supported-types__group p {
   display: block;
   margin: 0;
 }
@@ -68,13 +104,6 @@ import { Box, CodeXml } from 'lucide-vue-next'
   font-size: 11px;
   line-height: 1.55;
   overflow-wrap: anywhere;
-}
-
-.supported-types__group small {
-  margin-top: 3px;
-  color: var(--ink-600);
-  font-size: 10px;
-  line-height: 1.5;
 }
 
 @media (max-width: 700px) {

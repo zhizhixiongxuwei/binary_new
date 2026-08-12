@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,24 +15,49 @@ import (
 	"time"
 
 	"binaryscan/internal/auth"
+	"binaryscan/internal/filetype"
+	"binaryscan/internal/inputcategory"
 )
 
+type contentDetectorStub struct {
+	result filetype.Result
+	err    error
+}
+
+func (d contentDetectorStub) DetectContext(
+	context.Context,
+	io.ReaderAt,
+	int64,
+) (filetype.Result, error) {
+	return d.result, d.err
+}
+
 type repositoryStub struct {
-	mu                sync.Mutex
-	upload            Upload
-	parts             []Part
-	complete          bool
-	completeCalls     int
-	prepareCalls      int
-	cleanupCalls      int
-	cancelCalls       int
-	prepareErr        error
-	finalizeErr       error
-	cleanupErr        error
-	insertErr         error
-	cancelErr         error
-	createKey         string
-	createFingerprint string
+	mu                    sync.Mutex
+	upload                Upload
+	parts                 []Part
+	complete              bool
+	completeCalls         int
+	prepareCalls          int
+	cleanupCalls          int
+	cancelCalls           int
+	hasTaskCalls          int
+	prepareErr            error
+	finalizeErr           error
+	cleanupErr            error
+	insertErr             error
+	cancelErr             error
+	hasTask               bool
+	hasTaskErr            error
+	taskID                string
+	taskIDErr             error
+	taskIDCalls           int
+	directCandidates      []DirectTaskCandidate
+	directCandidateCalls  []string
+	archiveCandidates     []ArchiveImportCandidate
+	archiveCandidateCalls []string
+	createKey             string
+	createFingerprint     string
 }
 
 type testUploadDirectoryDeleter struct {
@@ -131,11 +157,91 @@ func (r *repositoryStub) Create(
 	r.createFingerprint = fingerprint
 	return value, true, nil
 }
+func (r *repositoryStub) RecordValidation(
+	_ context.Context,
+	_ string,
+	result ValidationResult,
+) error {
+	if r.upload.IntakeProfile == nil {
+		return ErrNotFound
+	}
+	r.upload.IntakeProfile.DetectedCategory = result.DetectedCategory
+	r.upload.IntakeProfile.DetectedFormat = result.DetectedFormat
+	r.upload.IntakeProfile.ValidationStatus = result.Status
+	r.upload.IntakeProfile.ValidationErrorCode = result.ErrorCode
+	r.upload.IntakeProfile.ValidationErrorMessage = result.ErrorMessage
+	r.upload.IntakeProfile.ValidatedAt = &result.ValidatedAt
+	if result.Status == ValidationMismatch || result.Status == ValidationUnsupported {
+		r.upload.Status = "failed"
+	}
+	return nil
+}
+func (r *repositoryStub) SetArchiveImportID(_ context.Context, _ string, id string) error {
+	if r.upload.IntakeProfile == nil {
+		return ErrNotFound
+	}
+	r.upload.IntakeProfile.ArchiveImportID = id
+	return nil
+}
+func (r *repositoryStub) CreateDerivedCompleted(
+	_ context.Context,
+	record DerivedCompletedRecord,
+) (Upload, bool, error) {
+	if r.upload.ID != "" && r.createKey == record.IdempotencyKey {
+		if r.createFingerprint != record.RequestFingerprint {
+			return Upload{}, false, ErrIdempotencyConflict
+		}
+		return r.upload, false, nil
+	}
+	r.upload = record.Upload
+	r.createKey = record.IdempotencyKey
+	r.createFingerprint = record.RequestFingerprint
+	return r.upload, true, nil
+}
 func (r *repositoryStub) Get(context.Context, string) (Upload, error) {
 	if r.upload.ID == "" {
 		return Upload{}, ErrNotFound
 	}
 	return r.upload, nil
+}
+func (r *repositoryStub) UploadHasTask(context.Context, string) (bool, error) {
+	r.hasTaskCalls++
+	return r.hasTask, r.hasTaskErr
+}
+func (r *repositoryStub) TaskIDForUpload(context.Context, string) (string, bool, error) {
+	r.taskIDCalls++
+	if r.taskIDErr != nil {
+		return "", false, r.taskIDErr
+	}
+	return r.taskID, r.taskID != "", nil
+}
+func (r *repositoryStub) ListDirectTaskCandidates(
+	_ context.Context,
+	afterID string,
+	limit int,
+) ([]DirectTaskCandidate, error) {
+	r.directCandidateCalls = append(r.directCandidateCalls, afterID)
+	result := make([]DirectTaskCandidate, 0, limit)
+	for _, candidate := range r.directCandidates {
+		if candidate.UploadID > afterID && len(result) < limit {
+			result = append(result, candidate)
+		}
+	}
+	return result, nil
+}
+func (r *repositoryStub) ListArchiveImportCandidates(
+	_ context.Context,
+	afterID string,
+	limit int,
+) ([]ArchiveImportCandidate, error) {
+	r.archiveCandidateCalls = append(r.archiveCandidateCalls, afterID)
+	result := make([]ArchiveImportCandidate, 0, limit)
+	for _, candidate := range r.archiveCandidates {
+		if candidate.UploadID > afterID && len(result) < limit {
+			result = append(result, candidate)
+		}
+	}
+	return result, nil
 }
 func (r *repositoryStub) ListParts(context.Context, string) ([]Part, error) {
 	return append([]Part(nil), r.parts...), nil
@@ -223,7 +329,7 @@ func TestUploadStreamsPartsAndCompletesContentAddressedBlob(t *testing.T) {
 	ctx := context.Background()
 	view, err := service.Create(ctx, CreateInput{
 		Filename: "sample.bin", Size: 6, ContentType: "application/octet-stream", CreatedBy: 7,
-		IdempotencyKey: "upload-create-key",
+		IdempotencyKey: "upload-create-key", InputCategory: inputcategory.Binary,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -289,7 +395,7 @@ func TestCompleteRecoversAfterPreparedBlobPublicationBeforeFinalization(t *testi
 	view, err := service.Create(ctx, CreateInput{
 		Filename: "sample.bin", Size: 4,
 		ContentType: "application/octet-stream", CreatedBy: 7,
-		IdempotencyKey: "upload-create-key",
+		IdempotencyKey: "upload-create-key", InputCategory: inputcategory.Binary,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -357,7 +463,7 @@ func TestCompleteKeepsDurableCleanupPendingStateOnFilesystemFailure(t *testing.T
 	view, err := service.Create(ctx, CreateInput{
 		Filename: "sample.bin", Size: 4,
 		ContentType: "application/octet-stream", CreatedBy: 7,
-		IdempotencyKey: "upload-create-key",
+		IdempotencyKey: "upload-create-key", InputCategory: inputcategory.Binary,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -421,7 +527,7 @@ func TestPutPartIsIdempotentButRejectsDifferentContent(t *testing.T) {
 	service, _, _, _ := newTestService(t)
 	view, err := service.Create(context.Background(), CreateInput{
 		Filename: "sample.bin", Size: 4, ContentType: "application/octet-stream", CreatedBy: 7,
-		IdempotencyKey: "upload-create-key",
+		IdempotencyKey: "upload-create-key", InputCategory: inputcategory.Binary,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -447,7 +553,7 @@ func TestPutPartRecoversOrphanedPublishedPart(t *testing.T) {
 	service, repository, uploadsRoot, _ := newTestService(t)
 	view, err := service.Create(context.Background(), CreateInput{
 		Filename: "sample.bin", Size: 4, ContentType: "application/octet-stream", CreatedBy: 7,
-		IdempotencyKey: "upload-create-key",
+		IdempotencyKey: "upload-create-key", InputCategory: inputcategory.Binary,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -476,7 +582,7 @@ func TestPutPartCompensatesForDatabaseFailure(t *testing.T) {
 	service, repository, uploadsRoot, _ := newTestService(t)
 	view, err := service.Create(context.Background(), CreateInput{
 		Filename: "sample.bin", Size: 4, ContentType: "application/octet-stream", CreatedBy: 7,
-		IdempotencyKey: "upload-create-key",
+		IdempotencyKey: "upload-create-key", InputCategory: inputcategory.Binary,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -501,7 +607,7 @@ func TestConcurrentIdenticalPartUploadsAreIdempotent(t *testing.T) {
 	service, repository, _, _ := newTestService(t)
 	view, err := service.Create(context.Background(), CreateInput{
 		Filename: "sample.bin", Size: 4, ContentType: "application/octet-stream", CreatedBy: 7,
-		IdempotencyKey: "upload-create-key",
+		IdempotencyKey: "upload-create-key", InputCategory: inputcategory.Binary,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -532,7 +638,7 @@ func TestCompleteDetectsSameSizePartTampering(t *testing.T) {
 	service, _, uploadsRoot, _ := newTestService(t)
 	view, err := service.Create(context.Background(), CreateInput{
 		Filename: "sample.bin", Size: 4, ContentType: "application/octet-stream", CreatedBy: 7,
-		IdempotencyKey: "upload-create-key",
+		IdempotencyKey: "upload-create-key", InputCategory: inputcategory.Binary,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -559,7 +665,7 @@ func TestCompleteRejectsPartStorageKeyOutsideUploadRoot(t *testing.T) {
 	view, err := service.Create(context.Background(), CreateInput{
 		Filename: "sample.bin", Size: 4,
 		ContentType: "application/octet-stream", CreatedBy: 7,
-		IdempotencyKey: "upload-create-key",
+		IdempotencyKey: "upload-create-key", InputCategory: inputcategory.Binary,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -601,7 +707,7 @@ func TestCompleteSupportsEmptyFile(t *testing.T) {
 	service, repository, _, repositoryRoot := newTestService(t)
 	view, err := service.Create(context.Background(), CreateInput{
 		Filename: "empty.bin", Size: 0, ContentType: "application/octet-stream", CreatedBy: 7,
-		IdempotencyKey: "upload-create-key",
+		IdempotencyKey: "upload-create-key", InputCategory: inputcategory.Binary,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -677,7 +783,7 @@ func TestUploadOwnershipAndExpiryAreEnforced(t *testing.T) {
 	service, repository, _, _ := newTestService(t)
 	view, err := service.Create(context.Background(), CreateInput{
 		Filename: "sample.bin", Size: 4, ContentType: "application/octet-stream", CreatedBy: 7,
-		IdempotencyKey: "upload-create-key",
+		IdempotencyKey: "upload-create-key", InputCategory: inputcategory.Binary,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -709,11 +815,12 @@ func TestUploadOwnershipAndExpiryAreEnforced(t *testing.T) {
 func TestCreateRejectsUnsafeFilenameAndOversize(t *testing.T) {
 	service, _, _, _ := newTestService(t)
 	for _, input := range []CreateInput{
-		{Filename: "../sample", Size: 1, ContentType: "application/octet-stream", CreatedBy: 1, IdempotencyKey: "upload-create-key"},
-		{Filename: "C:sample.bin", Size: 1, ContentType: "application/octet-stream", CreatedBy: 1, IdempotencyKey: "upload-create-key"},
-		{Filename: "sample\n.bin", Size: 1, ContentType: "application/octet-stream", CreatedBy: 1, IdempotencyKey: "upload-create-key"},
-		{Filename: "sample.bin", Size: 1025, ContentType: "application/octet-stream", CreatedBy: 1, IdempotencyKey: "upload-create-key"},
-		{Filename: "sample.bin", Size: 1, ContentType: "application/octet-stream", CreatedBy: 1},
+		{Filename: "../sample", Size: 1, ContentType: "application/octet-stream", CreatedBy: 1, IdempotencyKey: "upload-create-key", InputCategory: inputcategory.Binary},
+		{Filename: "C:sample.bin", Size: 1, ContentType: "application/octet-stream", CreatedBy: 1, IdempotencyKey: "upload-create-key", InputCategory: inputcategory.Binary},
+		{Filename: "sample\n.bin", Size: 1, ContentType: "application/octet-stream", CreatedBy: 1, IdempotencyKey: "upload-create-key", InputCategory: inputcategory.Binary},
+		{Filename: "sample.bin", Size: 1025, ContentType: "application/octet-stream", CreatedBy: 1, IdempotencyKey: "upload-create-key", InputCategory: inputcategory.Binary},
+		{Filename: "sample.bin", Size: 1, ContentType: "application/octet-stream", CreatedBy: 1, InputCategory: inputcategory.Binary},
+		{Filename: "sample.bin", Size: 1, ContentType: "application/octet-stream", CreatedBy: 1, IdempotencyKey: "upload-create-key"},
 		{Filename: "sample.bin", Size: 1, ContentType: "application/octet-stream", CreatedBy: 1, IdempotencyKey: "contains space"},
 		{Filename: "sample.bin", Size: 1, ContentType: "application/octet-stream", CreatedBy: 1, IdempotencyKey: "contains\ncontrol"},
 		{Filename: "sample.bin", Size: 1, ContentType: "application/octet-stream", CreatedBy: 1, IdempotencyKey: strings.Repeat("a", 129)},
@@ -734,6 +841,7 @@ func TestCreateReplayReturnsCreationSnapshotWithoutCapacityProbe(t *testing.T) {
 		ContentType:    "application/octet-stream",
 		CreatedBy:      7,
 		IdempotencyKey: "stable-create-key",
+		InputCategory:  inputcategory.Binary,
 	}
 
 	first, err := service.Create(context.Background(), input)
@@ -791,6 +899,7 @@ func TestCreateCapacityFailureRechecksConcurrentIdempotencyWinner(t *testing.T) 
 		ContentType:    "application/octet-stream",
 		CreatedBy:      7,
 		IdempotencyKey: "concurrent-create-key",
+		InputCategory:  inputcategory.Binary,
 	}
 	fingerprint, err := createRequestFingerprint(input)
 	if err != nil {
@@ -840,6 +949,7 @@ func TestCreateCapacityFailureRecheckPreservesFingerprintConflict(t *testing.T) 
 		ContentType:    "application/octet-stream",
 		CreatedBy:      7,
 		IdempotencyKey: "concurrent-conflict-key",
+		InputCategory:  inputcategory.Binary,
 	}
 	guard := &capacityGuardStub{
 		err: capacityErr,
@@ -881,7 +991,7 @@ func TestCapacityGuardRunsAfterDomainValidationAndBeforeWrites(t *testing.T) {
 	if _, err := service.Create(ctx, CreateInput{
 		Filename: "../sample", Size: 4,
 		ContentType: "application/octet-stream", CreatedBy: 7,
-		IdempotencyKey: "upload-create-key",
+		IdempotencyKey: "upload-create-key", InputCategory: inputcategory.Binary,
 	}); err != ErrInvalidInput {
 		t.Fatalf("invalid Create() error = %v", err)
 	}
@@ -892,7 +1002,7 @@ func TestCapacityGuardRunsAfterDomainValidationAndBeforeWrites(t *testing.T) {
 	view, err := service.Create(ctx, CreateInput{
 		Filename: "sample.bin", Size: 4,
 		ContentType: "application/octet-stream", CreatedBy: 7,
-		IdempotencyKey: "upload-create-key",
+		IdempotencyKey: "upload-create-key", InputCategory: inputcategory.Binary,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -995,7 +1105,7 @@ func TestDeleteCancelsUploadAndRemovesPartsIdempotently(t *testing.T) {
 	view, err := service.Create(context.Background(), CreateInput{
 		Filename: "sample.bin", Size: 4,
 		ContentType: "application/octet-stream", CreatedBy: 7,
-		IdempotencyKey: "upload-create-key",
+		IdempotencyKey: "upload-create-key", InputCategory: inputcategory.Binary,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1031,10 +1141,11 @@ func TestDeleteCancelsUploadAndRemovesPartsIdempotently(t *testing.T) {
 
 func TestDeleteEnforcesOwnershipRoleAndState(t *testing.T) {
 	tests := []struct {
-		name      string
-		principal auth.Principal
-		status    string
-		want      error
+		name       string
+		principal  auth.Principal
+		status     string
+		want       error
+		wantCancel bool
 	}{
 		{
 			name: "other operator is hidden",
@@ -1055,13 +1166,13 @@ func TestDeleteEnforcesOwnershipRoleAndState(t *testing.T) {
 			want:   ErrForbidden,
 		},
 		{
-			name: "completed upload is retained",
+			name: "completed unused upload is released",
 			principal: auth.Principal{
 				UserID: 7,
 				Role:   auth.RoleOperator,
 			},
-			status: "completed",
-			want:   ErrInvalidState,
+			status:     "completed",
+			wantCancel: true,
 		},
 	}
 	for _, test := range tests {
@@ -1070,7 +1181,7 @@ func TestDeleteEnforcesOwnershipRoleAndState(t *testing.T) {
 			view, err := service.Create(context.Background(), CreateInput{
 				Filename: "sample.bin", Size: 4,
 				ContentType: "application/octet-stream", CreatedBy: 7,
-				IdempotencyKey: "upload-create-key",
+				IdempotencyKey: "upload-create-key", InputCategory: inputcategory.Binary,
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -1083,8 +1194,12 @@ func TestDeleteEnforcesOwnershipRoleAndState(t *testing.T) {
 			); !errors.Is(err, test.want) {
 				t.Fatalf("Delete() error = %v, want %v", err, test.want)
 			}
-			if repository.cancelCalls != 0 {
-				t.Fatalf("Cancel() calls = %d, want 0", repository.cancelCalls)
+			wantCalls := 0
+			if test.wantCancel {
+				wantCalls = 1
+			}
+			if repository.cancelCalls != wantCalls {
+				t.Fatalf("Cancel() calls = %d, want %d", repository.cancelCalls, wantCalls)
 			}
 		})
 	}
@@ -1094,7 +1209,7 @@ func TestDeleteEnforcesOwnershipRoleAndState(t *testing.T) {
 		view, err := service.Create(context.Background(), CreateInput{
 			Filename: "sample.bin", Size: 4,
 			ContentType: "application/octet-stream", CreatedBy: 7,
-			IdempotencyKey: "upload-create-key",
+			IdempotencyKey: "upload-create-key", InputCategory: inputcategory.Binary,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -1128,7 +1243,14 @@ func newTestService(t *testing.T) (*Service, *repositoryStub, string, string) {
 		UploadsRoot: uploadsRoot, RepositoryRoot: repositoryRoot,
 		MaxUploadBytes: 1024, PartSize: 4, Retention: time.Hour,
 		PartDeleter: partDeleter,
-		Now:         func() time.Time { return time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC) },
+		Detector: contentDetectorStub{result: filetype.Result{
+			Format: "pe32", MIMEType: "application/vnd.microsoft.portable-executable",
+		}},
+		EnsureDirectTask: func(_ context.Context, _ DirectTaskRequest) (string, error) {
+			repository.taskID = "723e4567-e89b-42d3-a456-426614174000"
+			return repository.taskID, nil
+		},
+		Now: func() time.Time { return time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC) },
 	})
 	if err != nil {
 		t.Fatal(err)

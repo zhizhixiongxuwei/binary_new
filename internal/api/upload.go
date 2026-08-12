@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"binaryscan/internal/auth"
+	"binaryscan/internal/inputcategory"
 	"binaryscan/internal/storageguard"
 	"binaryscan/internal/upload"
 
@@ -40,9 +41,10 @@ func registerUploadRoutes(v1 *gin.RouterGroup, manager AuthManager, service Uplo
 
 func createUploadHandler(service UploadService) gin.HandlerFunc {
 	type createRequest struct {
-		Filename    string `json:"filename"`
-		Size        int64  `json:"size"`
-		ContentType string `json:"content_type"`
+		Filename      string                 `json:"filename"`
+		Size          int64                  `json:"size"`
+		ContentType   string                 `json:"content_type"`
+		InputCategory inputcategory.Category `json:"input_category"`
 	}
 	return func(c *gin.Context) {
 		if len(c.Request.URL.Query()) != 0 {
@@ -61,6 +63,10 @@ func createUploadHandler(service UploadService) gin.HandlerFunc {
 			WriteError(c, http.StatusBadRequest, "invalid_request", "The upload request is not valid.", nil)
 			return
 		}
+		if !request.InputCategory.Valid() {
+			WriteError(c, http.StatusBadRequest, "invalid_upload", "The upload request is invalid.", nil)
+			return
+		}
 		session, ok := CurrentSession(c)
 		if !ok {
 			WriteError(c, http.StatusUnauthorized, "authentication_required", "Authentication is required.", nil)
@@ -69,7 +75,7 @@ func createUploadHandler(service UploadService) gin.HandlerFunc {
 		view, err := service.Create(c.Request.Context(), upload.CreateInput{
 			Filename: request.Filename, Size: request.Size,
 			ContentType: request.ContentType, CreatedBy: session.User.UserID,
-			IdempotencyKey: idempotencyKey,
+			IdempotencyKey: idempotencyKey, InputCategory: request.InputCategory,
 		})
 		if err != nil {
 			writeUploadError(c, err)
@@ -255,6 +261,28 @@ func writeUploadError(c *gin.Context, err error) {
 			"The Idempotency-Key was already used for another upload request.",
 			nil,
 		)
+	case errors.Is(err, upload.ErrCategoryMismatch), errors.Is(err, upload.ErrUnsupportedFormat):
+		var validationError *upload.CompletionValidationError
+		if !errors.As(err, &validationError) {
+			c.Error(err).SetType(gin.ErrorTypePrivate)
+			WriteError(c, http.StatusInternalServerError, "upload_failed", "The upload operation could not be completed.", nil)
+			return
+		}
+		details := map[string]any{
+			"upload_id":       validationError.UploadID,
+			"input_category":  validationError.InputCategory,
+			"detected_format": validationError.DetectedFormat,
+		}
+		if validationError.DetectedCategory != "" {
+			details["detected_category"] = validationError.DetectedCategory
+		}
+		code := "unsupported_input_format"
+		message := "The detected format is not supported for task creation."
+		if errors.Is(err, upload.ErrCategoryMismatch) {
+			code = "input_category_mismatch"
+			message = "The detected format does not match the selected input category."
+		}
+		WriteError(c, http.StatusUnprocessableEntity, code, message, details)
 	case errors.Is(err, upload.ErrConflict):
 		WriteError(c, http.StatusConflict, "upload_conflict", "The upload part conflicts with existing content.", nil)
 	case errors.Is(err, upload.ErrIncomplete):

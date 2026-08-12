@@ -134,6 +134,62 @@ func TestExtractZIPRecursesWithoutUsingArchivePathsOnDisk(t *testing.T) {
 	assertCleanWorkDirectory(t)
 }
 
+func TestExtractLogicalPackageRetainsMembersWithoutRecursing(t *testing.T) {
+	classFile := make([]byte, 31)
+	copy(classFile, []byte{0xca, 0xfe, 0xba, 0xbe})
+	classFile[7] = 61
+	classFile[9] = 3
+	classFile[10] = 1
+	classFile[12] = 1
+	classFile[13] = 'A'
+	classFile[14] = 7
+	classFile[16] = 1
+	classFile[18] = 0x21
+	classFile[20] = 2
+	inner := zipFixture(t, []zipEntry{{name: "deep.class", body: classFile}})
+	outer := zipFixture(t, []zipEntry{
+		{name: "bin/tool.class", body: classFile},
+		{name: "nested.zip", body: inner},
+	})
+	sourcePath := filepath.Join(t.TempDir(), "outer.zip")
+	if err := os.WriteFile(sourcePath, outer, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	workDir := t.TempDir()
+	engine := NewEngine(filetype.Detector{}, generousLimits())
+	result, err := engine.ExtractLogicalPackage(
+		context.Background(), source, "zip", workDir,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNodeGraph(t, result.Nodes)
+	tool := findNode(t, result.Nodes, "/bin/tool.class")
+	if tool.Format != "java-class" {
+		t.Fatalf("tool format = %q", tool.Format)
+	}
+	findNode(t, result.Nodes, "/nested.zip")
+	for _, node := range result.Nodes {
+		if node.LogicalPath == "/nested.zip/deep.class" {
+			t.Fatal("logical-package mode recursively expanded a member archive")
+		}
+	}
+	if len(result.MaterializedFiles) != 2 {
+		t.Fatalf("materialized files = %+v", result.MaterializedFiles)
+	}
+	for _, retained := range result.MaterializedFiles {
+		info, err := os.Lstat(retained.WorkPath)
+		if err != nil || !info.Mode().IsRegular() {
+			t.Fatalf("retained member %d is unavailable: %v", retained.LocalID, err)
+		}
+	}
+}
+
 func TestExtractRejectsZipSlipAndUnsafeNames(t *testing.T) {
 	data := zipFixture(t, []zipEntry{
 		{name: "../escape", body: []byte("x")},

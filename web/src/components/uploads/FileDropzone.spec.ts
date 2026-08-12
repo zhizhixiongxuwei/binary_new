@@ -21,8 +21,9 @@ const ButtonStub = defineComponent({
   `,
 })
 
-function mountDropzone() {
+function mountDropzone(category: 'binary' | 'archive' | 'container' = 'binary') {
   return mount(FileDropzone, {
+    props: { category },
     global: {
       stubs: {
         ElButton: ButtonStub,
@@ -69,6 +70,83 @@ describe('FileDropzone', () => {
     })
     await input.trigger('change')
 
+    await vi.waitFor(() => {
+      expect(wrapper.emitted('selected')).toBeDefined()
+    })
+
     expect(wrapper.emitted('selected')).toEqual([[files]])
+  })
+
+  it('keeps the native picker non-restrictive for extensionless files', () => {
+    const wrapper = mountDropzone('archive')
+    const input = wrapper.get('input[type="file"]')
+
+    expect(input.attributes('accept')).toBeUndefined()
+    expect(input.attributes('data-accept-hint')).toContain('.zip')
+    expect(wrapper.text()).toContain('02 压缩包格式')
+  })
+
+  it('rejects only a high-confidence category mismatch before upload', async () => {
+    const wrapper = mountDropzone('archive')
+    const input = wrapper.get<HTMLInputElement>('input[type="file"]')
+    const extensionlessElf = new File([
+      new Uint8Array([0x7f, 0x45, 0x4c, 0x46]),
+    ], 'extensionless')
+
+    Object.defineProperty(input.element, 'files', {
+      configurable: true,
+      value: {
+        0: extensionlessElf,
+        length: 1,
+        item: () => extensionlessElf,
+      },
+    })
+    await input.trigger('change')
+    await vi.waitFor(() => expect(wrapper.emitted('rejected')).toBeDefined())
+
+    expect(wrapper.emitted('selected')).toBeUndefined()
+    expect(wrapper.emitted('rejected')?.[0]?.[0]).toEqual([
+      expect.stringContaining('ELF'),
+    ])
+  })
+
+  it('isolates preflight read failures and always resets the native input', async () => {
+    const wrapper = mountDropzone('archive')
+    const input = wrapper.get<HTMLInputElement>('input[type="file"]')
+    const unreadable = new File(['unknown'], 'unreadable.bin')
+    const unreadableSlice = new Blob()
+    Object.defineProperty(unreadableSlice, 'arrayBuffer', {
+      configurable: true,
+      value: vi.fn().mockRejectedValue(new Error('read failed')),
+    })
+    vi.spyOn(unreadable, 'slice').mockReturnValue(unreadableSlice)
+    const mismatchedElf = new File(
+      [new Uint8Array([0x7f, 0x45, 0x4c, 0x46])],
+      'application',
+    )
+
+    Object.defineProperty(input.element, 'files', {
+      configurable: true,
+      value: {
+        0: unreadable,
+        1: mismatchedElf,
+        length: 2,
+        item: (index: number) => [unreadable, mismatchedElf][index] ?? null,
+      },
+    })
+    Object.defineProperty(input.element, 'value', {
+      configurable: true,
+      writable: true,
+      value: 'selected-files',
+    })
+
+    await input.trigger('change')
+    await vi.waitFor(() => expect(wrapper.emitted('selected')).toBeDefined())
+
+    expect(wrapper.emitted('selected')).toEqual([[[unreadable]]])
+    expect(wrapper.emitted('rejected')?.[0]?.[0]).toEqual([
+      expect.stringContaining('ELF'),
+    ])
+    expect(input.element.value).toBe('')
   })
 })

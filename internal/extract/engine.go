@@ -12,6 +12,7 @@ import (
 	"math"
 	"os"
 	"path"
+	"runtime"
 
 	"binaryscan/internal/filetype"
 	"binaryscan/internal/imageextract"
@@ -130,6 +131,36 @@ func newEngine(detector Detector, limits Limits) *Engine {
 	}
 }
 
+// WithLimits returns an independent engine with the requested non-zero limit
+// overrides while preserving the detector and explicitly configured external
+// archive adapters. It lets durable jobs execute their persisted limit
+// snapshot rather than silently adopting newer process configuration.
+func (engine *Engine) WithLimits(overrides Limits) *Engine {
+	if engine == nil {
+		return nil
+	}
+	limits := engine.limits
+	if overrides.MaxExpandedBytes > 0 {
+		limits.MaxExpandedBytes = overrides.MaxExpandedBytes
+	}
+	if overrides.MaxEntryBytes > 0 {
+		limits.MaxEntryBytes = overrides.MaxEntryBytes
+	}
+	if overrides.MaxNodes > 0 {
+		limits.MaxNodes = overrides.MaxNodes
+	}
+	if overrides.MaxDepth > 0 {
+		limits.MaxDepth = overrides.MaxDepth
+	}
+	if overrides.MaxRatio > 0 {
+		limits.MaxRatio = overrides.MaxRatio
+	}
+	clone := newEngine(engine.detector, limits)
+	clone.trustedSevenZip = engine.trustedSevenZip
+	clone.externalArchive = engine.externalArchive
+	return clone
+}
+
 // Supports reports whether Engine can expand the supplied detector format.
 func (engine *Engine) Supports(format string) bool {
 	switch format {
@@ -147,6 +178,19 @@ func (engine *Engine) Supports(format string) bool {
 	}
 }
 
+// SupportsLogicalPackageRoot reports the exact v1 archive-import allowlist.
+// Executable ZIP derivatives and container TARs are intentionally excluded:
+// they are task inputs, not outer archive packages.
+func (engine *Engine) SupportsLogicalPackageRoot(format string) bool {
+	switch format {
+	case "zip", "7z", "rar", "tar", "gzip", "bzip2", "xz", "zstd",
+		"cab", "cpio", "ar", "deb", "rpm":
+		return engine.Supports(format)
+	default:
+		return false
+	}
+}
+
 // Extract expands source beneath the caller-owned root. Result.Nodes never
 // contains the root itself; first-level entries use ParentLocalID zero.
 func (engine *Engine) Extract(
@@ -154,6 +198,78 @@ func (engine *Engine) Extract(
 	source *os.File,
 	rootFormat string,
 	workDir string,
+) (Result, error) {
+	return engine.extract(ctx, source, rootFormat, workDir, false)
+}
+
+// ExtractLogicalPackage expands an outer upload archive while only traversing
+// format-inherent wrappers (for example gzip -> tar and DEB/RPM payloads).
+// Ordinary member archives are detected and retained but never recursively
+// expanded. Every regular member has a matching Result.MaterializedFiles item.
+func (engine *Engine) ExtractLogicalPackage(
+	ctx context.Context,
+	source *os.File,
+	rootFormat string,
+	workDir string,
+) (Result, error) {
+	if engine == nil || !engine.SupportsLogicalPackageRoot(rootFormat) {
+		return Result{}, fmt.Errorf(
+			"extract: unsupported logical-package root format %q",
+			rootFormat,
+		)
+	}
+	return engine.extract(ctx, source, rootFormat, workDir, true)
+}
+
+// ExtractLogicalPackageInDirectory is the descriptor-bound variant used when
+// a shared-UID process could rename or replace the workspace pathname. All
+// extractor-created files resolve through the already-open directory handle.
+func (engine *Engine) ExtractLogicalPackageInDirectory(
+	ctx context.Context,
+	source *os.File,
+	rootFormat string,
+	directory *os.File,
+) (Result, error) {
+	if directory == nil {
+		return Result{}, errors.New("extract: nil work directory descriptor")
+	}
+	info, err := directory.Stat()
+	if err != nil || !info.IsDir() {
+		return Result{}, errors.New("extract: invalid work directory descriptor")
+	}
+	var workDir string
+	switch runtime.GOOS {
+	case "linux":
+		workDir = fmt.Sprintf("/proc/self/fd/%d", directory.Fd())
+	case "darwin", "freebsd", "openbsd", "netbsd", "dragonfly":
+		workDir = fmt.Sprintf("/dev/fd/%d", directory.Fd())
+	default:
+		return Result{}, errors.New("extract: descriptor-bound work directories are unsupported")
+	}
+	opened, err := os.Stat(workDir)
+	if err != nil || !opened.IsDir() || !os.SameFile(info, opened) {
+		return Result{}, errors.New("extract: work directory descriptor identity changed")
+	}
+	return engine.extractAt(ctx, source, rootFormat, workDir, true, false)
+}
+
+func (engine *Engine) extract(
+	ctx context.Context,
+	source *os.File,
+	rootFormat string,
+	workDir string,
+	logicalPackage bool,
+) (Result, error) {
+	return engine.extractAt(ctx, source, rootFormat, workDir, logicalPackage, true)
+}
+
+func (engine *Engine) extractAt(
+	ctx context.Context,
+	source *os.File,
+	rootFormat string,
+	workDir string,
+	logicalPackage bool,
+	validateWorkPath bool,
 ) (Result, error) {
 	if engine == nil || engine.detector == nil {
 		return Result{}, errors.New("extract: nil engine or detector")
@@ -174,20 +290,24 @@ func (engine *Engine) Extract(
 	if !info.Mode().IsRegular() {
 		return Result{}, errors.New("extract: source is not a regular file")
 	}
-	if err := ensureWorkDirectory(workDir); err != nil {
-		return Result{}, err
+	if validateWorkPath {
+		if err := ensureWorkDirectory(workDir); err != nil {
+			return Result{}, err
+		}
 	}
 	state := operationState{
-		engine:        engine,
-		ctx:           ctx,
-		workDir:       workDir,
-		rootSize:      info.Size(),
-		nextID:        1,
-		paths:         make(map[string]struct{}),
-		nodeIndex:     make(map[int]int),
-		directories:   make(map[string]int),
-		reservedPaths: make(map[string]struct{}),
-		archiveNames:  make(map[string]string),
+		engine:         engine,
+		ctx:            ctx,
+		workDir:        workDir,
+		rootSize:       info.Size(),
+		nextID:         1,
+		paths:          make(map[string]struct{}),
+		nodeIndex:      make(map[int]int),
+		directories:    make(map[string]int),
+		reservedPaths:  make(map[string]struct{}),
+		archiveNames:   make(map[string]string),
+		logicalPackage: logicalPackage,
+		rootFormat:     rootFormat,
 		memory: parserDecoderMemory{
 			limit: engine.parserDecoderMemoryLimit,
 		},
@@ -212,23 +332,26 @@ func (engine *Engine) Extract(
 }
 
 type operationState struct {
-	engine          *Engine
-	ctx             context.Context
-	workDir         string
-	rootSize        int64
-	nextID          int
-	nodes           []Node
-	containerImages []ContainerImage
-	paths           map[string]struct{}
-	nodeIndex       map[int]int
-	directories     map[string]int
-	reservedPaths   map[string]struct{}
-	archiveNames    map[string]string
-	expandedBytes   int64
-	partial         bool
-	limitCode       string
-	stopped         bool
-	memory          parserDecoderMemory
+	engine            *Engine
+	ctx               context.Context
+	workDir           string
+	rootSize          int64
+	nextID            int
+	nodes             []Node
+	containerImages   []ContainerImage
+	paths             map[string]struct{}
+	nodeIndex         map[int]int
+	directories       map[string]int
+	reservedPaths     map[string]struct{}
+	archiveNames      map[string]string
+	logicalPackage    bool
+	rootFormat        string
+	materializedFiles []MaterializedFile
+	expandedBytes     int64
+	partial           bool
+	limitCode         string
+	stopped           bool
+	memory            parserDecoderMemory
 
 	// Shared by every CPIO reached during one recursive extraction. Keeping
 	// this on the operation prevents sibling or nested archives from each
@@ -292,6 +415,7 @@ func (state *operationState) result() Result {
 	return Result{
 		Nodes:                   state.nodes,
 		ContainerImages:         state.containerImages,
+		MaterializedFiles:       state.materializedFiles,
 		ExpandedBytes:           state.expandedBytes,
 		Partial:                 state.partial,
 		LimitCode:               state.limitCode,

@@ -15,11 +15,14 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
 
 	"binaryscan/internal/auth"
+	"binaryscan/internal/filetype"
+	"binaryscan/internal/inputcategory"
 )
 
 var (
@@ -27,17 +30,30 @@ var (
 	hashPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 )
 
-const uploadCreateOperation = "create"
+const (
+	uploadCreateOperation       = "create"
+	archiveEntryCreateOperation = "archive-entry"
+	directTaskKeyPrefix         = "direct-upload-task:"
+	maxDirectTaskNameRunes      = 255
+)
+
+type ContentDetector interface {
+	DetectContext(context.Context, io.ReaderAt, int64) (filetype.Result, error)
+}
 
 type Config struct {
-	UploadsRoot    string
-	RepositoryRoot string
-	MaxUploadBytes int64
-	PartSize       int64
-	Retention      time.Duration
-	CapacityGuard  CapacityGuard
-	PartDeleter    UploadDirectoryDeleter
-	Now            func() time.Time
+	UploadsRoot         string
+	RepositoryRoot      string
+	MaxUploadBytes      int64
+	PartSize            int64
+	Retention           time.Duration
+	CapacityGuard       CapacityGuard
+	PartDeleter         UploadDirectoryDeleter
+	Detector            ContentDetector
+	EnsureDirectTask    func(context.Context, DirectTaskRequest) (string, error)
+	EnsureArchiveImport func(context.Context, ArchiveImportRequest) (string, error)
+	DeleteArchiveImport func(context.Context, ArchiveImportDeleteRequest) error
+	Now                 func() time.Time
 }
 
 type UploadDirectoryDeleter interface {
@@ -51,8 +67,12 @@ type CapacityGuard interface {
 }
 
 type Service struct {
-	repository Repository
-	config     Config
+	repository                  Repository
+	config                      Config
+	directTaskRecoveryMu        sync.Mutex
+	directTaskRecoveryCursor    string
+	archiveImportRecoveryMu     sync.Mutex
+	archiveImportRecoveryCursor string
 }
 
 func NewService(repository Repository, config Config) (*Service, error) {
@@ -76,6 +96,9 @@ func NewService(repository Repository, config Config) (*Service, error) {
 	}
 	if config.Now == nil {
 		config.Now = time.Now
+	}
+	if config.Detector == nil {
+		config.Detector = filetype.Detector{}
 	}
 	return &Service{repository: repository, config: config}, nil
 }
@@ -132,6 +155,11 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (View, error) {
 		DisplayName: input.Filename, ContentType: input.ContentType,
 		DeclaredSize: input.Size, PartSize: s.config.PartSize,
 		Status: "created", ExpiresAt: now.Add(s.config.Retention), CreatedAt: now,
+		IntakeProfile: &IntakeProfile{
+			UploadID: id, InputCategory: input.InputCategory,
+			ValidationStatus: ValidationPending, SourceKind: SourceDirect,
+			CreatedAt: now, UpdatedAt: now,
+		},
 	}
 	stored, _, err := s.repository.Create(
 		ctx,
@@ -144,6 +172,116 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (View, error) {
 		return View{}, err
 	}
 	return uploadView(stored, nil), nil
+}
+
+func (s *Service) CreateDerivedCompleted(
+	ctx context.Context,
+	input DerivedCompletedInput,
+) (View, bool, error) {
+	if err := s.validateDerivedCompleted(input); err != nil {
+		return View{}, false, err
+	}
+	fingerprint, err := derivedCompletedFingerprint(input)
+	if err != nil {
+		return View{}, false, err
+	}
+	id, err := newUUID()
+	if err != nil {
+		return View{}, false, err
+	}
+	now := s.config.Now().UTC()
+	blobID := input.BlobID
+	profile := &IntakeProfile{
+		UploadID: id, InputCategory: input.InputCategory,
+		DetectedCategory: input.InputCategory, DetectedFormat: input.DetectedFormat,
+		ValidationStatus: ValidationValid, SourceKind: SourceArchiveEntry,
+		SourceParentUploadID: input.ParentUploadID,
+		SourceArchiveName:    input.ArchiveName, SourceEntryPath: input.EntryPath,
+		ValidatedAt: &now, CreatedAt: now, UpdatedAt: now,
+	}
+	value := Upload{
+		ID: id, CreatedBy: input.CreatedBy, OriginalName: []byte(input.Filename),
+		DisplayName: input.Filename, ContentType: input.ContentType,
+		DeclaredSize: input.Size, PartSize: s.config.PartSize,
+		ActualSHA256: input.SHA256, Status: "completed", BlobID: &blobID,
+		ExpiresAt: now.Add(s.config.Retention), CompletedAt: &now,
+		PartsCleanedAt: &now, CreatedAt: now, IntakeProfile: profile,
+	}
+	stored, created, err := s.repository.CreateDerivedCompleted(ctx, DerivedCompletedRecord{
+		Upload: value, IdempotencyKey: input.IdempotencyKey,
+		RequestFingerprint: fingerprint,
+	})
+	if err != nil {
+		return View{}, false, err
+	}
+	return uploadView(stored, nil), created, nil
+}
+
+func (s *Service) validateDerivedCompleted(input DerivedCompletedInput) error {
+	if input.CreatedBy == 0 || input.BlobID == 0 || input.Size < 0 ||
+		input.Size > s.config.MaxUploadBytes || !hashPattern.MatchString(input.SHA256) ||
+		!uuidPattern.MatchString(input.ParentUploadID) ||
+		(input.InputCategory != inputcategory.Binary &&
+			input.InputCategory != inputcategory.Container) ||
+		!validUploadIdempotencyKey(input.IdempotencyKey) {
+		return ErrInvalidInput
+	}
+	detectedCategory, ok := inputcategory.ForFormat(input.DetectedFormat)
+	if !ok || detectedCategory != input.InputCategory {
+		return ErrInvalidInput
+	}
+	if !validSnapshotText(input.ArchiveName, 512) ||
+		!validSnapshotText(input.EntryPath, 2048) ||
+		!validSnapshotText(input.Filename, 512) || input.Filename == "." ||
+		input.Filename == ".." || strings.ContainsAny(input.Filename, `/\`) ||
+		len(input.ContentType) == 0 || len(input.ContentType) > 255 ||
+		!isASCII(input.ContentType) {
+		return ErrInvalidInput
+	}
+	return nil
+}
+
+func validSnapshotText(value string, maxBytes int) bool {
+	if value == "" || len(value) > maxBytes || !utf8.ValidString(value) {
+		return false
+	}
+	for _, character := range value {
+		if unicode.IsControl(character) {
+			return false
+		}
+	}
+	return true
+}
+
+func derivedCompletedFingerprint(input DerivedCompletedInput) (string, error) {
+	payload, err := json.Marshal(struct {
+		Version        uint8                  `json:"version"`
+		Operation      string                 `json:"operation"`
+		CreatedBy      uint64                 `json:"created_by"`
+		Filename       string                 `json:"filename"`
+		ContentType    string                 `json:"content_type"`
+		Size           int64                  `json:"size"`
+		SHA256         string                 `json:"sha256"`
+		BlobID         uint64                 `json:"blob_id"`
+		InputCategory  inputcategory.Category `json:"input_category"`
+		DetectedFormat string                 `json:"detected_format"`
+		ParentUploadID string                 `json:"parent_upload_id"`
+		ArchiveName    string                 `json:"archive_name"`
+		EntryPath      string                 `json:"entry_path"`
+	}{
+		Version: 1, Operation: archiveEntryCreateOperation,
+		CreatedBy: input.CreatedBy, Filename: input.Filename,
+		ContentType: input.ContentType, Size: input.Size,
+		SHA256: input.SHA256, BlobID: input.BlobID,
+		InputCategory: input.InputCategory, DetectedFormat: input.DetectedFormat,
+		ParentUploadID: input.ParentUploadID, ArchiveName: input.ArchiveName,
+		EntryPath: input.EntryPath,
+	})
+	if err != nil {
+		return "", fmt.Errorf("encode derived upload fingerprint: %w", err)
+	}
+	digest := sha256.Sum256(payload)
+	return hex.EncodeToString(digest[:]), nil
 }
 
 func (s *Service) Get(ctx context.Context, id string, principal auth.Principal) (View, error) {
@@ -161,7 +299,18 @@ func (s *Service) Get(ctx context.Context, id string, principal auth.Principal) 
 	if err != nil {
 		return View{}, err
 	}
-	return uploadView(value, parts), nil
+	result := uploadView(value, parts)
+	taskID, found, err := s.repository.TaskIDForUpload(ctx, id)
+	if err != nil {
+		return View{}, err
+	}
+	if found {
+		if !uuidPattern.MatchString(taskID) {
+			return View{}, ErrConflict
+		}
+		result.TaskID = taskID
+	}
+	return result, nil
 }
 
 func (s *Service) Delete(ctx context.Context, id string, principal auth.Principal) error {
@@ -180,10 +329,25 @@ func (s *Service) Delete(ctx context.Context, id string, principal auth.Principa
 		if principal.Role != auth.RoleAdministrator && value.CreatedBy != principal.UserID {
 			return ErrNotFound
 		}
+		if requiresArchiveImportDelete(value) {
+			if s.config.DeleteArchiveImport == nil {
+				return ErrInvalidState
+			}
+			if err := s.config.DeleteArchiveImport(lockCtx, ArchiveImportDeleteRequest{
+				UploadID: id,
+				Actor:    principal,
+			}); err != nil {
+				return err
+			}
+		}
 		switch value.Status {
 		case "cancelled":
 			// A previous request may have committed the database transition before
 			// filesystem cleanup failed. Replays finish that cleanup.
+		case "completed":
+			if err := s.repository.Cancel(lockCtx, id); err != nil {
+				return err
+			}
 		case "created", "uploading", "assembling", "failed", "expired":
 			if err := s.repository.Cancel(lockCtx, id); err != nil {
 				return err
@@ -201,6 +365,69 @@ func (s *Service) Delete(ctx context.Context, id string, principal auth.Principa
 			return err
 		}
 		return nil
+	})
+}
+
+func requiresArchiveImportDelete(value Upload) bool {
+	profile := value.IntakeProfile
+	if profile == nil || profile.InputCategory != inputcategory.Archive ||
+		profile.SourceKind != SourceDirect ||
+		(profile.ValidationStatus != ValidationValid && profile.ArchiveImportID == "") {
+		return false
+	}
+	switch value.Status {
+	case "completed", "expired", "cancelled", "failed":
+		return true
+	default:
+		return false
+	}
+}
+
+// DeleteDerivedCompleted releases an unconsumed archive-entry upload. It is a
+// narrow recovery hook for the archive-import saga and deliberately rejects
+// direct uploads, owner mismatches, and uploads already retained by a task.
+func (s *Service) DeleteDerivedCompleted(
+	ctx context.Context,
+	id string,
+	owner uint64,
+) error {
+	if !uuidPattern.MatchString(id) || owner == 0 {
+		return ErrInvalidInput
+	}
+	return s.repository.WithLock(ctx, id, func(lockCtx context.Context) error {
+		value, err := s.repository.Get(lockCtx, id)
+		if err != nil {
+			return err
+		}
+		if value.CreatedBy != owner || value.IntakeProfile == nil ||
+			value.IntakeProfile.SourceKind != SourceArchiveEntry {
+			return ErrNotFound
+		}
+		switch value.Status {
+		case "cancelled":
+		case "completed":
+			if err := s.repository.Cancel(lockCtx, id); err != nil {
+				return err
+			}
+		case "expired":
+			// Retention has already released the upload-owned blob reference.
+			// Treat that state as a successful replay only when no task retained
+			// the derived upload before expiration.
+			if value.BlobID != nil {
+				return ErrInvalidState
+			}
+			retained, err := s.repository.UploadHasTask(lockCtx, id)
+			if err != nil {
+				return err
+			}
+			if retained {
+				return ErrInvalidState
+			}
+		default:
+			return ErrInvalidState
+		}
+		_, err = s.cleanupParts(lockCtx, id)
+		return err
 	})
 }
 
@@ -325,15 +552,35 @@ func (s *Service) Complete(ctx context.Context, id string, principal auth.Princi
 			if err != nil {
 				return err
 			}
-			result = uploadView(value, parts)
 			_, _ = s.cleanupParts(lockCtx, id)
+			taskID, err := s.ensureDirectTask(lockCtx, value)
+			if err != nil {
+				return err
+			}
+			if err := s.ensureArchiveImport(lockCtx, value); err != nil {
+				return err
+			}
+			value, err = s.repository.Get(lockCtx, id)
+			if err != nil {
+				return err
+			}
+			result = uploadView(value, parts)
+			result.TaskID = taskID
 			return nil
+		}
+		if value.Status == "failed" && value.IntakeProfile != nil &&
+			(value.IntakeProfile.ValidationStatus == ValidationMismatch ||
+				value.IntakeProfile.ValidationStatus == ValidationUnsupported) {
+			return completionValidationError(value)
 		}
 		if !value.ExpiresAt.After(s.config.Now()) {
 			return ErrExpired
 		}
 		if value.Status != "created" && value.Status != "uploading" &&
 			value.Status != "assembling" {
+			return ErrInvalidState
+		}
+		if value.IntakeProfile == nil {
 			return ErrInvalidState
 		}
 		parts, err := s.repository.ListParts(lockCtx, id)
@@ -362,6 +609,21 @@ func (s *Service) Complete(ctx context.Context, id string, principal auth.Princi
 			return err
 		}
 		defer os.Remove(assembly.StagingPath)
+		validation, err := s.detectInput(lockCtx, value, assembly.StagingPath)
+		if err != nil {
+			return err
+		}
+		if err := s.repository.RecordValidation(lockCtx, id, validation); err != nil {
+			return err
+		}
+		if validation.Status != ValidationValid {
+			_, _ = s.cleanupParts(lockCtx, id)
+			return &CompletionValidationError{
+				UploadID: id, InputCategory: validation.InputCategory,
+				DetectedCategory: validation.DetectedCategory,
+				DetectedFormat:   validation.DetectedFormat, Status: validation.Status,
+			}
+		}
 		if err := s.repository.PrepareCompletion(
 			lockCtx,
 			id,
@@ -380,16 +642,295 @@ func (s *Service) Complete(ctx context.Context, id string, principal auth.Princi
 		); err != nil {
 			return err
 		}
-		value.Status = "completed"
-		value.ActualSHA256 = assembly.SHA256
-		value.CompletedAt = &completedAt
-		result = uploadView(value, parts)
 		// Completion is already durable. A failed best-effort cleanup keeps the
 		// terminal upload and part records pending for maintenance or a replay.
 		_, _ = s.cleanupParts(lockCtx, id)
+		value, err = s.repository.Get(lockCtx, id)
+		if err != nil {
+			return err
+		}
+		taskID, err := s.ensureDirectTask(lockCtx, value)
+		if err != nil {
+			return err
+		}
+		if err := s.ensureArchiveImport(lockCtx, value); err != nil {
+			return err
+		}
+		value, err = s.repository.Get(lockCtx, id)
+		if err != nil {
+			return err
+		}
+		result = uploadView(value, parts)
+		result.TaskID = taskID
 		return nil
 	})
 	return result, err
+}
+
+func (s *Service) detectInput(
+	ctx context.Context,
+	value Upload,
+	path string,
+) (ValidationResult, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return ValidationResult{}, fmt.Errorf("open assembled upload for detection: %w", err)
+	}
+	defer file.Close()
+	detected, err := s.config.Detector.DetectContext(ctx, file, value.DeclaredSize)
+	if err != nil {
+		return ValidationResult{}, fmt.Errorf("detect assembled upload type: %w", err)
+	}
+	now := s.config.Now().UTC()
+	result := ValidationResult{
+		InputCategory:  value.IntakeProfile.InputCategory,
+		DetectedFormat: detected.Format,
+		ValidatedAt:    now,
+	}
+	detectedCategory, supported := inputcategory.ForFormat(detected.Format)
+	if !supported {
+		result.Status = ValidationUnsupported
+		result.ErrorCode = "unsupported_input_format"
+		result.ErrorMessage = "The detected format is not supported for task creation."
+		return result, nil
+	}
+	result.DetectedCategory = detectedCategory
+	if detectedCategory != value.IntakeProfile.InputCategory {
+		result.Status = ValidationMismatch
+		result.ErrorCode = "input_category_mismatch"
+		result.ErrorMessage = "The detected format does not match the selected input category."
+		return result, nil
+	}
+	result.Status = ValidationValid
+	return result, nil
+}
+
+func (s *Service) ensureArchiveImport(ctx context.Context, value Upload) error {
+	profile := value.IntakeProfile
+	if profile == nil || profile.SourceKind != SourceDirect ||
+		profile.InputCategory != inputcategory.Archive ||
+		profile.DetectedCategory != inputcategory.Archive ||
+		profile.ValidationStatus != ValidationValid {
+		return nil
+	}
+	if profile.ArchiveImportID != "" {
+		return nil
+	}
+	return s.ensureArchiveImportRequest(ctx, ArchiveImportCandidate{
+		UploadID: value.ID, CreatedBy: value.CreatedBy, Filename: value.DisplayName,
+		Size: value.DeclaredSize, SHA256: value.ActualSHA256,
+		DetectedFormat: profile.DetectedFormat,
+	})
+}
+
+func (s *Service) ensureArchiveImportRequest(
+	ctx context.Context,
+	candidate ArchiveImportCandidate,
+) error {
+	detectedCategory, supported := inputcategory.ForFormat(candidate.DetectedFormat)
+	if !uuidPattern.MatchString(candidate.UploadID) || candidate.CreatedBy == 0 ||
+		!validSnapshotText(candidate.Filename, 512) || candidate.Size < 0 ||
+		candidate.Size > s.config.MaxUploadBytes || !hashPattern.MatchString(candidate.SHA256) ||
+		!supported || detectedCategory != inputcategory.Archive {
+		return ErrInvalidState
+	}
+	if s.config.EnsureArchiveImport == nil {
+		return errors.New("archive import coordinator is not configured")
+	}
+	archiveImportID, err := s.config.EnsureArchiveImport(ctx, ArchiveImportRequest{
+		UploadID: candidate.UploadID, CreatedBy: candidate.CreatedBy,
+		Filename: candidate.Filename, Size: candidate.Size,
+		SHA256: candidate.SHA256, DetectedFormat: candidate.DetectedFormat,
+	})
+	if err != nil {
+		return fmt.Errorf("ensure archive import: %w", err)
+	}
+	if !uuidPattern.MatchString(archiveImportID) {
+		return errors.New("archive import coordinator returned an invalid UUID")
+	}
+	return s.repository.SetArchiveImportID(ctx, candidate.UploadID, archiveImportID)
+}
+
+func (s *Service) ensureDirectTask(ctx context.Context, value Upload) (string, error) {
+	profile := value.IntakeProfile
+	if profile == nil || profile.SourceKind != SourceDirect ||
+		profile.ValidationStatus != ValidationValid ||
+		(profile.InputCategory != inputcategory.Binary &&
+			profile.InputCategory != inputcategory.Container) {
+		return "", nil
+	}
+	if profile.DetectedCategory != profile.InputCategory {
+		return "", ErrInvalidState
+	}
+	return s.ensureDirectTaskRequest(ctx, DirectTaskCandidate{
+		UploadID: value.ID, CreatedBy: value.CreatedBy, Filename: value.DisplayName,
+		InputCategory: profile.InputCategory, DetectedFormat: profile.DetectedFormat,
+	})
+}
+
+func (s *Service) ensureDirectTaskRequest(
+	ctx context.Context,
+	candidate DirectTaskCandidate,
+) (string, error) {
+	detectedCategory, supported := inputcategory.ForFormat(candidate.DetectedFormat)
+	if !uuidPattern.MatchString(candidate.UploadID) || candidate.CreatedBy == 0 ||
+		!validSnapshotText(candidate.Filename, 512) || !supported ||
+		detectedCategory != candidate.InputCategory ||
+		(candidate.InputCategory != inputcategory.Binary &&
+			candidate.InputCategory != inputcategory.Container) {
+		return "", ErrInvalidState
+	}
+	if s.config.EnsureDirectTask == nil {
+		return "", errors.New("direct task coordinator is not configured")
+	}
+	request := DirectTaskRequest{
+		UploadID: candidate.UploadID, CreatedBy: candidate.CreatedBy,
+		Filename: candidate.Filename, TaskName: DirectTaskName(candidate.Filename),
+		IdempotencyKey: DirectTaskIdempotencyKey(candidate.UploadID),
+		InputCategory:  candidate.InputCategory, DetectedFormat: candidate.DetectedFormat,
+	}
+	taskID, err := s.config.EnsureDirectTask(ctx, request)
+	if err != nil {
+		return "", fmt.Errorf("ensure direct upload task: %w", err)
+	}
+	if !uuidPattern.MatchString(taskID) {
+		return "", errors.New("direct task coordinator returned an invalid UUID")
+	}
+	storedTaskID, found, err := s.repository.TaskIDForUpload(ctx, candidate.UploadID)
+	if err != nil {
+		return "", err
+	}
+	if !found || storedTaskID != taskID || !uuidPattern.MatchString(storedTaskID) {
+		return "", ErrConflict
+	}
+	return storedTaskID, nil
+}
+
+func DirectTaskName(filename string) string {
+	filename = strings.TrimSpace(filename)
+	runes := make([]rune, 0, maxDirectTaskNameRunes)
+	for _, character := range filename {
+		if unicode.IsControl(character) {
+			continue
+		}
+		runes = append(runes, character)
+		if len(runes) == maxDirectTaskNameRunes {
+			break
+		}
+	}
+	name := strings.TrimSpace(string(runes))
+	if name == "" {
+		return "Uploaded sample"
+	}
+	return name
+}
+
+func DirectTaskIdempotencyKey(uploadID string) string {
+	return directTaskKeyPrefix + uploadID
+}
+
+func (s *Service) RecoverDirectTasks(
+	ctx context.Context,
+	limit int,
+) (DirectTaskRecoveryReport, error) {
+	var report DirectTaskRecoveryReport
+	if limit < 1 || limit > MaxDirectTaskRecoveryBatch {
+		return report, ErrInvalidInput
+	}
+
+	s.directTaskRecoveryMu.Lock()
+	defer s.directTaskRecoveryMu.Unlock()
+	candidates, err := s.repository.ListDirectTaskCandidates(
+		ctx, s.directTaskRecoveryCursor, limit,
+	)
+	if err != nil {
+		return report, err
+	}
+	if len(candidates) == 0 && s.directTaskRecoveryCursor != "" {
+		s.directTaskRecoveryCursor = ""
+		report.Wrapped = true
+		candidates, err = s.repository.ListDirectTaskCandidates(ctx, "", limit)
+		if err != nil {
+			return report, err
+		}
+	}
+	if len(candidates) > 0 {
+		s.directTaskRecoveryCursor = candidates[len(candidates)-1].UploadID
+	}
+	report.Candidates = len(candidates)
+	errorsSeen := make([]error, 0)
+	for _, candidate := range candidates {
+		if err := ctx.Err(); err != nil {
+			return report, errors.Join(append(errorsSeen, err)...)
+		}
+		if _, err := s.ensureDirectTaskRequest(ctx, candidate); err != nil {
+			report.Failures++
+			report.Diagnostics = append(report.Diagnostics, DirectTaskRecoveryDiagnostic{
+				UploadID: candidate.UploadID, Err: err,
+			})
+			errorsSeen = append(errorsSeen, err)
+			continue
+		}
+		report.Ensured++
+	}
+	return report, errors.Join(errorsSeen...)
+}
+
+func (s *Service) RecoverArchiveImports(
+	ctx context.Context,
+	limit int,
+) (ArchiveImportRecoveryReport, error) {
+	var report ArchiveImportRecoveryReport
+	if limit < 1 || limit > MaxArchiveRecoveryBatch {
+		return report, ErrInvalidInput
+	}
+
+	s.archiveImportRecoveryMu.Lock()
+	defer s.archiveImportRecoveryMu.Unlock()
+	candidates, err := s.repository.ListArchiveImportCandidates(
+		ctx, s.archiveImportRecoveryCursor, limit,
+	)
+	if err != nil {
+		return report, err
+	}
+	if len(candidates) == 0 && s.archiveImportRecoveryCursor != "" {
+		s.archiveImportRecoveryCursor = ""
+		report.Wrapped = true
+		candidates, err = s.repository.ListArchiveImportCandidates(ctx, "", limit)
+		if err != nil {
+			return report, err
+		}
+	}
+	if len(candidates) > 0 {
+		s.archiveImportRecoveryCursor = candidates[len(candidates)-1].UploadID
+	}
+	report.Candidates = len(candidates)
+	errorsSeen := make([]error, 0)
+	for _, candidate := range candidates {
+		if err := ctx.Err(); err != nil {
+			return report, errors.Join(append(errorsSeen, err)...)
+		}
+		if err := s.ensureArchiveImportRequest(ctx, candidate); err != nil {
+			report.Failures++
+			report.Diagnostics = append(
+				report.Diagnostics,
+				ArchiveImportRecoveryDiagnostic{UploadID: candidate.UploadID, Err: err},
+			)
+			errorsSeen = append(errorsSeen, err)
+			continue
+		}
+		report.Ensured++
+	}
+	return report, errors.Join(errorsSeen...)
+}
+
+func completionValidationError(value Upload) error {
+	profile := value.IntakeProfile
+	return &CompletionValidationError{
+		UploadID: value.ID, InputCategory: profile.InputCategory,
+		DetectedCategory: profile.DetectedCategory,
+		DetectedFormat:   profile.DetectedFormat, Status: profile.ValidationStatus,
+	}
 }
 
 func (s *Service) cleanupParts(ctx context.Context, uploadID string) (bool, error) {
@@ -404,6 +945,9 @@ func (s *Service) cleanupParts(ctx context.Context, uploadID string) (bool, erro
 
 func (s *Service) validateCreate(input CreateInput) error {
 	if input.CreatedBy == 0 || input.Size < 0 || input.Size > s.config.MaxUploadBytes {
+		return ErrInvalidInput
+	}
+	if !input.InputCategory.Valid() {
 		return ErrInvalidInput
 	}
 	if !validUploadIdempotencyKey(input.IdempotencyKey) {
@@ -441,14 +985,16 @@ func validUploadIdempotencyKey(value string) bool {
 
 func createRequestFingerprint(input CreateInput) (string, error) {
 	payload, err := json.Marshal(struct {
-		Version     uint8  `json:"version"`
-		Operation   string `json:"operation"`
-		Filename    string `json:"filename"`
-		Size        int64  `json:"size"`
-		ContentType string `json:"content_type"`
+		Version       uint8                  `json:"version"`
+		Operation     string                 `json:"operation"`
+		Filename      string                 `json:"filename"`
+		Size          int64                  `json:"size"`
+		ContentType   string                 `json:"content_type"`
+		InputCategory inputcategory.Category `json:"input_category"`
 	}{
-		Version: 1, Operation: uploadCreateOperation,
+		Version: 2, Operation: uploadCreateOperation,
 		Filename: input.Filename, Size: input.Size, ContentType: input.ContentType,
+		InputCategory: input.InputCategory,
 	})
 	if err != nil {
 		return "", fmt.Errorf("encode upload creation fingerprint: %w", err)
@@ -695,6 +1241,19 @@ func uploadView(value Upload, parts []Part) View {
 	}
 	if value.Status == "completed" {
 		view.SHA256 = value.ActualSHA256
+	}
+	if profile := value.IntakeProfile; profile != nil {
+		view.InputCategory = profile.InputCategory
+		view.ValidationStatus = profile.ValidationStatus
+		view.DetectedCategory = profile.DetectedCategory
+		view.DetectedFormat = profile.DetectedFormat
+		view.ArchiveImportID = profile.ArchiveImportID
+		if profile.ValidationErrorCode != "" {
+			view.ValidationError = &ValidationErrorView{
+				Code:    profile.ValidationErrorCode,
+				Message: profile.ValidationErrorMessage,
+			}
+		}
 	}
 	return view
 }

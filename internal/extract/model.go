@@ -47,13 +47,22 @@ type ContainerImage struct {
 	WorkPath    string
 }
 
+// MaterializedFile is a regular logical-package member retained in the
+// caller-provided work directory. WorkPath is valid only until that directory
+// is removed and must never be persisted as a storage location.
+type MaterializedFile struct {
+	LocalID  int
+	WorkPath string
+}
+
 // Result contains all nodes retained before completion or a configured limit.
 type Result struct {
-	Nodes           []Node
-	ContainerImages []ContainerImage
-	ExpandedBytes   int64
-	Partial         bool
-	LimitCode       string
+	Nodes             []Node
+	ContainerImages   []ContainerImage
+	MaterializedFiles []MaterializedFile
+	ExpandedBytes     int64
+	Partial           bool
+	LimitCode         string
 
 	// Kept unexported for lifecycle regression tests. These values are not
 	// part of persisted results or the API contract.

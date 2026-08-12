@@ -90,6 +90,27 @@ describe('useChunkUpload', () => {
     })
   })
 
+  it('uses the task linked by Complete without posting a duplicate task', async () => {
+    const taskId = '90000000-0000-4000-8000-000000000001'
+    vi.spyOn(api, 'createUpload').mockResolvedValue(session())
+    vi.spyOn(api, 'uploadPart').mockResolvedValue(undefined)
+    vi.spyOn(api, 'completeUpload').mockResolvedValue({
+      ...completedUpload(),
+      task_id: taskId,
+    })
+    const createTask = vi.spyOn(api, 'createTask')
+    const uploads = useChunkUpload()
+    uploads.addFiles([new File(['abcd'], 'server-owned-task.bin')])
+
+    await uploads.startAll()
+
+    expect(createTask).not.toHaveBeenCalled()
+    expect(uploads.queue.value[0]).toMatchObject({
+      status: 'completed',
+      taskId,
+    })
+  })
+
   it('pauses after the in-flight part reaches its boundary', async () => {
     vi.spyOn(api, 'createUpload').mockResolvedValue(session())
     let resolvePart!: () => void

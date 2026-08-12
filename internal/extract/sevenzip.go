@@ -128,7 +128,12 @@ type sevenZipStage struct {
 	outputInfo  os.FileInfo
 	runInfo     os.FileInfo
 	archiveInfo os.FileInfo
-	cleanupOnce sync.Once
+
+	// External sandbox sessions bind outputRoot directly to an already-opened
+	// directory. In that mode outputPath may be /proc/self/fd/N and must not be
+	// revalidated with Lstat, because the procfs entry is a symlink by design.
+	outputDescriptorBound bool
+	cleanupOnce           sync.Once
 }
 
 // prepareSevenZipStage separates helper input, output, and cwd to make
@@ -380,6 +385,26 @@ func validateRootIdentity(
 	return nil
 }
 
+func validateSevenZipOutputIdentity(stage *sevenZipStage) error {
+	if stage == nil || stage.outputRoot == nil || stage.outputInfo == nil {
+		return errors.New("missing output directory identity")
+	}
+	if !stage.outputDescriptorBound {
+		return validateRootIdentity(
+			stage.outputPath,
+			stage.outputRoot,
+			stage.outputInfo,
+		)
+	}
+	rootInfo, err := stage.outputRoot.Lstat(".")
+	if err != nil || !rootInfo.IsDir() ||
+		rootInfo.Mode()&os.ModeSymlink != 0 ||
+		!os.SameFile(stage.outputInfo, rootInfo) {
+		return errors.New("opened output directory identity mismatch")
+	}
+	return nil
+}
+
 type sevenZipTreeEntry struct {
 	name string
 	info os.FileInfo
@@ -392,11 +417,7 @@ func snapshotSevenZipTree(
 	stage *sevenZipStage,
 	maximumEntries int,
 ) ([]sevenZipTreeEntry, error) {
-	if err := validateRootIdentity(
-		stage.outputPath,
-		stage.outputRoot,
-		stage.outputInfo,
-	); err != nil {
+	if err := validateSevenZipOutputIdentity(stage); err != nil {
 		return nil, fmt.Errorf("%w: output root changed: %v", errSevenZipUnsafeOutput, err)
 	}
 	rootDevice, deviceOK := fileDevice(stage.outputInfo)
@@ -894,7 +915,6 @@ func (adapter *trustedSevenZipAdapter) run(
 		"-bb0",
 		"-bso0",
 		"-bsp0",
-		"-spf-",
 		"-o" + stage.outputPath,
 		"--",
 		filepath.Join(stage.inputPath, sevenZipStagedArchiveFilename),

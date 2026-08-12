@@ -15,6 +15,7 @@ import (
 
 	"binaryscan/internal/auth"
 	"binaryscan/internal/buildinfo"
+	"binaryscan/internal/inputcategory"
 	"binaryscan/internal/storageguard"
 	"binaryscan/internal/upload"
 )
@@ -36,6 +37,7 @@ type CreateUploadCapture struct {
 	ContentType    string
 	CreatedBy      uint64
 	IdempotencyKey string
+	InputCategory  inputcategory.Category
 }
 
 func (s *uploadServiceStub) Create(_ context.Context, input upload.CreateInput) (upload.View, error) {
@@ -44,6 +46,7 @@ func (s *uploadServiceStub) Create(_ context.Context, input upload.CreateInput) 
 		Filename: input.Filename, Size: input.Size,
 		ContentType: input.ContentType, CreatedBy: input.CreatedBy,
 		IdempotencyKey: input.IdempotencyKey,
+		InputCategory:  input.InputCategory,
 	}
 	return s.view, s.err
 }
@@ -90,7 +93,7 @@ func TestCreateUploadContractAndRole(t *testing.T) {
 	}}
 	router := uploadTestRouter(t, manager, service)
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/uploads", strings.NewReader(
-		`{"filename":"sample.bin","size":42,"content_type":"application/octet-stream"}`,
+		`{"filename":"sample.bin","size":42,"content_type":"application/octet-stream","input_category":"binary"}`,
 	))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Idempotency-Key", "upload-request-1")
@@ -103,7 +106,7 @@ func TestCreateUploadContractAndRole(t *testing.T) {
 	if service.createdInput != (CreateUploadCapture{
 		Filename: "sample.bin", Size: 42,
 		ContentType: "application/octet-stream", CreatedBy: 7,
-		IdempotencyKey: "upload-request-1",
+		IdempotencyKey: "upload-request-1", InputCategory: inputcategory.Binary,
 	}) {
 		t.Fatalf("create input = %#v", service.createdInput)
 	}
@@ -123,7 +126,7 @@ func TestCreateUploadContractAndRole(t *testing.T) {
 	manager.session.User.Role = auth.RoleReader
 	denied := httptest.NewRecorder()
 	request = httptest.NewRequest(http.MethodPost, "/api/v1/uploads", strings.NewReader(
-		`{"filename":"sample.bin","size":42,"content_type":"application/octet-stream"}`,
+		`{"filename":"sample.bin","size":42,"content_type":"application/octet-stream","input_category":"binary"}`,
 	))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Idempotency-Key", "upload-request-2")
@@ -146,7 +149,7 @@ func TestCreateUploadRejectsUnknownJSONField(t *testing.T) {
 	service := &uploadServiceStub{}
 	router := uploadTestRouter(t, manager, service)
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/uploads", strings.NewReader(
-		`{"filename":"sample.bin","size":42,"content_type":"application/octet-stream","extra":true}`,
+		`{"filename":"sample.bin","size":42,"content_type":"application/octet-stream","input_category":"binary","extra":true}`,
 	))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Idempotency-Key", "upload-request-3")
@@ -155,6 +158,31 @@ func TestCreateUploadRejectsUnknownJSONField(t *testing.T) {
 	router.ServeHTTP(response, request)
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", response.Code)
+	}
+}
+
+func TestCreateUploadRequiresCanonicalInputCategory(t *testing.T) {
+	csrf := "csrf-token"
+	manager := &authManagerStub{
+		session:   auth.Session{User: auth.Principal{UserID: 7, Role: auth.RoleOperator}},
+		csrfToken: csrf,
+	}
+	for _, body := range []string{
+		`{"filename":"sample.bin","size":42,"content_type":"application/octet-stream"}`,
+		`{"filename":"sample.bin","size":42,"content_type":"application/octet-stream","input_category":"Binary"}`,
+		`{"filename":"sample.bin","size":42,"content_type":"application/octet-stream","input_category":"image"}`,
+	} {
+		service := &uploadServiceStub{}
+		router := uploadTestRouter(t, manager, service)
+		request := httptest.NewRequest(http.MethodPost, "/api/v1/uploads", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Idempotency-Key", "category-required")
+		addAuthAndCSRF(request, csrf)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest || service.createCalls != 0 {
+			t.Fatalf("body %s response = %d/%s, calls=%d", body, response.Code, response.Body.String(), service.createCalls)
+		}
 	}
 }
 
@@ -173,7 +201,7 @@ func TestCreateUploadRejectsQueryParametersBeforeService(t *testing.T) {
 		http.MethodPost,
 		"/api/v1/uploads?idempotency_key=must-not-be-accepted",
 		strings.NewReader(
-			`{"filename":"sample.bin","size":42,"content_type":"application/octet-stream"}`,
+			`{"filename":"sample.bin","size":42,"content_type":"application/octet-stream","input_category":"binary"}`,
 		),
 	)
 	request.Header.Set("Content-Type", "application/json")
@@ -220,7 +248,7 @@ func TestCreateUploadRequiresSingleValidIdempotencyKey(t *testing.T) {
 				http.MethodPost,
 				"/api/v1/uploads",
 				strings.NewReader(
-					`{"filename":"sample.bin","size":42,"content_type":"application/octet-stream"}`,
+					`{"filename":"sample.bin","size":42,"content_type":"application/octet-stream","input_category":"binary"}`,
 				),
 			)
 			request.Header.Set("Content-Type", "application/json")
@@ -259,7 +287,7 @@ func TestCreateUploadMapsIdempotencyConflictWithoutLeakingExistingUpload(t *test
 		http.MethodPost,
 		"/api/v1/uploads",
 		strings.NewReader(
-			`{"filename":"different.bin","size":42,"content_type":"application/octet-stream"}`,
+			`{"filename":"different.bin","size":42,"content_type":"application/octet-stream","input_category":"binary"}`,
 		),
 	)
 	request.Header.Set("Content-Type", "application/json")
@@ -291,7 +319,7 @@ func TestCreateUploadReturnsInsufficientStorageWithoutLeakingProbeDetails(
 		http.MethodPost,
 		"/api/v1/uploads",
 		strings.NewReader(
-			`{"filename":"sample.bin","size":42,"content_type":"application/octet-stream"}`,
+			`{"filename":"sample.bin","size":42,"content_type":"application/octet-stream","input_category":"binary"}`,
 		),
 	)
 	request.Header.Set("Content-Type", "application/json")
@@ -368,6 +396,31 @@ func TestCompleteUploadRejectsNonEmptyChunkedBody(t *testing.T) {
 	}
 }
 
+func TestCompleteUploadReturnsDetectedCategoryMismatchDetails(t *testing.T) {
+	csrf := "csrf-token"
+	manager := &authManagerStub{
+		session:   auth.Session{User: auth.Principal{UserID: 7, Role: auth.RoleOperator}},
+		csrfToken: csrf,
+	}
+	uploadID := "123e4567-e89b-42d3-a456-426614174000"
+	service := &uploadServiceStub{err: &upload.CompletionValidationError{
+		UploadID: uploadID, InputCategory: inputcategory.Binary,
+		DetectedCategory: inputcategory.Archive, DetectedFormat: "zip",
+		Status: upload.ValidationMismatch,
+	}}
+	router := uploadTestRouter(t, manager, service)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/uploads/"+uploadID+"/complete", nil)
+	addAuthAndCSRF(request, csrf)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusUnprocessableEntity ||
+		!strings.Contains(response.Body.String(), `"code":"input_category_mismatch"`) ||
+		!strings.Contains(response.Body.String(), `"detected_category":"archive"`) ||
+		!strings.Contains(response.Body.String(), `"detected_format":"zip"`) {
+		t.Fatalf("response = %d/%s", response.Code, response.Body.String())
+	}
+}
+
 func TestDeleteUploadRequiresCSRFAndReturnsNoContent(t *testing.T) {
 	const uploadID = "123e4567-e89b-42d3-a456-426614174000"
 	csrf := "csrf-token"
@@ -418,7 +471,7 @@ func TestUploadInternalErrorIsLoggedButNotExposed(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(&logOutput, nil))
 	router := uploadTestRouterWithLogger(t, manager, service, logger)
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/uploads", strings.NewReader(
-		`{"filename":"sample.bin","size":42,"content_type":"application/octet-stream"}`,
+		`{"filename":"sample.bin","size":42,"content_type":"application/octet-stream","input_category":"binary"}`,
 	))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Idempotency-Key", "upload-internal-error")

@@ -2,9 +2,13 @@ package upload
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"strings"
 	"testing"
 	"time"
+
+	"binaryscan/internal/inputcategory"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/go-sql-driver/mysql"
@@ -29,6 +33,12 @@ func TestCreatePersistsUploadAndIdempotencyRecordAtomically(t *testing.T) {
 		Status:       "created",
 		ExpiresAt:    now.Add(time.Hour),
 		CreatedAt:    now,
+		IntakeProfile: &IntakeProfile{
+			UploadID:         "123e4567-e89b-42d3-a456-426614174000",
+			InputCategory:    inputcategory.Binary,
+			ValidationStatus: ValidationPending,
+			SourceKind:       SourceDirect,
+		},
 	}
 	fingerprint := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
@@ -54,6 +64,9 @@ func TestCreatePersistsUploadAndIdempotencyRecordAtomically(t *testing.T) {
 			"create",
 			fingerprint,
 		).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`(?s)INSERT INTO upload_intake_profiles`).
+		WithArgs(value.ID, string(inputcategory.Binary)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
@@ -98,13 +111,19 @@ func TestResolveCreateReturnsCreationSnapshotAndRejectsFingerprintConflict(t *te
 			fingerprint,
 		)
 	}
-	for range 2 {
-		mock.ExpectQuery(
-			`(?s)SELECT id, created_by, original_name.*request_fingerprint.*FROM uploads.*LIMIT 1`,
-		).
-			WithArgs(uint64(7), "create", "stable-key").
-			WillReturnRows(row())
-	}
+	mock.ExpectQuery(
+		`(?s)SELECT id, created_by, original_name.*request_fingerprint.*FROM uploads.*LIMIT 1`,
+	).
+		WithArgs(uint64(7), "create", "stable-key").
+		WillReturnRows(row())
+	mock.ExpectQuery(`(?s)FROM upload_intake_profiles.*WHERE upload_id = \?`).
+		WithArgs("123e4567-e89b-42d3-a456-426614174000").
+		WillReturnRows(pendingIntakeProfileRows(now, "123e4567-e89b-42d3-a456-426614174000"))
+	mock.ExpectQuery(
+		`(?s)SELECT id, created_by, original_name.*request_fingerprint.*FROM uploads.*LIMIT 1`,
+	).
+		WithArgs(uint64(7), "create", "stable-key").
+		WillReturnRows(row())
 
 	stored, found, err := repository.ResolveCreate(
 		context.Background(),
@@ -159,6 +178,12 @@ func TestCreateResolvesConcurrentUniqueKeyWinner(t *testing.T) {
 		Status:       "created",
 		ExpiresAt:    now.Add(time.Hour),
 		CreatedAt:    now,
+		IntakeProfile: &IntakeProfile{
+			UploadID:         "123e4567-e89b-42d3-a456-426614174000",
+			InputCategory:    inputcategory.Binary,
+			ValidationStatus: ValidationPending,
+			SourceKind:       SourceDirect,
+		},
 	}
 	winnerID := "223e4567-e89b-42d3-a456-426614174000"
 
@@ -203,6 +228,9 @@ func TestCreateResolvesConcurrentUniqueKeyWinner(t *testing.T) {
 			now,
 			fingerprint,
 		))
+	mock.ExpectQuery(`(?s)FROM upload_intake_profiles.*WHERE upload_id = \?`).
+		WithArgs(winnerID).
+		WillReturnRows(pendingIntakeProfileRows(now, winnerID))
 
 	stored, created, err := repository.Create(
 		context.Background(),
@@ -222,6 +250,109 @@ func TestCreateResolvesConcurrentUniqueKeyWinner(t *testing.T) {
 	}
 }
 
+func TestCreateDerivedCompletedRetainsBlobOnceAcrossReplay(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := NewMySQLRepository(db)
+	now := time.Date(2026, 8, 11, 1, 2, 3, 0, time.UTC)
+	uploadID := "323e4567-e89b-42d3-a456-426614174000"
+	parentID := "123e4567-e89b-42d3-a456-426614174000"
+	hash := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	blobID := uint64(19)
+	profile := &IntakeProfile{
+		UploadID: uploadID, InputCategory: inputcategory.Binary,
+		DetectedCategory: inputcategory.Binary, DetectedFormat: "pe32",
+		ValidationStatus: ValidationValid, SourceKind: SourceArchiveEntry,
+		SourceParentUploadID: parentID, SourceArchiveName: "bundle.zip",
+		SourceEntryPath: "nested/member.bin", ValidatedAt: &now,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	value := Upload{
+		ID: uploadID, CreatedBy: 7, OriginalName: []byte("member.bin"),
+		DisplayName: "member.bin", ContentType: "application/octet-stream",
+		DeclaredSize: 4, PartSize: DefaultPartSize, ActualSHA256: hash,
+		Status: "completed", BlobID: &blobID, ExpiresAt: now.Add(time.Hour),
+		CompletedAt: &now, PartsCleanedAt: &now, CreatedAt: now,
+		IntakeProfile: profile,
+	}
+	record := DerivedCompletedRecord{
+		Upload: value, IdempotencyKey: "entry-key",
+		RequestFingerprint: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+	}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`(?s)SELECT id, created_by, original_name.*FROM uploads.*FOR UPDATE`).
+		WithArgs(uint64(7), archiveEntryCreateOperation, "entry-key").
+		WillReturnRows(idempotentCreateRows())
+	mock.ExpectQuery(`(?s)SELECT sha256, size_bytes, state, deleted_at.*FROM blobs.*FOR UPDATE`).
+		WithArgs(blobID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"sha256", "size_bytes", "state", "deleted_at",
+		}).AddRow(hash, int64(4), "available", nil))
+	mock.ExpectExec(`(?s)UPDATE blobs.*reference_count = reference_count \+ 1`).
+		WithArgs(blobID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`(?s)INSERT INTO uploads.*'completed'`).
+		WithArgs(
+			uploadID, uint64(7), []byte("member.bin"), "member.bin",
+			"application/octet-stream", int64(4), int64(DefaultPartSize), hash,
+			blobID, value.ExpiresAt, now, now, "entry-key", archiveEntryCreateOperation,
+			record.RequestFingerprint, now,
+		).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`(?s)INSERT INTO upload_intake_profiles.*'archive_entry'`).
+		WithArgs(
+			uploadID, "binary", "binary", "pe32", parentID, "bundle.zip",
+			"nested/member.bin", now, now,
+		).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	stored, created, err := repository.CreateDerivedCompleted(context.Background(), record)
+	if err != nil || !created || stored.ID != uploadID {
+		t.Fatalf("CreateDerivedCompleted() = %#v/%v/%v", stored, created, err)
+	}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`(?s)SELECT id, created_by, original_name.*FROM uploads.*FOR UPDATE`).
+		WithArgs(uint64(7), archiveEntryCreateOperation, "entry-key").
+		WillReturnRows(idempotentCreateRows().AddRow(
+			uploadID, uint64(7), []byte("member.bin"), "member.bin",
+			"application/octet-stream", int64(4), int64(DefaultPartSize),
+			value.ExpiresAt, now, record.RequestFingerprint,
+		))
+	mock.ExpectQuery(`(?s)FROM upload_intake_profiles.*WHERE upload_id = \?`).
+		WithArgs(uploadID).
+		WillReturnRows(validDerivedProfileRows(now, uploadID, parentID))
+	mock.ExpectQuery(`(?s)SELECT id, created_by, original_name.*FROM uploads.*WHERE id = \?`).
+		WithArgs(uploadID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "created_by", "original_name", "display_name", "content_type",
+			"declared_size_bytes", "part_size_bytes", "expected_sha256", "actual_sha256",
+			"status", "blob_id", "expires_at", "completed_at", "parts_cleaned_at", "created_at",
+		}).AddRow(
+			uploadID, uint64(7), []byte("member.bin"), "member.bin", "application/octet-stream",
+			int64(4), int64(DefaultPartSize), nil, hash, "completed", blobID,
+			value.ExpiresAt, now, now, now,
+		))
+	mock.ExpectQuery(`(?s)FROM upload_intake_profiles.*WHERE upload_id = \?`).
+		WithArgs(uploadID).
+		WillReturnRows(validDerivedProfileRows(now, uploadID, parentID))
+	mock.ExpectCommit()
+
+	stored, created, err = repository.CreateDerivedCompleted(context.Background(), record)
+	if err != nil || created || stored.Status != "completed" || stored.BlobID == nil ||
+		stored.IntakeProfile == nil || stored.IntakeProfile.SourceEntryPath != "nested/member.bin" {
+		t.Fatalf("derived replay = %#v/%v/%v", stored, created, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func idempotentCreateRows() *sqlmock.Rows {
 	return sqlmock.NewRows([]string{
 		"id",
@@ -235,6 +366,30 @@ func idempotentCreateRows() *sqlmock.Rows {
 		"created_at",
 		"request_fingerprint",
 	})
+}
+
+func pendingIntakeProfileRows(now time.Time, uploadID string) *sqlmock.Rows {
+	return sqlmock.NewRows([]string{
+		"upload_id", "input_category", "detected_category", "detected_format",
+		"validation_status", "validation_error_code", "validation_error_message",
+		"source_kind", "source_parent_upload_id", "source_archive_name",
+		"source_entry_path", "archive_import_id", "validated_at", "created_at", "updated_at",
+	}).AddRow(
+		uploadID, "binary", nil, nil, "pending", nil, nil, "direct",
+		nil, nil, nil, nil, nil, now, now,
+	)
+}
+
+func validDerivedProfileRows(now time.Time, uploadID string, parentID string) *sqlmock.Rows {
+	return sqlmock.NewRows([]string{
+		"upload_id", "input_category", "detected_category", "detected_format",
+		"validation_status", "validation_error_code", "validation_error_message",
+		"source_kind", "source_parent_upload_id", "source_archive_name",
+		"source_entry_path", "archive_import_id", "validated_at", "created_at", "updated_at",
+	}).AddRow(
+		uploadID, "binary", "binary", "pe32", "valid", nil, nil, "archive_entry",
+		parentID, "bundle.zip", "nested/member.bin", nil, now, now, now,
+	)
 }
 
 func TestPrepareCompletionPersistsBlobReferenceBeforePublication(t *testing.T) {
@@ -276,6 +431,102 @@ func TestPrepareCompletionPersistsBlobReferenceBeforePublication(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRecordValidationRejectsMismatchAtomicallyAndReplays(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := NewMySQLRepository(db)
+	uploadID := "123e4567-e89b-42d3-a456-426614174000"
+	now := time.Date(2026, 8, 11, 2, 3, 4, 0, time.UTC)
+	result := ValidationResult{
+		Status: ValidationMismatch, InputCategory: inputcategory.Binary,
+		DetectedCategory: inputcategory.Archive, DetectedFormat: "zip",
+		ErrorCode:    "input_category_mismatch",
+		ErrorMessage: "The detected format does not match the selected input category.",
+		ValidatedAt:  now,
+	}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`(?s)SELECT upload.status, intake.input_category.*FOR UPDATE`).
+		WithArgs(uploadID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"status", "input_category", "detected_category", "detected_format",
+			"validation_status", "validation_error_code", "validation_error_message",
+		}).AddRow("uploading", "binary", nil, nil, "pending", nil, nil))
+	mock.ExpectExec(`(?s)UPDATE upload_intake_profiles.*validation_status = \?`).
+		WithArgs(
+			"archive", "zip", "mismatch", "input_category_mismatch",
+			result.ErrorMessage, now, uploadID,
+		).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`(?s)UPDATE uploads.*status = 'failed'`).
+		WithArgs(uploadID, "uploading").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	if err := repository.RecordValidation(context.Background(), uploadID, result); err != nil {
+		t.Fatal(err)
+	}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`(?s)SELECT upload.status, intake.input_category.*FOR UPDATE`).
+		WithArgs(uploadID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"status", "input_category", "detected_category", "detected_format",
+			"validation_status", "validation_error_code", "validation_error_message",
+		}).AddRow(
+			"failed", "binary", "archive", "zip", "mismatch",
+			"input_category_mismatch", result.ErrorMessage,
+		))
+	mock.ExpectCommit()
+	if err := repository.RecordValidation(context.Background(), uploadID, result); err != nil {
+		t.Fatalf("replayed RecordValidation() error = %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSetArchiveImportIDIsImmutableAndIdempotent(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := NewMySQLRepository(db)
+	uploadID := "123e4567-e89b-42d3-a456-426614174000"
+	importID := "323e4567-e89b-42d3-a456-426614174000"
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`(?s)SELECT upload.status, intake.input_category.*FOR UPDATE`).
+		WithArgs(uploadID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"status", "input_category", "validation_status", "archive_import_id",
+		}).AddRow("completed", "archive", "valid", nil))
+	mock.ExpectExec(`(?s)UPDATE upload_intake_profiles.*archive_import_id = \?`).
+		WithArgs(importID, uploadID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	if err := repository.SetArchiveImportID(context.Background(), uploadID, importID); err != nil {
+		t.Fatal(err)
+	}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`(?s)SELECT upload.status, intake.input_category.*FOR UPDATE`).
+		WithArgs(uploadID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"status", "input_category", "validation_status", "archive_import_id",
+		}).AddRow("completed", "archive", "valid", importID))
+	mock.ExpectCommit()
+	if err := repository.SetArchiveImportID(context.Background(), uploadID, importID); err != nil {
+		t.Fatalf("replayed SetArchiveImportID() error = %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
@@ -538,6 +789,106 @@ func TestCleanupPartsReplayConvergesAfterAmbiguousCommit(t *testing.T) {
 	}
 }
 
+func TestUploadHasTaskTreatsEveryTaskStateAsRetained(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := NewMySQLRepository(db)
+	uploadID := "123e4567-e89b-42d3-a456-426614174000"
+
+	mock.ExpectQuery(`(?s)SELECT EXISTS.*FROM tasks.*WHERE upload_id = \?`).
+		WithArgs(uploadID).
+		WillReturnRows(sqlmock.NewRows([]string{"retained"}).AddRow(true))
+	retained, err := repository.UploadHasTask(context.Background(), uploadID)
+	if err != nil || !retained {
+		t.Fatalf("UploadHasTask() = (%v, %v)", retained, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTaskIDForUploadReturnsAuthoritativeTaskIncludingDeletedTombstone(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := NewMySQLRepository(db)
+	uploadID := "123e4567-e89b-42d3-a456-426614174000"
+	taskID := "223e4567-e89b-42d3-a456-426614174000"
+
+	// Deliberately require no task-status predicate: a soft-deleted task remains
+	// the exactly-once tombstone for this upload.
+	mock.ExpectQuery(`SELECT id\s+FROM tasks\s+WHERE upload_id = \?\s+LIMIT 1`).
+		WithArgs(uploadID).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(taskID))
+	stored, found, err := repository.TaskIDForUpload(context.Background(), uploadID)
+	if err != nil || !found || stored != taskID {
+		t.Fatalf("TaskIDForUpload() = (%q, %v, %v)", stored, found, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestListDirectTaskCandidatesUsesEligibleStableBoundedQuery(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := NewMySQLRepository(db)
+	afterID := "123e4567-e89b-42d3-a456-426614174000"
+	uploadID := "223e4567-e89b-42d3-a456-426614174000"
+
+	mock.ExpectQuery(`(?s)SELECT upload[.]id, upload[.]created_by, upload[.]display_name,.*FROM uploads upload.*JOIN upload_intake_profiles.*JOIN blobs.*upload[.]id > \?.*upload[.]status = 'completed'.*source_kind = 'direct'.*validation_status = 'valid'.*input_category IN \('binary', 'container'\).*detected_category = intake[.]input_category.*stored_blob[.]state = 'available'.*NOT EXISTS \(\s*SELECT 1\s*FROM tasks\s*WHERE tasks[.]upload_id = upload[.]id\s*\).*ORDER BY upload[.]id.*LIMIT \?`).
+		WithArgs(afterID, 10).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "created_by", "display_name", "input_category", "detected_format",
+		}).AddRow(uploadID, uint64(7), "sample.bin", "binary", "pe32"))
+	candidates, err := repository.ListDirectTaskCandidates(
+		context.Background(), afterID, 10,
+	)
+	if err != nil || len(candidates) != 1 || candidates[0].UploadID != uploadID ||
+		candidates[0].InputCategory != inputcategory.Binary ||
+		candidates[0].DetectedFormat != "pe32" {
+		t.Fatalf("ListDirectTaskCandidates() = (%#v, %v)", candidates, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestListArchiveImportCandidatesUsesEligibleStableBoundedQuery(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := NewMySQLRepository(db)
+	afterID := "123e4567-e89b-42d3-a456-426614174000"
+	uploadID := "223e4567-e89b-42d3-a456-426614174000"
+
+	mock.ExpectQuery(`(?s)SELECT upload[.]id, upload[.]created_by, upload[.]display_name,.*declared_size_bytes, upload[.]actual_sha256, intake[.]detected_format.*FROM uploads upload.*JOIN upload_intake_profiles.*JOIN blobs.*upload[.]id > \?.*upload[.]status = 'completed'.*source_kind = 'direct'.*validation_status = 'valid'.*input_category = 'archive'.*detected_category = 'archive'.*detected_format IS NOT NULL.*archive_import_id IS NULL.*actual_sha256 IS NOT NULL.*stored_blob[.]state = 'available'.*ORDER BY upload[.]id.*LIMIT \?`).
+		WithArgs(afterID, 10).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "created_by", "display_name", "declared_size_bytes", "actual_sha256", "detected_format",
+		}).AddRow(uploadID, uint64(7), "bundle.zip", int64(4), strings.Repeat("a", 64), "zip"))
+	candidates, err := repository.ListArchiveImportCandidates(
+		context.Background(), afterID, 10,
+	)
+	if err != nil || len(candidates) != 1 || candidates[0].UploadID != uploadID ||
+		candidates[0].Size != 4 || candidates[0].DetectedFormat != "zip" {
+		t.Fatalf("ListArchiveImportCandidates() = (%#v, %v)", candidates, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCancelTransitionsStateAndLeavesPartRowsForRecoverableCleanup(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -566,7 +917,7 @@ func TestCancelTransitionsStateAndLeavesPartRowsForRecoverableCleanup(t *testing
 	}
 }
 
-func TestCancelRejectsUploadWhoseStateChanged(t *testing.T) {
+func TestCancelRejectsCompletedUploadRetainedByTask(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatal(err)
@@ -581,6 +932,9 @@ func TestCancelRejectsUploadWhoseStateChanged(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows(
 			[]string{"status", "blob_id"},
 		).AddRow("completed", 9))
+	mock.ExpectQuery(`(?s)SELECT id.*FROM tasks.*WHERE upload_id = \?`).
+		WithArgs(uploadID).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("task-id"))
 	mock.ExpectRollback()
 
 	if err := repository.Cancel(context.Background(), uploadID); err != ErrInvalidState {
@@ -627,6 +981,41 @@ func TestCancelReleasesPreparedBlobReferenceAtomically(t *testing.T) {
 	}
 }
 
+func TestCancelReleasesCompletedUnusedBlobReferenceAtomically(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := NewMySQLRepository(db)
+	uploadID := "123e4567-e89b-42d3-a456-426614174000"
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`(?s)SELECT status, blob_id.*FROM uploads.*FOR UPDATE`).
+		WithArgs(uploadID).
+		WillReturnRows(sqlmock.NewRows([]string{"status", "blob_id"}).AddRow("completed", 9))
+	mock.ExpectQuery(`(?s)SELECT id.*FROM tasks.*WHERE upload_id = \?`).
+		WithArgs(uploadID).
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectQuery(`(?s)SELECT reference_count, state.*FROM blobs.*FOR UPDATE`).
+		WithArgs(uint64(9)).
+		WillReturnRows(sqlmock.NewRows([]string{"reference_count", "state"}).AddRow(1, "available"))
+	mock.ExpectExec(`(?s)UPDATE blobs.*state = \?.*reference_count = reference_count - 1`).
+		WithArgs("deleting", uint64(9), "available", uint64(1)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`(?s)UPDATE uploads.*status = 'cancelled'.*blob_id = NULL`).
+		WithArgs(uploadID, "completed").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	if err := repository.Cancel(context.Background(), uploadID); err != nil {
+		t.Fatal(err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestWithLockUsesReservedConnectionForRepositoryCalls(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -653,6 +1042,14 @@ func TestWithLockUsesReservedConnectionForRepositoryCalls(t *testing.T) {
 			4, DefaultPartSize, nil, nil, "created", nil, now.Add(time.Hour), nil, nil,
 			now,
 		))
+	mock.ExpectQuery(`(?s)FROM upload_intake_profiles.*WHERE upload_id = \?`).
+		WithArgs(uploadID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"upload_id", "input_category", "detected_category", "detected_format",
+			"validation_status", "validation_error_code", "validation_error_message",
+			"source_kind", "source_parent_upload_id", "source_archive_name",
+			"source_entry_path", "archive_import_id", "validated_at", "created_at", "updated_at",
+		}))
 	mock.ExpectQuery("SELECT RELEASE_LOCK").
 		WithArgs("binaryscan_upload_" + uploadID).
 		WillReturnRows(sqlmock.NewRows([]string{"released"}).AddRow(1))

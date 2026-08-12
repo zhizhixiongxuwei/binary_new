@@ -1,11 +1,19 @@
 <script setup lang="ts">
-import { ArrowUpRight, CircleCheck, Pause, Play, RotateCw, Trash2 } from 'lucide-vue-next'
+import {
+  ArrowUpRight,
+  CircleCheck,
+  Pause,
+  Play,
+  RotateCw,
+  Trash2,
+  X,
+} from 'lucide-vue-next'
 
-import type { UploadQueueItem } from '@/composables/useChunkUpload'
+import type { UploadQueueDisplayItem } from '@/components/uploads/uploadQueueTypes'
 import { formatBytes } from '@/utils/formatters'
 
 defineProps<{
-  items: readonly UploadQueueItem[]
+  items: readonly UploadQueueDisplayItem[]
   activeId: string | null
 }>()
 
@@ -15,6 +23,7 @@ const emit = defineEmits<{
   resume: [id: string]
   retry: [id: string]
   openTask: [taskId: string]
+  clearCompleted: [id: string]
 }>()
 
 const labels = {
@@ -22,6 +31,7 @@ const labels = {
   uploading: '上传中',
   paused: '已暂停',
   completed: '任务已创建',
+  archive: '归档已上传',
   failed: '上传失败',
 } as const
 </script>
@@ -42,7 +52,7 @@ const labels = {
         <el-progress
           :percentage="item.progress"
           :stroke-width="5"
-          :status="item.status === 'failed' ? 'exception' : item.status === 'completed' ? 'success' : undefined"
+          :status="item.status === 'failed' ? 'exception' : item.status === 'completed' || item.status === 'archive' ? 'success' : undefined"
           :aria-label="`${item.file.name} 上传进度 ${item.progress}%`"
         />
         <div class="upload-row__state" aria-live="polite">
@@ -58,6 +68,12 @@ const labels = {
             {{ labels[item.status] }}
           </span>
           <span v-if="item.errorMessage" class="upload-row__error">{{ item.errorMessage }}</span>
+          <span
+            v-else-if="item.detectedFormat"
+            class="upload-row__format mono"
+          >
+            {{ item.detectedFormat }}
+          </span>
         </div>
       </div>
       <div class="upload-row__commands">
@@ -71,6 +87,15 @@ const labels = {
         >
           <ArrowUpRight :size="17" aria-hidden="true" />
           <span>查看任务</span>
+        </button>
+        <button
+          v-if="item.status === 'completed' && item.taskId"
+          type="button"
+          aria-label="从列表清除"
+          title="从列表清除"
+          @click="emit('clearCompleted', item.localId)"
+        >
+          <X :size="17" aria-hidden="true" />
         </button>
         <button
           v-if="item.status === 'uploading'"
@@ -101,7 +126,7 @@ const labels = {
           <RotateCw :size="17" aria-hidden="true" />
         </button>
         <button
-          v-if="item.status !== 'uploading' && item.status !== 'completed'"
+          v-if="item.status !== 'uploading' && item.status !== 'completed' && item.status !== 'archive'"
           type="button"
           :aria-label="item.removing ? '正在移除文件' : '移除文件'"
           :title="item.removing ? '正在移除文件' : '移除文件'"
@@ -204,6 +229,12 @@ const labels = {
   text-align: right;
 }
 
+.upload-row__format {
+  color: var(--ink-400);
+  font-size: 10px;
+}
+
+.upload-row__status--archive,
 .upload-row__status--completed {
   color: var(--teal-strong);
 }
