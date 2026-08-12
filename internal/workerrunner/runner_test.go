@@ -187,6 +187,45 @@ func TestRunnerWaitsWhenNoJobAndStopsOnCancellation(t *testing.T) {
 	}
 }
 
+func TestRunnerDoesNotClaimUntilClaimGateRecovers(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var gateCalls atomic.Int32
+	var claims atomic.Int32
+	stub := &queueStub{
+		claim: func(context.Context, queue.Kind, string) (queue.Lease, bool, error) {
+			claims.Add(1)
+			return testLease(), true, nil
+		},
+		finish: func(context.Context, queue.Lease, queue.FinishInput) error {
+			cancel()
+			return nil
+		},
+	}
+	runner := newTestRunner(t, stub, processorFunc(func(
+		context.Context,
+		queue.Lease,
+	) (queue.FinishInput, error) {
+		return queue.FinishInput{Outcome: queue.OutcomeSucceeded}, nil
+	}), Config{
+		Kind: queue.KindJavaAnalysis, Owner: "worker-1",
+		PollInterval: time.Millisecond, HeartbeatInterval: time.Hour,
+		ClaimGate: func(context.Context) error {
+			if gateCalls.Add(1) < 3 {
+				return errors.New("checker unavailable")
+			}
+			return nil
+		},
+	})
+	waitRun(t, runAsync(runner, ctx))
+	if gateCalls.Load() != 3 || claims.Load() != 1 {
+		t.Fatalf(
+			"claim gate calls=%d claims=%d, want 3/1",
+			gateCalls.Load(), claims.Load(),
+		)
+	}
+}
+
 func TestRunnerStartsHeartbeatsAndFinishesWithRenewedLease(t *testing.T) {
 	lease := testLease()
 	renewedUntil := lease.LeaseUntil.Add(time.Minute)

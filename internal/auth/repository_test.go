@@ -39,6 +39,41 @@ WHERE id = ? AND password_hash = ? AND status = 'active'`)).
 	}
 }
 
+func TestCreateInitialAdministratorKeepsFixedCredentialActive(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := NewMySQLRepository(db)
+
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT GET_LOCK(?, ?)")).
+		WithArgs("binaryscan_initial_administrator", 30).
+		WillReturnRows(sqlmock.NewRows([]string{"acquired"}).AddRow(1))
+	mock.ExpectExec(regexp.QuoteMeta(`
+INSERT INTO users (
+    public_id, username, display_name, password_hash, role, status, force_password_change
+)
+SELECT ?, ?, ?, ?, 'administrator', 'active', ?
+WHERE NOT EXISTS (SELECT 1 FROM users LIMIT 1)`)).
+		WithArgs("user-id", "admin", "Administrator", "password-hash", false).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(regexp.QuoteMeta("SELECT RELEASE_LOCK(?)")).
+		WithArgs("binaryscan_initial_administrator").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	err = repository.CreateInitialAdministrator(context.Background(), User{
+		PublicID: "user-id", Username: "admin", DisplayName: "Administrator",
+		PasswordHash: "password-hash",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCompleteLoginRejectsChangedPasswordHash(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {

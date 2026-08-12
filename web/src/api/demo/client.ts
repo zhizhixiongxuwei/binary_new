@@ -10,6 +10,8 @@ import {
 } from '@/api/demo/fixtures'
 import type {
   AdminUser,
+  ArchiveImport,
+  ArchiveImportEntry,
   AuditLog,
   AuditLogListQuery,
   CompletedUpload,
@@ -36,6 +38,12 @@ interface DemoUpload {
   session: UploadSession
   parts: Set<number>
   completed?: CompletedUpload
+}
+
+interface DemoArchiveImport {
+  value: ArchiveImport
+  entries: ArchiveImportEntry[]
+  batchResults: Map<string, string>
 }
 
 const DEMO_PART_SIZE = 32 * 1024 * 1024
@@ -216,6 +224,7 @@ export function createDemoApiClient(options: DemoApiOptions = {}): ApiClient {
     ]),
   )
   const uploads = new Map<string, DemoUpload>()
+  const archiveImports = new Map<string, DemoArchiveImport>()
   const uploadByIdempotencyKey = new Map<
     string,
     { fingerprint: string; uploadId: string }
@@ -259,6 +268,74 @@ export function createDemoApiClient(options: DemoApiOptions = {}): ApiClient {
       throw new ApiError('示例上传会话不存在', 404, { code: 'UPLOAD_NOT_FOUND' })
     }
     return upload
+  }
+
+  function ensureDirectUploadTask(
+    upload: DemoUpload,
+    user: CurrentUser,
+  ): string {
+    if (!upload.completed) {
+      throw new ApiError('示例文件尚未完成上传', 409, {
+        code: 'upload_not_completed',
+      })
+    }
+    if (upload.completed.task_id) return upload.completed.task_id
+    if (upload.input.input_category === 'archive') {
+      throw new ApiError('示例归档上传不能创建外层任务', 409, {
+        code: 'task_conflict',
+      })
+    }
+
+    taskCounter += 1
+    const id = createdTaskId(taskCounter)
+    const createdAt = `2026-07-30T10:${String(taskCounter).padStart(2, '0')}:00+08:00`
+    tasks.unshift({
+      id,
+      name: upload.input.filename,
+      input_type: inferredInputFormat(upload.input.filename),
+      status: 'QUEUED',
+      risk_level: 'UNKNOWN',
+      progress: 0,
+      progress_indeterminate: false,
+      creator_id: user.id,
+      creator_name: user.display_name,
+      tags: ['UI-PREVIEW'],
+      created_at: createdAt,
+      original_filename: upload.input.filename,
+      size_bytes: upload.completed.size_bytes,
+      sha256: upload.completed.sha256,
+      sample_expires_at: '2026-08-29T10:00:00+08:00',
+      sample_deleted_at: null,
+    })
+    fileNodes.set(id, [
+      {
+        id: createdNodeId(taskCounter),
+        parent_id: null,
+        logical_path: `/${upload.input.filename}`,
+        display_name: upload.input.filename,
+        archive_name_id: '',
+        node_type: 'file',
+        depth: 0,
+        format: upload.input.filename.split('.').pop()?.toLowerCase() ?? '',
+        mime_type: upload.input.content_type,
+        architecture: '',
+        size_bytes: upload.input.size,
+        sha256: upload.completed.sha256,
+        extraction_status: 'queued',
+        error_code: '',
+        error_message: '',
+        source_container: null,
+        has_children: false,
+        metadata_json: {
+          preview_fixture: true,
+          note: '纯前端示例任务，不会持久化或执行真实检测',
+        },
+        source_parent: null,
+      },
+    ])
+    upload.completed = { ...upload.completed, task_id: id }
+    upload.session = upload.completed
+    return id
   }
 
   return {
@@ -487,6 +564,152 @@ export function createDemoApiClient(options: DemoApiOptions = {}): ApiClient {
       await delay()
       requireUser()
       throw new ApiError('界面预览不会读取真实反编译任务状态', 501, {
+        code: 'DEMO_READ_ONLY',
+      })
+    },
+
+    async listDecompileProjects(taskId) {
+      await delay()
+      requireUser()
+      findTask(taskId)
+      return { items: [] }
+    },
+
+    async getDecompileProject(taskId) {
+      await delay()
+      requireUser()
+      findTask(taskId)
+      throw new ApiError('界面预览不包含反编译源码项目', 404, {
+        code: 'DECOMPILE_PROJECT_NOT_FOUND',
+      })
+    },
+
+    async downloadDecompileProject() {
+      await delay()
+      requireUser()
+      throw new ApiError('界面预览不会导出反编译源码项目', 501, {
+        code: 'DEMO_READ_ONLY',
+      })
+    },
+
+    async deleteDecompileProject() {
+      await delay()
+      requireUser()
+      throw new ApiError('界面预览不会删除反编译源码项目', 501, {
+        code: 'DEMO_READ_ONLY',
+      })
+    },
+
+    async previewDecompileProjectDeletion() {
+      await delay()
+      requireUser()
+      throw new ApiError('界面预览不会删除反编译源码项目', 501, {
+        code: 'DEMO_READ_ONLY',
+      })
+    },
+
+    async confirmDecompileProjectDeletion() {
+      await delay()
+      requireUser()
+      throw new ApiError('界面预览不会删除反编译源码项目', 501, {
+        code: 'DEMO_READ_ONLY',
+      })
+    },
+
+    async getDecompileProjectDeletion() {
+      await delay()
+      requireUser()
+      throw new ApiError('界面预览不包含源码删除操作', 404, {
+        code: 'SOURCE_PROJECT_DELETION_NOT_FOUND',
+      })
+    },
+
+    async createCAnalysisRun() {
+      await delay()
+      requireUser()
+      throw new ApiError('界面预览不会提交真实 C 源码检测', 501, {
+        code: 'DEMO_READ_ONLY',
+      })
+    },
+
+    async listCAnalysisRuns(taskId) {
+      await delay()
+      requireUser()
+      findTask(taskId)
+      return { items: [] }
+    },
+
+    async getCAnalysisRun() {
+      await delay()
+      requireUser()
+      throw new ApiError('界面预览不包含 C 源码检测运行', 404, {
+        code: 'C_ANALYSIS_RUN_NOT_FOUND',
+      })
+    },
+
+    async listCAnalysisFindings() {
+      await delay()
+      requireUser()
+      return { items: [] }
+    },
+
+    async cancelCAnalysisRun() {
+      await delay()
+      requireUser()
+      throw new ApiError('界面预览不会取消 C 源码检测', 501, {
+        code: 'DEMO_READ_ONLY',
+      })
+    },
+
+    async deleteCAnalysisRun() {
+      await delay()
+      requireUser()
+      throw new ApiError('界面预览不会删除 C 源码检测运行', 501, {
+        code: 'DEMO_READ_ONLY',
+      })
+    },
+
+    async createJavaAnalysisRun() {
+      await delay()
+      requireUser()
+      throw new ApiError('界面预览不会提交真实 Java 源码检测', 501, {
+        code: 'DEMO_READ_ONLY',
+      })
+    },
+
+    async listJavaAnalysisRuns(taskId) {
+      await delay()
+      requireUser()
+      findTask(taskId)
+      return { items: [] }
+    },
+
+    async getJavaAnalysisRun() {
+      await delay()
+      requireUser()
+      throw new ApiError('界面预览不包含 Java 源码检测运行', 404, {
+        code: 'JAVA_ANALYSIS_RUN_NOT_FOUND',
+      })
+    },
+
+    async listJavaAnalysisFindings() {
+      await delay()
+      requireUser()
+      return { items: [] }
+    },
+
+    async cancelJavaAnalysisRun() {
+      await delay()
+      requireUser()
+      throw new ApiError('界面预览不会取消 Java 源码检测', 501, {
+        code: 'DEMO_READ_ONLY',
+      })
+    },
+
+    async deleteJavaAnalysisRun() {
+      await delay()
+      requireUser()
+      throw new ApiError('界面预览不会删除 Java 源码检测运行', 501, {
         code: 'DEMO_READ_ONLY',
       })
     },
@@ -940,6 +1163,7 @@ export function createDemoApiClient(options: DemoApiOptions = {}): ApiClient {
         input.filename,
         input.size,
         input.content_type,
+        input.input_category,
       ])
       const known = uploadByIdempotencyKey.get(intentKey)
       if (known) {
@@ -965,6 +1189,8 @@ export function createDemoApiClient(options: DemoApiOptions = {}): ApiClient {
         status: 'created',
         uploaded_parts: [],
         expires_at: '2026-08-01T00:00:00+08:00',
+        input_category: input.input_category,
+        validation_status: 'pending',
       }
       uploads.set(id, {
         input: { ...input },
@@ -1007,7 +1233,7 @@ export function createDemoApiClient(options: DemoApiOptions = {}): ApiClient {
 
     async completeUpload(uploadId) {
       await delay()
-      requireUser()
+      const user = requireUser()
       const upload = findUpload(uploadId)
       if (upload.completed) {
         return {
@@ -1028,22 +1254,220 @@ export function createDemoApiClient(options: DemoApiOptions = {}): ApiClient {
         uploaded_parts: [...upload.parts].sort((left, right) => left - right),
         sha256: String(uploadCounter).padStart(64, '0'),
         size_bytes: upload.input.size,
+        input_category: upload.input.input_category,
+        validation_status: 'valid',
+        detected_category: upload.input.input_category,
+        detected_format:
+          upload.input.input_category === 'archive'
+            ? 'zip'
+            : upload.input.input_category === 'container'
+              ? 'docker-tar'
+              : 'elf64',
+      }
+      if (upload.input.input_category === 'archive') {
+        const importId = `demo-archive-${String(uploadCounter).padStart(4, '0')}`
+        completed.archive_import_id = importId
+        const now = '2026-07-30T10:00:00+08:00'
+        archiveImports.set(importId, {
+          value: {
+            id: importId,
+            upload_id: uploadId,
+            filename: upload.input.filename,
+            status: 'ready',
+            scanned_entries: 3,
+            total_entries: 3,
+            eligible_entries: 2,
+            skipped_entries: 1,
+            created_tasks: 0,
+            created_at: now,
+            updated_at: now,
+          },
+          entries: [
+            {
+              id: `${importId}-entry-1`,
+              path: 'bin/application',
+              size_bytes: Math.max(1, Math.min(upload.input.size, 1_048_576)),
+              sha256: '1'.repeat(64),
+              detected_format: 'elf64',
+              detected_category: 'binary',
+              status: 'eligible',
+            },
+            {
+              id: `${importId}-entry-2`,
+              path: 'images/service-image.tar',
+              size_bytes: Math.max(1, Math.min(upload.input.size, 2_097_152)),
+              sha256: '2'.repeat(64),
+              detected_format: 'docker-tar',
+              detected_category: 'container',
+              status: 'eligible',
+            },
+            {
+              id: `${importId}-entry-3`,
+              path: 'nested/source.zip',
+              size_bytes: 512,
+              sha256: null,
+              detected_format: null,
+              detected_category: null,
+              status: 'skipped',
+              skip_reason: '成员压缩包不递归展开',
+            },
+          ],
+          batchResults: new Map(),
+        })
       }
       upload.completed = completed
       upload.session = completed
-      return { ...completed, uploaded_parts: [...completed.uploaded_parts] }
+      if (upload.input.input_category !== 'archive') {
+        ensureDirectUploadTask(upload, user)
+      }
+      return {
+        ...upload.completed,
+        uploaded_parts: [...upload.completed.uploaded_parts],
+      }
     },
 
     async deleteUpload(uploadId) {
       await delay()
       requireUser()
-      const upload = findUpload(uploadId)
-      if (upload.completed) {
-        throw new ApiError('已完成的示例上传不能取消', 409, {
-          code: 'upload_invalid_state',
-        })
+      findUpload(uploadId)
+      for (const [importId, archiveImport] of archiveImports) {
+        if (archiveImport.value.upload_id === uploadId) archiveImports.delete(importId)
       }
       uploads.delete(uploadId)
+    },
+
+    async listArchiveImports(query = {}) {
+      await delay()
+      requireUser()
+      const offset = pageOffset(query.cursor)
+      const pageSize = normalizePageSize(query.page_size, 25)
+      const matching = [...archiveImports.values()]
+        .map((archiveImport) => archiveImport.value)
+        .filter((archiveImport) => archiveImport.status !== 'deleted')
+        .sort((left, right) => {
+          const byCreatedAt = right.created_at.localeCompare(left.created_at)
+          return byCreatedAt || right.id.localeCompare(left.id)
+        })
+      const items = matching.slice(offset, offset + pageSize)
+      const nextOffset = offset + items.length
+      return {
+        items: items.map((archiveImport) => ({ ...archiveImport })),
+        ...(nextOffset < matching.length
+          ? { next_cursor: `demo-offset-${nextOffset}` }
+          : {}),
+      }
+    },
+
+    async getArchiveImport(importId) {
+      await delay()
+      requireUser()
+      const archiveImport = archiveImports.get(importId)
+      if (!archiveImport) {
+        throw new ApiError('示例归档导入不存在', 404, {
+          code: 'ARCHIVE_IMPORT_NOT_FOUND',
+        })
+      }
+      return { ...archiveImport.value }
+    },
+
+    async listArchiveImportEntries(importId, query = {}) {
+      await delay()
+      requireUser()
+      const archiveImport = archiveImports.get(importId)
+      if (!archiveImport) {
+        throw new ApiError('示例归档导入不存在', 404, {
+          code: 'ARCHIVE_IMPORT_NOT_FOUND',
+        })
+      }
+      const matching = archiveImport.entries.filter((entry) =>
+        !query.filter || query.filter === 'all'
+          ? true
+          : entry.status === query.filter,
+      )
+      const offset = pageOffset(query.cursor)
+      const pageSize = normalizePageSize(query.page_size, 50)
+      const items = matching.slice(offset, offset + pageSize)
+      const nextOffset = offset + items.length
+      return {
+        items: items.map((entry) => ({ ...entry })),
+        ...(nextOffset < matching.length
+          ? { next_cursor: `demo-offset-${nextOffset}` }
+          : {}),
+      }
+    },
+
+    async createArchiveTaskBatch(importId, input, idempotencyKey) {
+      await delay()
+      const user = requireUser()
+      const archiveImport = archiveImports.get(importId)
+      if (!archiveImport) {
+        throw new ApiError('示例归档导入不存在', 404, {
+          code: 'ARCHIVE_IMPORT_NOT_FOUND',
+        })
+      }
+      if (input.entry_ids.length === 0 || input.entry_ids.length > 20) {
+        throw new ApiError('示例批量请求必须选择 1 到 20 个条目', 400, {
+          code: 'INVALID_ARCHIVE_TASK_BATCH',
+        })
+      }
+      const items = input.entry_ids.map((entryId) => {
+        const entry = archiveImport.entries.find((candidate) => candidate.id === entryId)
+        if (
+          !entry ||
+          (entry.status !== 'eligible' &&
+            entry.status !== 'failed' &&
+            entry.status !== 'created')
+        ) {
+          return {
+            entry_id: entryId,
+            outcome: 'failed' as const,
+            error_code: 'ENTRY_NOT_ELIGIBLE',
+            message: '条目不可创建任务',
+          }
+        }
+        const knownTaskId = archiveImport.batchResults.get(entryId)
+        if (knownTaskId) {
+          return {
+            entry_id: entryId,
+            outcome: 'existing' as const,
+            task_id: knownTaskId,
+          }
+        }
+        taskCounter += 1
+        const taskId = createdTaskId(taskCounter)
+        archiveImport.batchResults.set(entryId, taskId)
+        entry.status = 'created'
+        entry.task_id = taskId
+        tasks.unshift({
+          id: taskId,
+          name: `${archiveImport.value.filename} :: ${entry.path}`,
+          input_type: entry.detected_format ?? 'unknown',
+          status: 'QUEUED',
+          risk_level: 'UNKNOWN',
+          progress: 0,
+          progress_indeterminate: false,
+          creator_id: user.id,
+          creator_name: user.display_name,
+          tags: ['UI-PREVIEW'],
+          created_at: '2026-07-30T10:30:00+08:00',
+          original_filename: entry.path,
+          size_bytes: entry.size_bytes,
+          sha256: entry.sha256 ?? '0'.repeat(64),
+          sample_expires_at: '2026-08-29T10:30:00+08:00',
+          sample_deleted_at: null,
+        })
+        return {
+          entry_id: entryId,
+          outcome: 'created' as const,
+          task_id: taskId,
+        }
+      })
+      archiveImport.value.created_tasks = archiveImport.entries.filter(
+        (entry) => entry.status === 'created',
+      ).length
+      archiveImport.value.updated_at = '2026-07-30T10:30:00+08:00'
+      void idempotencyKey
+      return { items }
     },
 
     async createTask(input, idempotencyKey) {
@@ -1057,55 +1481,7 @@ export function createDemoApiClient(options: DemoApiOptions = {}): ApiClient {
           code: 'upload_not_completed',
         })
       }
-
-      taskCounter += 1
-      const id = createdTaskId(taskCounter)
-      const createdAt = `2026-07-30T10:${String(taskCounter).padStart(2, '0')}:00+08:00`
-      const task: TaskDetail = {
-        id,
-        name: input.name,
-        input_type: inferredInputFormat(upload.input.filename),
-        status: 'QUEUED',
-        risk_level: 'UNKNOWN',
-        progress: 0,
-        progress_indeterminate: false,
-        creator_id: user.id,
-        creator_name: user.display_name,
-        tags: ['UI-PREVIEW'],
-        created_at: createdAt,
-        original_filename: upload.input.filename,
-        size_bytes: upload.completed.size_bytes,
-        sha256: upload.completed.sha256,
-        sample_expires_at: '2026-08-29T10:00:00+08:00',
-        sample_deleted_at: null,
-      }
-      tasks.unshift(task)
-      fileNodes.set(id, [
-        {
-          id: createdNodeId(taskCounter),
-          parent_id: null,
-          logical_path: `/${upload.input.filename}`,
-          display_name: upload.input.filename,
-          archive_name_id: '',
-          node_type: 'file',
-          depth: 0,
-          format: upload.input.filename.split('.').pop()?.toLowerCase() ?? '',
-          mime_type: upload.input.content_type,
-          architecture: '',
-          size_bytes: upload.input.size,
-          sha256: upload.completed.sha256,
-          extraction_status: 'queued',
-          error_code: '',
-          error_message: '',
-          source_container: null,
-          has_children: false,
-          metadata_json: {
-            preview_fixture: true,
-            note: '纯前端示例任务，不会持久化或执行真实检测',
-          },
-          source_parent: null,
-        },
-      ])
+      const id = ensureDirectUploadTask(upload, user)
       taskByIdempotencyKey.set(idempotencyKey, id)
       return { id }
     },

@@ -912,6 +912,8 @@ describe('api client', () => {
       status: 'created' as const,
       uploaded_parts: [],
       expires_at: '2026-08-30T00:00:00Z',
+      input_category: 'binary' as const,
+      validation_status: 'pending' as const,
     }
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ data: session }), {
@@ -927,6 +929,7 @@ describe('api client', () => {
           filename: 'sample.bin',
           size: 4,
           content_type: 'application/octet-stream',
+          input_category: 'binary',
         },
         'stable-upload-create-key',
       ),
@@ -942,6 +945,7 @@ describe('api client', () => {
       filename: 'sample.bin',
       size: 4,
       content_type: 'application/octet-stream',
+      input_category: 'binary',
     })
   })
 
@@ -1043,5 +1047,22 @@ describe('api client', () => {
     expect(new Headers(init.headers).get('X-CSRF-Token')).toBe(
       'upload-delete-token',
     )
+  })
+
+  it('rejects upload deletion unless the server confirms it with 204', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ data: null }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      ),
+    )
+
+    await expect(api.deleteUpload('upload-1')).rejects.toMatchObject({
+      code: 'INVALID_RESPONSE_STATUS',
+      status: 502,
+    })
   })
 })

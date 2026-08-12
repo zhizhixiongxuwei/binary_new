@@ -351,9 +351,10 @@ func (r *MySQLRepository) CreateInitialAdministrator(ctx context.Context, user U
 INSERT INTO users (
     public_id, username, display_name, password_hash, role, status, force_password_change
 )
-SELECT ?, ?, ?, ?, 'administrator', 'active', TRUE
+SELECT ?, ?, ?, ?, 'administrator', 'active', ?
 WHERE NOT EXISTS (SELECT 1 FROM users LIMIT 1)`,
 		user.PublicID, user.Username, user.DisplayName, user.PasswordHash,
+		user.ForcePasswordChange,
 	)
 	if err != nil {
 		return fmt.Errorf("create initial administrator: %w", err)

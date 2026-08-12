@@ -138,6 +138,39 @@ func TestAssembleWorkerRunnerBuildsTrivyRuntime(t *testing.T) {
 	}
 }
 
+func TestJavaWorkerRepositoryConfigInvalidatesSourceAnalysisReports(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	cfg := testWorkerConfig()
+	configuration := javaAnalysisRepositoryConfig(cfg)
+	if configuration.AnalyzerVersion != cfg.JavaCheckerVersion ||
+		configuration.InvalidateReports == nil {
+		t.Fatalf("Java worker repository config = %#v", configuration)
+	}
+	mock.ExpectBegin()
+	tx, err := db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskID := "71111111-1111-4111-8111-111111111111"
+	mock.ExpectExec(`(?s)UPDATE reports.*snapshot_state = 'stale'.*WHERE task_id = \?`).
+		WithArgs(taskID).
+		WillReturnResult(sqlmock.NewResult(0, 2))
+	if err := configuration.InvalidateReports(t.Context(), tx, taskID); err != nil {
+		t.Fatal(err)
+	}
+	mock.ExpectCommit()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestAssembleWorkerRunnerBuildsManualImageRuntime(t *testing.T) {
 	cfg := testWorkerConfig()
 	cfg.RepositoryRoot = t.TempDir()
@@ -375,6 +408,22 @@ func TestAnalyzerReadinessRegistrationUsesVerifiedRuntimeIdentity(t *testing.T) 
 			registration.WorkerKind != kind {
 			t.Fatalf("%s readiness = (%#v, %v)", kind, registration, available)
 		}
+	}
+	cAnalysis, ok := analyzerReadinessRegistration(
+		"c_analysis", "c-analysis:owner", cfg,
+	)
+	if !ok || cAnalysis.AnalyzerName != "binaryscan-c-checker" ||
+		cAnalysis.AnalyzerVersion != cfg.CCheckerVersion ||
+		cAnalysis.WorkerKind != "c_analysis" {
+		t.Fatalf("C analysis readiness = (%#v, %v)", cAnalysis, ok)
+	}
+	javaAnalysis, ok := analyzerReadinessRegistration(
+		"java_analysis", "java-analysis:owner", cfg,
+	)
+	if !ok || javaAnalysis.AnalyzerName != "binaryscan-java-checker" ||
+		javaAnalysis.AnalyzerVersion != cfg.JavaCheckerVersion ||
+		javaAnalysis.WorkerKind != "java_analysis" {
+		t.Fatalf("Java analysis readiness = (%#v, %v)", javaAnalysis, ok)
 	}
 	if _, ok := analyzerReadinessRegistration("scan", "scan:owner", cfg); ok {
 		t.Fatal("scan worker unexpectedly registered an analyzer runtime")

@@ -8,13 +8,15 @@ import (
 type Kind string
 
 const (
-	KindScan      Kind = "scan"
-	KindImage     Kind = "image"
-	KindNative    Kind = "native"
-	KindBytecode  Kind = "bytecode"
-	KindTrivy     Kind = "trivy"
-	KindReport    Kind = "report"
-	KindDecompile Kind = "decompile"
+	KindScan         Kind = "scan"
+	KindImage        Kind = "image"
+	KindNative       Kind = "native"
+	KindBytecode     Kind = "bytecode"
+	KindTrivy        Kind = "trivy"
+	KindReport       Kind = "report"
+	KindDecompile    Kind = "decompile"
+	KindCAnalysis    Kind = "c_analysis"
+	KindJavaAnalysis Kind = "java_analysis"
 )
 
 type Outcome string

@@ -13,19 +13,27 @@ import (
 )
 
 type repositoryStub struct {
-	blobReferenceCandidates []BlobReferenceCandidate
-	blobReconcileResults    map[uint64]BlobReferenceResult
-	blobReferences          map[string]bool
-	uploadReferences        map[string]bool
-	storedReferences        map[string]bool
-	protectBlobOnDelete     map[string]bool
-	protectUploadOnDelete   map[string]bool
-	protectStoredOnDelete   map[string]bool
-	onBlobReference         func(BlobCandidate)
-	onUploadReference       func(UploadCandidate)
-	blobDeleteCalls         int
-	uploadDeleteCalls       int
-	storedDeleteCalls       int
+	blobReferenceCandidates      []BlobReferenceCandidate
+	blobReconcileResults         map[uint64]BlobReferenceResult
+	blobReferences               map[string]bool
+	uploadReferences             map[string]bool
+	sourceProjectReferences      map[string]bool
+	storedReferences             map[string]bool
+	protectBlobOnDelete          map[string]bool
+	protectUploadOnDelete        map[string]bool
+	protectSourceProjectOnDelete map[string]bool
+	protectStoredOnDelete        map[string]bool
+	pendingSourceProjects        []PendingSourceProject
+	pendingSourceTargets         map[string]SourceProjectCleanupTarget
+	onBlobReference              func(BlobCandidate)
+	onUploadReference            func(UploadCandidate)
+	onSourceProjectReference     func(SourceProjectCandidate)
+	onStoredReference            func(StoredFileCandidate)
+	blobDeleteCalls              int
+	uploadDeleteCalls            int
+	sourceProjectDeleteCalls     int
+	pendingSourceDeleteCalls     int
+	storedDeleteCalls            int
 }
 
 func (s *repositoryStub) ListBlobReferenceCandidates(
@@ -75,10 +83,56 @@ func (s *repositoryStub) UploadReferenced(
 	return s.uploadReferences[candidate.ID], nil
 }
 
+func (s *repositoryStub) ListPendingSourceProjects(
+	_ context.Context,
+	limit int,
+) ([]PendingSourceProject, error) {
+	result := append([]PendingSourceProject(nil), s.pendingSourceProjects...)
+	if len(result) > limit {
+		result = result[:limit]
+	}
+	return result, nil
+}
+
+func (s *repositoryStub) CleanupPendingSourceProject(
+	ctx context.Context,
+	candidate PendingSourceProject,
+	remove func(context.Context, SourceProjectCleanupTarget) error,
+) (bool, error) {
+	s.pendingSourceDeleteCalls++
+	target := s.pendingSourceTargets[candidate.ID]
+	return true, remove(ctx, target)
+}
+
+func (s *repositoryStub) SourceProjectReferenced(
+	_ context.Context,
+	candidate SourceProjectCandidate,
+) (bool, error) {
+	if s.onSourceProjectReference != nil {
+		s.onSourceProjectReference(candidate)
+	}
+	return s.sourceProjectReferences[candidate.ID], nil
+}
+
+func (s *repositoryStub) DeleteOrphanSourceProject(
+	ctx context.Context,
+	candidate SourceProjectCandidate,
+	remove func(context.Context) error,
+) (bool, error) {
+	s.sourceProjectDeleteCalls++
+	if s.protectSourceProjectOnDelete[candidate.ID] {
+		return false, nil
+	}
+	return true, remove(ctx)
+}
+
 func (s *repositoryStub) StoredFileReferenced(
 	_ context.Context,
 	candidate StoredFileCandidate,
 ) (bool, error) {
+	if s.onStoredReference != nil {
+		s.onStoredReference(candidate)
+	}
 	return s.storedReferences[candidate.StorageKey], nil
 }
 
@@ -288,6 +342,235 @@ func TestSweeperReconcilesBlobCountsAndStoredFileOrphans(t *testing.T) {
 	)
 }
 
+func TestSweeperRemovesOnlyExpiredOrphanReportStagingFiles(t *testing.T) {
+	repositoryRoot := filepath.Join(t.TempDir(), "repository")
+	uploadsRoot := filepath.Join(t.TempDir(), "uploads")
+	if err := os.MkdirAll(repositoryRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(uploadsRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.August, 11, 12, 0, 0, 0, time.UTC)
+	taskID := "75555555-5555-4555-8555-555555555555"
+	orphanKey := reportStagingFixtureKey(
+		taskID, "76666666-6666-4666-8666-666666666666", strings.Repeat("a", 24),
+	)
+	activeKey := reportStagingFixtureKey(
+		taskID, "77777777-7777-4777-8777-777777777777", strings.Repeat("b", 24),
+	)
+	freshKey := reportStagingFixtureKey(
+		taskID, "78888888-8888-4888-8888-888888888888", strings.Repeat("c", 24),
+	)
+	writeStoredFileFixture(
+		t, repositoryRoot, orphanKey, []byte("crashed generation"),
+		now.Add(-2*DefaultGracePeriod),
+	)
+	writeStoredFileFixture(
+		t, repositoryRoot, activeKey, []byte("active generation"),
+		now.Add(-2*DefaultGracePeriod),
+	)
+	writeStoredFileFixture(
+		t, repositoryRoot, freshKey, []byte("fresh generation"),
+		now.Add(-time.Hour),
+	)
+
+	repository := &repositoryStub{
+		storedReferences: map[string]bool{activeKey: true},
+	}
+	blobDeleter, _ := retention.NewRepositoryBlobDeleter(repositoryRoot)
+	uploadDeleter, _ := retention.NewRepositoryUploadDirectoryDeleter(uploadsRoot)
+	sweeper, err := NewSweeper(repository, Config{
+		RepositoryRoot: repositoryRoot, UploadsRoot: uploadsRoot,
+		GracePeriod: DefaultGracePeriod, Now: func() time.Time { return now },
+		BlobDeleter: blobDeleter, UploadDeleter: uploadDeleter,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := sweeper.Sweep(context.Background(), MaxSweepBatch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.StoredFilesScanned != 2 || report.ReferencedStoredFiles != 1 ||
+		report.OrphanStoredFiles != 1 || report.RemovedStoredFiles != 1 ||
+		report.DeferredYoungStored != 1 || report.Failures != 0 {
+		t.Fatalf("report staging sweep = %+v", report)
+	}
+	assertMissing(t, filepath.Join(repositoryRoot, filepath.FromSlash(orphanKey)))
+	for _, storageKey := range []string{activeKey, freshKey} {
+		assertPresent(t, filepath.Join(repositoryRoot, filepath.FromSlash(storageKey)))
+	}
+}
+
+func TestSweeperRefusesReportStagingFileReplacedAfterInventory(t *testing.T) {
+	repositoryRoot := filepath.Join(t.TempDir(), "repository")
+	uploadsRoot := filepath.Join(t.TempDir(), "uploads")
+	if err := os.MkdirAll(repositoryRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(uploadsRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.August, 11, 13, 0, 0, 0, time.UTC)
+	storageKey := reportStagingFixtureKey(
+		"79999999-9999-4999-8999-999999999999",
+		"7aaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+		strings.Repeat("d", 24),
+	)
+	filePath := writeStoredFileFixture(
+		t, repositoryRoot, storageKey, []byte("old staging"),
+		now.Add(-2*DefaultGracePeriod),
+	)
+	repository := &repositoryStub{}
+	repository.onStoredReference = func(candidate StoredFileCandidate) {
+		if candidate.Kind != StoredFileReportStaging {
+			return
+		}
+		replacement := filePath + ".replacement"
+		if err := os.WriteFile(replacement, []byte("new staging"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(replacement, filePath); err != nil {
+			t.Fatal(err)
+		}
+		repository.onStoredReference = nil
+	}
+	blobDeleter, _ := retention.NewRepositoryBlobDeleter(repositoryRoot)
+	uploadDeleter, _ := retention.NewRepositoryUploadDirectoryDeleter(uploadsRoot)
+	sweeper, err := NewSweeper(repository, Config{
+		RepositoryRoot: repositoryRoot, UploadsRoot: uploadsRoot,
+		GracePeriod: DefaultGracePeriod, Now: func() time.Time { return now },
+		BlobDeleter: blobDeleter, UploadDeleter: uploadDeleter,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := sweeper.Sweep(context.Background(), MaxSweepBatch)
+	if err == nil || !errors.Is(err, ErrUnsafeInventory) ||
+		report.RemovedStoredFiles != 0 || report.Failures != 1 {
+		t.Fatalf("replaced report staging Sweep() = (%+v, %v)", report, err)
+	}
+	content, readErr := os.ReadFile(filePath)
+	if readErr != nil || string(content) != "new staging" {
+		t.Fatalf("replacement report staging was removed: %q, %v", content, readErr)
+	}
+}
+
+func TestSweeperNeverFollowsReportStagingSymlink(t *testing.T) {
+	repositoryRoot := filepath.Join(t.TempDir(), "repository")
+	uploadsRoot := filepath.Join(t.TempDir(), "uploads")
+	if err := os.MkdirAll(repositoryRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(uploadsRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	taskID := "7bbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+	storageKey := reportStagingFixtureKey(
+		taskID,
+		"7ccccccc-cccc-4ccc-8ccc-cccccccccccc",
+		strings.Repeat("e", 24),
+	)
+	stagingPath := filepath.Join(repositoryRoot, filepath.FromSlash(storageKey))
+	if err := os.MkdirAll(filepath.Dir(stagingPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "outside-report")
+	if err := os.WriteFile(outside, []byte("do not delete"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, stagingPath); err != nil {
+		t.Fatal(err)
+	}
+	blobDeleter, _ := retention.NewRepositoryBlobDeleter(repositoryRoot)
+	uploadDeleter, _ := retention.NewRepositoryUploadDirectoryDeleter(uploadsRoot)
+	sweeper, err := NewSweeper(&repositoryStub{}, Config{
+		RepositoryRoot: repositoryRoot, UploadsRoot: uploadsRoot,
+		GracePeriod: DefaultGracePeriod,
+		Now:         func() time.Time { return time.Now().UTC() },
+		BlobDeleter: blobDeleter, UploadDeleter: uploadDeleter,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := sweeper.Sweep(context.Background(), MaxSweepBatch)
+	if err != nil || report.RemovedStoredFiles != 0 || report.Failures != 1 ||
+		len(report.Diagnostics) != 1 ||
+		!errors.Is(report.Diagnostics[0].Err, ErrUnsafeInventory) {
+		t.Fatalf("report staging symlink Sweep() = (%+v, %v)", report, err)
+	}
+	content, readErr := os.ReadFile(outside)
+	if readErr != nil || string(content) != "do not delete" {
+		t.Fatalf("report staging symlink target changed: %q, %v", content, readErr)
+	}
+	assertPresent(t, stagingPath)
+}
+
+func TestSweeperProtectsActiveAndCleansOrphanAndPendingSourceProjects(
+	t *testing.T,
+) {
+	repositoryRoot := filepath.Join(t.TempDir(), "repository")
+	uploadsRoot := filepath.Join(t.TempDir(), "uploads")
+	if err := os.MkdirAll(repositoryRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(uploadsRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.August, 3, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-2 * DefaultGracePeriod)
+	activeID := "81111111-1111-4111-8111-111111111111"
+	orphanID := "82222222-2222-4222-8222-222222222222"
+	pendingID := "83333333-3333-4333-8333-333333333333"
+	youngID := "84444444-4444-4444-8444-444444444444"
+	taskID := "85555555-5555-4555-8555-555555555555"
+	for id, modified := range map[string]time.Time{
+		activeID: old, orphanID: old, pendingID: old,
+		youngID: now.Add(-time.Hour),
+	} {
+		writeSourceProjectFixture(t, repositoryRoot, id, modified)
+	}
+	repository := &repositoryStub{
+		sourceProjectReferences: map[string]bool{activeID: true},
+		pendingSourceProjects: []PendingSourceProject{{
+			ID: pendingID, TaskID: taskID, LayoutVersion: "project-v1",
+		}},
+		pendingSourceTargets: map[string]SourceProjectCleanupTarget{
+			pendingID: {
+				ProjectID: pendingID, TaskID: taskID, LayoutVersion: "project-v1",
+			},
+		},
+	}
+	blobDeleter, _ := retention.NewRepositoryBlobDeleter(repositoryRoot)
+	uploadDeleter, _ := retention.NewRepositoryUploadDirectoryDeleter(uploadsRoot)
+	sweeper, err := NewSweeper(repository, Config{
+		RepositoryRoot: repositoryRoot, UploadsRoot: uploadsRoot,
+		GracePeriod: DefaultGracePeriod, Now: func() time.Time { return now },
+		BlobDeleter: blobDeleter, UploadDeleter: uploadDeleter,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := sweeper.Sweep(context.Background(), MaxSweepBatch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.PendingSourceProjects != 1 || report.CompletedSourceProjects != 1 ||
+		report.SourceProjectDirsScanned != 2 ||
+		report.ReferencedSourceProjects != 1 || report.OrphanSourceProjects != 1 ||
+		report.RemovedSourceProjects != 1 ||
+		report.DeferredYoungSourceProject != 1 || report.Failures != 0 {
+		t.Fatalf("source project sweep report = %+v", report)
+	}
+	for _, id := range []string{orphanID, pendingID} {
+		assertMissing(t, filepath.Join(repositoryRoot, "source-projects", id))
+	}
+	for _, id := range []string{activeID, youngID} {
+		assertPresent(t, filepath.Join(repositoryRoot, "source-projects", id))
+	}
+}
+
 func TestSweeperDryRunCollectsWithoutDeleting(t *testing.T) {
 	repositoryRoot := filepath.Join(t.TempDir(), "repository")
 	uploadsRoot := filepath.Join(t.TempDir(), "uploads")
@@ -490,6 +773,31 @@ func writeStoredFileFixture(
 		t.Fatal(err)
 	}
 	return filePath
+}
+
+func reportStagingFixtureKey(taskID string, reportID string, nonce string) string {
+	return "reports/" + taskID + "/." + reportID + "." + nonce + ".staging"
+}
+
+func writeSourceProjectFixture(
+	t *testing.T,
+	root string,
+	id string,
+	modified time.Time,
+) {
+	t.Helper()
+	projectRoot := filepath.Join(root, "source-projects", id)
+	if err := os.MkdirAll(filepath.Join(projectRoot, "src"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(projectRoot, "src", "decompiled.c"), []byte("void f() {}"), 0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(projectRoot, modified, modified); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func assertPresent(t *testing.T, path string) {

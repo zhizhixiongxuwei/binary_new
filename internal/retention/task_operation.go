@@ -5,11 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"math"
 	"time"
 
 	"binaryscan/internal/audit"
-	"binaryscan/internal/taskcleanup"
 	"binaryscan/internal/taskevent"
 )
 
@@ -127,9 +125,6 @@ WHERE task_id = ? AND fencing_token = ?`,
 		TaskID: taskID, LeaseOwner: leaseOwner, FencingToken: fence,
 		Attempt: attempt, LeaseUntil: databaseNow.Add(leaseDuration),
 	}
-	if err := collectRetainedDecompileOutputs(ctx, tx, &claim); err != nil {
-		return TaskSampleClaim{}, false, err
-	}
 	if err := audit.Append(ctx, tx, audit.Event{
 		Action:     "retention.task_sample_cleanup_started",
 		ObjectType: "task",
@@ -137,7 +132,7 @@ WHERE task_id = ? AND fencing_token = ?`,
 		Outcome:    audit.OutcomeSuccess,
 		Metadata: map[string]any{
 			"attempt": attempt, "fencing_token": fence,
-			"decompile_file_count": len(claim.Files),
+			"decompile_sources_preserved": true,
 		},
 	}); err != nil {
 		return TaskSampleClaim{}, false, fmt.Errorf(
@@ -150,48 +145,6 @@ WHERE task_id = ? AND fencing_token = ?`,
 		)
 	}
 	return claim, true, nil
-}
-
-func collectRetainedDecompileOutputs(
-	ctx context.Context,
-	tx *sql.Tx,
-	claim *TaskSampleClaim,
-) error {
-	rows, err := tx.QueryContext(ctx, `
-SELECT id, storage_key, content_sha256, size_bytes
-FROM decompile_results
-WHERE task_id = ? AND storage_key IS NOT NULL
-ORDER BY id`, claim.TaskID)
-	if err != nil {
-		return fmt.Errorf("list retained decompile outputs: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var (
-			id, key string
-			digest  sql.NullString
-			size    sql.Null[uint64]
-		)
-		if err := rows.Scan(&id, &key, &digest, &size); err != nil {
-			return fmt.Errorf("scan retained decompile output: %w", err)
-		}
-		if !digest.Valid || !size.Valid || size.V > math.MaxInt64 {
-			return errors.New("retained decompile output metadata is incomplete")
-		}
-		claim.Files = append(claim.Files, taskcleanup.StoredFile{
-			Kind: taskcleanup.FileDecompile, TaskID: claim.TaskID,
-			RecordID: id, StorageKey: key, SHA256: digest.String,
-			SizeBytes: int64(size.V),
-		})
-		claim.Scopes = append(claim.Scopes, taskcleanup.Scope{
-			Kind: taskcleanup.FileDecompile, TaskID: claim.TaskID,
-			RecordID: id,
-		})
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate retained decompile outputs: %w", err)
-	}
-	return nil
 }
 
 func (r *MySQLRepository) RenewExpiredTaskSample(
@@ -295,16 +248,6 @@ FOR UPDATE`, claim.TaskID, claim.FencingToken, claim.LeaseOwner).Scan(&status)
 	if err := releaseBlobReference(ctx, tx, blobID); err != nil {
 		return false, err
 	}
-	if _, err := tx.ExecContext(ctx, `
-UPDATE decompile_results
-SET storage_key = NULL,
-    content_sha256 = NULL,
-    size_bytes = NULL
-WHERE task_id = ?`, claim.TaskID); err != nil {
-		return false, fmt.Errorf(
-			"clear expired decompile output metadata: %w", err,
-		)
-	}
 	result, err := tx.ExecContext(ctx, `
 UPDATE tasks
 SET sample_deleted_at = UTC_TIMESTAMP(6),
@@ -350,10 +293,10 @@ WHERE task_id = ?
 		ObjectID:   claim.TaskID,
 		Outcome:    audit.OutcomeSuccess,
 		Metadata: map[string]any{
-			"reason":                    "sample_retention_expired",
-			"attempt":                   claim.Attempt,
-			"fencing_token":             claim.FencingToken,
-			"decompile_sources_removed": true,
+			"reason":                      "sample_retention_expired",
+			"attempt":                     claim.Attempt,
+			"fencing_token":               claim.FencingToken,
+			"decompile_sources_preserved": true,
 		},
 	}); err != nil {
 		return false, fmt.Errorf("append task sample retention audit: %w", err)

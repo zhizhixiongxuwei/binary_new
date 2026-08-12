@@ -130,6 +130,50 @@ func TestRepositoryFileDeleterRejectsEscapesTamperingAndHardlinks(
 	}
 }
 
+func TestRepositoryFileDeleterRemovesSourceProjectRootWithoutFollowingLinks(
+	t *testing.T,
+) {
+	root := t.TempDir()
+	projectID := "623e4567-e89b-42d3-a456-426614174006"
+	projectRoot := filepath.Join(root, "source-projects", projectID)
+	if err := os.MkdirAll(filepath.Join(projectRoot, "src"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(projectRoot, "src", "decompiled.c"), []byte("void f() {}"), 0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "keep")
+	if err := os.WriteFile(outside, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(projectRoot, "outside-link")); err != nil {
+		t.Fatal(err)
+	}
+	deleter, err := NewRepositoryFileDeleter(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := deleter.DeleteScope(context.Background(), Scope{
+		Kind: FileSourceProject, TaskID: testTaskID, RecordID: projectID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := deleter.DeleteScope(context.Background(), Scope{
+		Kind: FileSourceProject, TaskID: testTaskID, RecordID: projectID,
+	}); err != nil {
+		t.Fatalf("replayed source project cleanup: %v", err)
+	}
+	if _, err := os.Lstat(projectRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("source project root still exists: %v", err)
+	}
+	content, err := os.ReadFile(outside)
+	if err != nil || string(content) != "keep" {
+		t.Fatalf("source project cleanup followed symlink: %q, %v", content, err)
+	}
+}
+
 func TestRepositoryFileDeleterDetectsRootReplacement(t *testing.T) {
 	parent := t.TempDir()
 	root := filepath.Join(parent, "repository")

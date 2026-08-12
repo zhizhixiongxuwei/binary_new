@@ -10,13 +10,14 @@ usage() {
 	cat <<'EOF'
 Usage: ./scripts/prepare-dependency-images.sh OUTPUT_DIR [TRIVY_CACHE_DIR]
 
-Prepares the five external dependency images, freezes their local image IDs, and
+Prepares the nine external dependency images, freezes their local image IDs, and
 exports one offline image archive. When TRIVY_CACHE_DIR is omitted, Trivy 0.72.0
 downloads the current primary and Java databases first.
 
 Optional environment variables:
   BINARYSCAN_JAVA_SOURCE_IMAGE    Existing image containing the pinned JDK/tools
   BINARYSCAN_GHIDRA_SOURCE_IMAGE  Existing image containing Ghidra 12.1.2/JDK 21
+  BINARYSCAN_CHECKER_MAVEN_IMAGE   Maven 3.9.11/JDK 17 image used to seed both checkers
 EOF
 }
 
@@ -143,7 +144,11 @@ load_settings
 ensure_image_loaded golang:1.25.0-bookworm
 ensure_image_loaded node:22-bookworm-slim
 ensure_image_loaded aquasec/trivy:0.72.0
+ensure_image_loaded alpine:3.22.5
 ensure_image_loaded "$BINARYSCAN_MYSQL_IMAGE"
+c_checker_maven_source=${BINARYSCAN_CHECKER_MAVEN_IMAGE:-${BINARYSCAN_C_CHECKER_MAVEN_IMAGE:-maven:3.9.11-eclipse-temurin-17}}
+ensure_image_loaded "$c_checker_maven_source"
+ensure_image_loaded "$BINARYSCAN_C_CHECKER_JRE_IMAGE"
 
 output_directory=$1
 case "$output_directory" in
@@ -190,6 +195,27 @@ esac
 
 prepare_builder_caches
 
+note "building $BINARYSCAN_ARCHIVE_TOOLS_IMAGE with pinned archive utilities"
+docker build --pull=false --platform "$BINARYSCAN_PLATFORM" \
+	--file "$PROJECT_ROOT/docker/archive-tools.Dockerfile" \
+	--tag "$BINARYSCAN_ARCHIVE_TOOLS_IMAGE" \
+	--build-arg ALPINE_IMAGE=alpine:3.22.5 \
+	"$PROJECT_ROOT"
+
+note "building $BINARYSCAN_C_CHECKER_BUILDER_IMAGE with the locked Maven dependency cache"
+docker build --pull=false --platform "$BINARYSCAN_PLATFORM" \
+	--file "$PROJECT_ROOT/c-checker/Dockerfile.builder" \
+	--tag "$BINARYSCAN_C_CHECKER_BUILDER_IMAGE" \
+	--build-arg "MAVEN_IMAGE=$c_checker_maven_source" \
+	"$PROJECT_ROOT/c-checker"
+
+note "building $BINARYSCAN_JAVA_CHECKER_BUILDER_IMAGE with the locked Maven dependency cache"
+docker build --pull=false --platform "$BINARYSCAN_PLATFORM" \
+	--file "$PROJECT_ROOT/java-checker/Dockerfile.builder" \
+	--tag "$BINARYSCAN_JAVA_CHECKER_BUILDER_IMAGE" \
+	--build-arg "MAVEN_IMAGE=$c_checker_maven_source" \
+	"$PROJECT_ROOT/java-checker"
+
 note "building $BINARYSCAN_BUILDER_IMAGE"
 docker build --pull=false --network=none --platform "$BINARYSCAN_PLATFORM" \
 	--file "$PROJECT_ROOT/docker/builder.Dockerfile" \
@@ -233,8 +259,19 @@ docker build --pull=false --network=none --platform "$BINARYSCAN_PLATFORM" \
 	"$build_root"
 
 verify_image "$BINARYSCAN_MYSQL_IMAGE" ""
-verify_dependency_images
+# The preparation step intentionally replaces locally built dependency images.
+# Freeze their new identities before enforcing the immutable delivery lock.
+verify_dependency_images_unlocked
 "$SCRIPT_DIR/freeze-image-lock.sh"
+unset BINARYSCAN_BUILDER_IMAGE_ID \
+	BINARYSCAN_MYSQL_IMAGE_ID \
+	BINARYSCAN_TRIVY_RUNTIME_DB_IMAGE_ID \
+	BINARYSCAN_ARCHIVE_TOOLS_IMAGE_ID \
+	BINARYSCAN_JAVA_RUNTIME_IMAGE_ID \
+	BINARYSCAN_GHIDRA_RUNTIME_IMAGE_ID \
+	BINARYSCAN_C_CHECKER_BUILDER_IMAGE_ID \
+	BINARYSCAN_JAVA_CHECKER_BUILDER_IMAGE_ID \
+	BINARYSCAN_C_CHECKER_JRE_IMAGE_ID
 "$SCRIPT_DIR/export-dependency-images.sh" "$output_directory"
 
 note "dependency preparation complete"

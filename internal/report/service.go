@@ -311,8 +311,11 @@ func (s *Service) generateArtifact(
 	hasher := sha256.New()
 	counter := &byteCounter{}
 	writer := io.MultiWriter(file, hasher, counter)
+	dependencies := make([]CAnalysisDependency, 0)
+	javaDependencies := make([]JavaAnalysisDependency, 0)
 	request := SnapshotRequest{
 		TaskID: value.TaskID, ReportID: value.ID, GeneratedAt: generatedAt,
+		Dependencies: &dependencies, JavaDependencies: &javaDependencies,
 	}
 	switch value.Format {
 	case FormatJSON:
@@ -395,10 +398,12 @@ func (s *Service) generateArtifact(
 		)
 	}
 	return ArtifactMetadata{
-		StorageKey:  finalKey,
-		SHA256:      hex.EncodeToString(hasher.Sum(nil)),
-		SizeBytes:   counter.total,
-		CompletedAt: s.now().UTC(),
+		StorageKey:       finalKey,
+		SHA256:           hex.EncodeToString(hasher.Sum(nil)),
+		SizeBytes:        counter.total,
+		CompletedAt:      s.now().UTC(),
+		Dependencies:     dependencies,
+		JavaDependencies: javaDependencies,
 	}, nil
 }
 

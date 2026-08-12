@@ -44,8 +44,12 @@ func TestStorageSchemaKeepsLargePayloadsOutsideMySQL(t *testing.T) {
 		"upload_parts":      {"storage_key", "sha256", "size_bytes"},
 		"file_nodes":        {"storage_key", "sha256", "size_bytes"},
 		"decompile_results": {"storage_key", "content_sha256", "size_bytes"},
-		"artifacts":         {"storage_key", "sha256", "size_bytes"},
-		"reports":           {"storage_key", "sha256", "size_bytes"},
+		"decompile_source_projects": {
+			"root_storage_key", "manifest_storage_key", "manifest_sha256",
+			"manifest_size_bytes",
+		},
+		"artifacts": {"storage_key", "sha256", "size_bytes"},
+		"reports":   {"storage_key", "sha256", "size_bytes"},
 	}
 	for tableName, requiredColumns := range referenceContracts {
 		definition, exists := tables[tableName]

@@ -195,13 +195,13 @@ FOR UPDATE`, taskID).Scan(
 		)
 		err := transaction.QueryRowContext(ctx, `
 SELECT node.format, node.storage_key, node.sha256, node.size_bytes,
-       blob.storage_key, blob.sha256, blob.size_bytes,
-       blob.reference_count, blob.state
+       stored_blob.storage_key, stored_blob.sha256, stored_blob.size_bytes,
+       stored_blob.reference_count, stored_blob.state
 FROM file_nodes node
 JOIN file_node_blob_refs reference
   ON reference.task_id = node.task_id
  AND reference.file_node_id = node.id
-JOIN blobs blob ON blob.id = reference.blob_id
+JOIN blobs stored_blob ON stored_blob.id = reference.blob_id
 WHERE node.task_id = ?
   AND node.logical_path_hash = ?
   AND node.logical_path = ?

@@ -3,11 +3,12 @@ import { describe, expect, it } from 'vitest'
 
 import TaskResultTabs from '@/components/tasks/TaskResultTabs.vue'
 import type { TaskResultStates } from '@/components/tasks/taskResultTypes'
+import type { TaskResultTab } from '@/components/tasks/taskResultTypes'
 
 function mountTabs(options: {
   states?: TaskResultStates
   mode?: 'live' | 'preview'
-  visibleTabs?: readonly ('files' | 'decompile' | 'vulnerabilities' | 'reports')[]
+  visibleTabs?: readonly TaskResultTab[]
 } = {}) {
   const optionalProps = {
     ...(options.states ? { states: options.states } : {}),
@@ -128,5 +129,33 @@ describe('TaskResultTabs', () => {
         .get('[role="tab"][data-result-tab="vulnerabilities"]')
         .attributes('aria-selected'),
     ).toBe('true')
+  })
+
+  it('exposes the Java analysis tab and its refresh command contract', async () => {
+    const wrapper = mount(TaskResultTabs, {
+      props: {
+        taskId: 'task-java',
+        visibleTabs: ['files', 'java-analysis'],
+        states: { 'java-analysis': { status: 'ready' } },
+        commands: {
+          'refresh-java-analysis': { enabled: true, pending: false },
+        },
+      },
+      slots: {
+        files: '<div>files</div>',
+        'java-analysis': '<div data-testid="java-analysis">Java findings</div>',
+      },
+    })
+
+    await wrapper
+      .get('[role="tab"][data-result-tab="java-analysis"]')
+      .trigger('click')
+    expect(wrapper.get('[data-testid="java-analysis"]').text()).toBe(
+      'Java findings',
+    )
+    await wrapper
+      .get('button[aria-label="刷新 Java 源码检测结果"]')
+      .trigger('click')
+    expect(wrapper.emitted('command')).toEqual([['refresh-java-analysis']])
   })
 })

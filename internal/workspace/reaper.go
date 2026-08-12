@@ -17,6 +17,7 @@ import (
 const (
 	maxSweepBatch       = 1000
 	ownershipMarkerName = ".binaryscan-owned"
+	archiveImportRoot   = "archive-imports"
 	ownershipMarkerSize = 37
 	ownershipMarkerMode = 0o640
 )
@@ -334,6 +335,15 @@ func filterTrustedRootMetadata(
 ) []fs.DirEntry {
 	filtered := make([]fs.DirEntry, 0, len(entries))
 	for _, entry := range entries {
+		// Archive imports use their own UUID/fence hierarchy and lifecycle
+		// cleanup below the shared task-work root. It is not a queue workspace
+		// and must never be interpreted (or removed) by this reaper.
+		if entry.Name() == archiveImportRoot {
+			info, err := root.Lstat(entry.Name())
+			if err == nil && realDirectory(info) {
+				continue
+			}
+		}
 		if entry.Name() == ownershipMarkerName {
 			info, err := root.Lstat(entry.Name())
 			if err == nil && exactOwnershipMarker(info) {

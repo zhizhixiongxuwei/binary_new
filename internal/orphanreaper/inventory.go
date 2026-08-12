@@ -21,15 +21,108 @@ const ownershipMarkerName = ".binaryscan-owned"
 var errStoredInventoryBatchFull = errors.New("stored-file inventory batch is full")
 
 type inventory struct {
-	repositoryPath string
-	repositoryInfo fs.FileInfo
-	uploadsPath    string
-	uploadsInfo    fs.FileInfo
-	blobPrefix     int
-	blobCursor     string
-	uploadCursor   string
-	storedKind     int
-	storedCursor   string
+	repositoryPath      string
+	repositoryInfo      fs.FileInfo
+	uploadsPath         string
+	uploadsInfo         fs.FileInfo
+	blobPrefix          int
+	blobCursor          string
+	uploadCursor        string
+	sourceProjectCursor string
+	storedKind          int
+	storedCursor        string
+}
+
+func (i *inventory) nextSourceProjects(
+	ctx context.Context,
+	limit int,
+	cutoff time.Time,
+) ([]SourceProjectCandidate, int, []Diagnostic, error) {
+	root, err := reopenRoot(i.repositoryPath, i.repositoryInfo, "repository")
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	defer root.Close()
+	projects, err := openChildDirectory(root, "source-projects")
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, 0, nil, nil
+	}
+	if err != nil {
+		return nil, 0, nil, fmt.Errorf("open source project inventory: %w", err)
+	}
+	defer projects.Close()
+	entries, err := fs.ReadDir(projects.FS(), ".")
+	if err != nil {
+		return nil, 0, nil, fmt.Errorf("list source project inventory: %w", err)
+	}
+	if len(entries) > maxDirectoryEntries {
+		return nil, 0, nil, fmt.Errorf(
+			"%w: source project root exceeds the entry limit", ErrUnsafeInventory,
+		)
+	}
+	if len(entries) == 0 {
+		i.sourceProjectCursor = ""
+		return nil, 0, nil, nil
+	}
+	start := sort.Search(len(entries), func(index int) bool {
+		return entries[index].Name() > i.sourceProjectCursor
+	})
+	if start == len(entries) {
+		start = 0
+	}
+	count := limit
+	if count > len(entries) {
+		count = len(entries)
+	}
+	result := make([]SourceProjectCandidate, 0, count)
+	diagnostics := make([]Diagnostic, 0)
+	deferred := 0
+	for offset := 0; offset < count; offset++ {
+		if err := ctx.Err(); err != nil {
+			return result, deferred, diagnostics, err
+		}
+		entry := entries[(start+offset)%len(entries)]
+		name := entry.Name()
+		i.sourceProjectCursor = name
+		if name == ownershipMarkerName {
+			continue
+		}
+		if !canonicalObjectID.MatchString(name) {
+			diagnostics = append(diagnostics, Diagnostic{
+				Kind: "source-project", Name: name,
+				Err: fmt.Errorf(
+					"%w: non-canonical source project directory", ErrUnsafeInventory,
+				),
+			})
+			continue
+		}
+		info, statErr := projects.Lstat(name)
+		if statErr != nil {
+			diagnostics = append(diagnostics, Diagnostic{
+				Kind: "source-project", Name: name, Err: statErr,
+			})
+			continue
+		}
+		if !realDirectory(info) {
+			diagnostics = append(diagnostics, Diagnostic{
+				Kind: "source-project", Name: name,
+				Err: fmt.Errorf(
+					"%w: source project candidate is not a real directory",
+					ErrUnsafeInventory,
+				),
+			})
+			continue
+		}
+		if info.ModTime().After(cutoff) {
+			deferred++
+			continue
+		}
+		result = append(result, SourceProjectCandidate{
+			ID: name, StorageKey: path.Join("source-projects", name),
+			ModifiedAt: info.ModTime().UTC(), fileInfo: info,
+		})
+	}
+	return result, deferred, diagnostics, nil
 }
 
 func newInventory(repositoryPath string, uploadsPath string) (*inventory, error) {
@@ -416,6 +509,12 @@ func (i *inventory) scanStoredNamespace(
 		if relative == "." {
 			return nil
 		}
+		if entry.Name() == ownershipMarkerName {
+			if entry.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
 		if entry.IsDir() {
 			info, statErr := namespaceRoot.Lstat(relative)
 			if statErr != nil {
@@ -464,8 +563,14 @@ func (i *inventory) scanStoredNamespace(
 			return nil
 		}
 		storageKey := path.Join(namespace.Directory, relative)
+		kind := namespace.Kind
+		if namespace.Kind == StoredFileReport {
+			if _, _, staging := reportStagingIdentity(storageKey); staging {
+				kind = StoredFileReportStaging
+			}
+		}
 		candidates = append(candidates, StoredFileCandidate{
-			Kind: namespace.Kind, StorageKey: storageKey, SHA256: digest,
+			Kind: kind, StorageKey: storageKey, SHA256: digest,
 			SizeBytes: info.Size(), ModifiedAt: info.ModTime().UTC(), fileInfo: info,
 		})
 		return nil
@@ -585,6 +690,108 @@ func (i *inventory) revalidateUpload(candidate UploadCandidate) error {
 		return fmt.Errorf("%w: upload candidate changed before deletion", ErrUnsafeInventory)
 	}
 	return nil
+}
+
+func (i *inventory) revalidateSourceProject(
+	candidate SourceProjectCandidate,
+) error {
+	if candidate.fileInfo == nil || !validSourceProjectCandidate(candidate) {
+		return fmt.Errorf(
+			"%w: source project inventory identity is missing", ErrUnsafeInventory,
+		)
+	}
+	root, err := reopenRoot(i.repositoryPath, i.repositoryInfo, "repository")
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	projects, err := openChildDirectory(root, "source-projects")
+	if err != nil {
+		return fmt.Errorf("reopen source project inventory: %w", err)
+	}
+	defer projects.Close()
+	current, err := projects.Lstat(candidate.ID)
+	if err != nil {
+		return fmt.Errorf("reinspect source project candidate: %w", err)
+	}
+	if !realDirectory(current) || !os.SameFile(candidate.fileInfo, current) {
+		return fmt.Errorf(
+			"%w: source project candidate changed before deletion",
+			ErrUnsafeInventory,
+		)
+	}
+	return nil
+}
+
+func (i *inventory) deleteReportStaging(
+	ctx context.Context,
+	candidate StoredFileCandidate,
+) (bool, error) {
+	taskID, _, valid := reportStagingIdentity(candidate.StorageKey)
+	if !valid || candidate.Kind != StoredFileReportStaging || candidate.fileInfo == nil {
+		return false, fmt.Errorf(
+			"%w: report staging inventory identity is missing", ErrUnsafeInventory,
+		)
+	}
+	root, err := reopenRoot(i.repositoryPath, i.repositoryInfo, "repository")
+	if err != nil {
+		return false, err
+	}
+	defer root.Close()
+	reports, err := openChildDirectory(root, "reports")
+	if err != nil {
+		return false, fmt.Errorf("reopen report staging inventory: %w", err)
+	}
+	defer reports.Close()
+	taskReports, err := openChildDirectory(reports, taskID)
+	if err != nil {
+		return false, fmt.Errorf("reopen report staging task directory: %w", err)
+	}
+	defer taskReports.Close()
+
+	name := path.Base(candidate.StorageKey)
+	current, err := taskReports.Lstat(name)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("reinspect report staging candidate: %w", err)
+	}
+	if !current.Mode().IsRegular() || current.Mode()&os.ModeSymlink != 0 ||
+		current.Size() != candidate.SizeBytes ||
+		!os.SameFile(candidate.fileInfo, current) {
+		return false, fmt.Errorf(
+			"%w: report staging candidate changed before deletion", ErrUnsafeInventory,
+		)
+	}
+	digest, err := hashStoredFile(ctx, taskReports, name, current)
+	if err != nil {
+		return false, err
+	}
+	if digest != candidate.SHA256 {
+		return false, fmt.Errorf(
+			"%w: report staging content changed before deletion", ErrUnsafeInventory,
+		)
+	}
+	latest, err := taskReports.Lstat(name)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("reinspect hashed report staging candidate: %w", err)
+	}
+	if !latest.Mode().IsRegular() || latest.Mode()&os.ModeSymlink != 0 ||
+		latest.Size() != current.Size() || !os.SameFile(current, latest) {
+		return false, fmt.Errorf(
+			"%w: report staging candidate changed before removal", ErrUnsafeInventory,
+		)
+	}
+	if err := taskReports.Remove(name); errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	} else if err != nil {
+		return false, fmt.Errorf("remove report staging candidate: %w", err)
+	}
+	return true, nil
 }
 
 func realDirectory(info fs.FileInfo) bool {

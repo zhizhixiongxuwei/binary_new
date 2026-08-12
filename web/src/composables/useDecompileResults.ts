@@ -196,6 +196,24 @@ export function useDecompileResults(options: UseDecompileResultsOptions) {
     void load()
   }
 
+  async function openResult(resultId: string): Promise<boolean> {
+    if (!resultId) return false
+    let target = items.value.find((item) => item.id === resultId)
+    if (!target) {
+      await load()
+      target = items.value.find((item) => item.id === resultId)
+    }
+    let pages = 0
+    while (!target && nextCursor.value && pages < 32) {
+      await load(true)
+      target = items.value.find((item) => item.id === resultId)
+      pages += 1
+    }
+    if (!target) return false
+    selectResult(target.id)
+    return true
+  }
+
   watch(
     [() => toValue(options.taskId), () => options.enabled === undefined || toValue(options.enabled)],
     ([taskId, enabled]) => {
@@ -238,6 +256,7 @@ export function useDecompileResults(options: UseDecompileResultsOptions) {
     selectResult,
     loadMoreResults,
     loadMoreSource,
+    openResult,
     refresh,
   }
 }

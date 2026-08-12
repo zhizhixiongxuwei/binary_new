@@ -176,6 +176,18 @@ function mountPanel(
             </div>
           `,
         },
+        DecompileProjectPanel: {
+          props: ['taskId', 'userRole', 'enabled'],
+          emits: ['deleted', 'analyze', 'analyzeJava'],
+          template: `
+            <section
+              data-testid="decompile-project-panel"
+              :data-task-id="taskId"
+              :data-role="userRole || ''"
+              :data-enabled="String(enabled)"
+            />
+          `,
+        },
         TaskAnalysisActions: AnalysisActionsStub,
         TaskActionBar: options.realLifecycleActions
           ? false
@@ -241,18 +253,25 @@ describe('TaskDetailPanel', () => {
     vi.spyOn(api, 'getTask')
       .mockResolvedValueOnce(task('task-native', 'sample.bin', 'elf64'))
       .mockResolvedValueOnce(task('task-image', 'image.tar', 'docker-tar'))
+      .mockResolvedValueOnce(task('task-java', 'example.jar', 'jar'))
 
     const nativeWrapper = mountPanel('task-native')
     await flushPromises()
     expect(
       nativeWrapper.findAll('[data-result-tab]').map((tab) => tab.text()),
-    ).toEqual(['文件结构', '反编译', '报告'])
+    ).toEqual(['文件结构', '反编译', 'C 源码检测', '报告'])
 
     const imageWrapper = mountPanel('task-image')
     await flushPromises()
     expect(
       imageWrapper.findAll('[data-result-tab]').map((tab) => tab.text()),
     ).toEqual(['文件结构', '容器漏洞', '报告'])
+
+    const javaWrapper = mountPanel('task-java')
+    await flushPromises()
+    expect(
+      javaWrapper.findAll('[data-result-tab]').map((tab) => tab.text()),
+    ).toEqual(['文件结构', '反编译', 'Java 源码检测', '报告'])
   })
 
   it('derives creator ownership only from the stable user ID', async () => {
@@ -317,10 +336,25 @@ describe('TaskDetailPanel', () => {
     expect(resultsPanel.attributes('hidden')).toBeDefined()
     expect(informationPanel.attributes('hidden')).toBeDefined()
     expect(informationPanel.find('[data-testid="lifecycle-actions"]').exists()).toBe(true)
+    expect(
+      informationPanel
+        .get('[data-testid="decompile-project-panel"]')
+        .attributes('data-enabled'),
+    ).toBe('false')
+    expect(
+      informationPanel
+        .get('[data-testid="decompile-project-panel"]')
+        .attributes('data-role'),
+    ).toBe('administrator')
 
     await informationTab.trigger('click')
     expect(informationPanel.attributes('hidden')).toBeUndefined()
     expect(informationTab.attributes('aria-selected')).toBe('true')
+    expect(
+      informationPanel
+        .get('[data-testid="decompile-project-panel"]')
+        .attributes('data-enabled'),
+    ).toBe('true')
   })
 
   it('opens files and Trivy results from the outer analysis commands', async () => {

@@ -77,6 +77,24 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8f9fa;border:1px so
 		{{range .Vulnerabilities}}<tr data-report-vulnerability-id="{{.VulnerabilityID}}" data-severity="{{.Severity}}" data-package-name="{{.PackageName}}"><td>{{.VulnerabilityID}}</td><td class="severity-{{.Severity}}">{{.Severity}}</td><td>{{.PackageName}}</td><td>{{nullable .InstalledVersion}}<br>{{nullable .FixedVersion}}</td><td>{{.ImageLogicalPath}}</td><td>{{nullable .Title}}<br>{{nullable .DescriptionSummary}}</td><td>{{if .Evidence.HasValues}}<dl class="evidence-list">{{if .Evidence.Target}}<div><dt>扫描目标</dt><dd><code>{{.Evidence.Target}}</code></dd></div>{{end}}{{if .Evidence.PackagePath}}<div><dt>包路径</dt><dd><code>{{.Evidence.PackagePath}}</code></dd></div>{{end}}{{if .Evidence.Class}}<div><dt>组件类别</dt><dd><code>{{.Evidence.Class}}</code></dd></div>{{end}}{{if .Evidence.Type}}<div><dt>包类型</dt><dd><code>{{.Evidence.Type}}</code></dd></div>{{end}}{{if .Evidence.ImagePlatform}}<div><dt>镜像平台</dt><dd><code>{{.Evidence.ImagePlatform}}</code></dd></div>{{end}}{{if .Evidence.ManifestDigest}}<div><dt>清单摘要</dt><dd><code>{{.Evidence.ManifestDigest}}</code></dd></div>{{end}}{{if .Evidence.ImageReferences}}<div><dt>镜像引用</dt><dd>{{range .Evidence.ImageReferences}}<code>{{.}}</code><br>{{end}}</dd></div>{{end}}{{if .Evidence.HasDataSource}}<div><dt>漏洞数据源</dt><dd>{{.Evidence.DataSourceName}}{{if and .Evidence.DataSourceName .Evidence.DataSourceID}} / {{end}}{{.Evidence.DataSourceID}}{{if .Evidence.DataSourceURL}}<br><a class="source-link" href="{{.Evidence.DataSourceURL}}" target="_blank" rel="noreferrer noopener">{{.Evidence.DataSourceURL}}</a>{{end}}</dd></div>{{end}}</dl>{{else}}<span class="muted">无结构化证据</span>{{end}}{{if .References}}<strong>漏洞引用</strong><ul class="reference-list">{{range .References}}<li><a href="{{.URL}}" target="_blank" rel="noreferrer noopener">{{.URL}}</a></li>{{end}}</ul>{{end}}</td></tr>{{else}}<tr><td colspan="7">无漏洞发现</td></tr>{{end}}
 	</tbody></table>
 	{{if .VulnerabilitiesTruncated}}<p class="muted">漏洞详情仅展示前 {{.VulnerabilityLimit}} 项；完整数据请使用 JSON 报告。</p>{{end}}
+	<h2>C 伪源码静态分析</h2>
+	<p class="muted">仅展示每个仍可用反编译源码项目的最新成功或部分成功运行。输入是 Ghidra 伪 C，不等同于原始、可编译源码。</p>
+	<table><thead><tr><th>源码项目</th><th>运行</th><th>分析器</th><th>状态</th><th>发现</th><th>诊断</th><th>源码 SHA-256</th></tr></thead><tbody>
+	{{range .CAnalysisRuns}}<tr data-report-c-analysis-run-id="{{.ID}}" data-source-project-id="{{.SourceProjectID}}"><td>{{.SourceProjectID}}</td><td>{{.ID}}</td><td>{{.AnalyzerName}} {{.AnalyzerVersion}}</td><td>{{.Status}}</td><td>{{.FindingCount}}{{if .FindingsTruncated}}+{{end}}</td><td>{{.DiagnosticCount}}{{if .DiagnosticsTruncated}}+{{end}}</td><td>{{.SourceSHA256}}</td></tr>{{else}}<tr><td colspan="7">无 C 伪源码静态分析结果</td></tr>{{end}}
+	</tbody></table>
+	<h3>C 伪源码发现</h3><table><thead><tr><th>CWE / 规则</th><th>级别</th><th>函数</th><th>位置</th><th>说明</th><th>证据片段</th></tr></thead><tbody>
+	{{range .CAnalysisFindings}}<tr data-report-c-analysis-finding-id="{{.ID}}" data-c-analysis-run-id="{{.RunID}}"><td>{{.CWE}}<br><code>{{.RuleID}}</code></td><td class="severity-{{.Severity}}">{{.Severity}}</td><td>{{.FunctionName}}<br><code>{{.FunctionAddress}}</code></td><td>{{.StartLine}}:{{.StartColumn}}-{{.EndLine}}:{{.EndColumn}}</td><td>{{.Message}}</td><td><pre>{{nullable .Snippet}}</pre></td></tr>{{else}}<tr><td colspan="6">无 C 伪源码发现</td></tr>{{end}}
+	</tbody></table>
+	{{if .CAnalysisFindingsTruncated}}<p class="muted">C 伪源码发现仅展示前 {{.CAnalysisFindingLimit}} 项；更多记录及截断状态请查看 JSON 报告。</p>{{end}}
+	<h2>Java 反编译源码静态分析</h2>
+	<p class="muted">仅展示每个仍可用 Java 反编译源码项目的最新成功或部分成功运行；结果用于辅助查看，不参与任务总风险等级。</p>
+	<table><thead><tr><th>源码项目</th><th>运行</th><th>分析器</th><th>状态</th><th>源码文件</th><th>发现</th><th>诊断</th><th>输入 SHA-256</th></tr></thead><tbody>
+	{{range .JavaAnalysisRuns}}<tr data-report-java-analysis-run-id="{{.ID}}" data-source-project-id="{{.SourceProjectID}}"><td>{{.SourceProjectID}}</td><td>{{.ID}}</td><td>{{.AnalyzerName}} {{.AnalyzerVersion}}<br><code>{{.RulesetVersion}}</code></td><td>{{.Status}}</td><td>{{.SourceFileCount}}</td><td>{{.FindingCount}}{{if .FindingsTruncated}}+{{end}}</td><td>{{.DiagnosticCount}}{{if .DiagnosticsTruncated}}+{{end}}</td><td>{{.InputSHA256}}</td></tr>{{else}}<tr><td colspan="8">无 Java 反编译源码静态分析结果</td></tr>{{end}}
+	</tbody></table>
+	<h3>Java 源码发现</h3><table><thead><tr><th>CWE / 规则</th><th>级别</th><th>文件</th><th>类型 / 方法</th><th>位置</th><th>说明</th><th>证据片段</th></tr></thead><tbody>
+	{{range .JavaAnalysisFindings}}<tr data-report-java-analysis-finding-id="{{.ID}}" data-java-analysis-run-id="{{.RunID}}"><td>{{.CWE}}<br><code>{{.RuleID}}</code></td><td class="severity-{{.Severity}}">{{.Severity}}</td><td>{{.LogicalPath}}<br><code>{{.BinaryName}}</code></td><td>{{.TypeName}}<br>{{.CallableName}}<br><code>{{nullable .CallableSignature}}</code></td><td>{{.StartLine}}:{{.StartColumn}}-{{.EndLine}}:{{.EndColumn}}</td><td>{{.Message}}</td><td><pre>{{nullable .Snippet}}</pre></td></tr>{{else}}<tr><td colspan="7">无 Java 源码发现</td></tr>{{end}}
+	</tbody></table>
+	{{if .JavaAnalysisFindingsTruncated}}<p class="muted">Java 源码发现仅展示前 {{.JavaAnalysisFindingLimit}} 项；更多记录及截断状态请查看 JSON 报告。</p>{{end}}
 	<h2>分析器运行</h2><table><thead><tr><th>分析器</th><th>版本</th><th>状态</th><th>文件节点</th><th>错误</th></tr></thead><tbody>
 	{{range .Analyzers}}<tr><td>{{.AnalyzerName}}</td><td>{{.AnalyzerVersion}}</td><td>{{.Status}}</td><td>{{nullable .FileNodeID}}</td><td>{{nullable .ErrorCode}} {{nullable .ErrorMessage}}</td></tr>{{else}}<tr><td colspan="5">无分析器记录</td></tr>{{end}}
 	</tbody></table>
@@ -100,6 +118,8 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8f9fa;border:1px so
 
 const (
 	htmlVulnerabilityDetailLimit = 1000
+	htmlCAnalysisFindingLimit    = 1000
+	htmlJavaAnalysisFindingLimit = 1000
 	htmlAnalyzerRunLimit         = 1000
 	htmlDecompileResultLimit     = 3000
 	htmlDatabaseVersionLimit     = 100
@@ -107,34 +127,42 @@ const (
 )
 
 type htmlReportData struct {
-	SchemaVersion            string
-	ReportID                 string
-	GeneratedAt              string
-	Task                     taskSnapshot
-	Execution                executionSnapshot
-	SampleRelation           string
-	SampleRelationMessage    string
-	Limits                   string
-	Statistics               string
-	FileCount                uint64
-	FileTypes                []htmlFileType
-	ImageStructures          []htmlImageStructure
-	VulnerabilitySummary     []htmlVulnerabilitySummary
-	Vulnerabilities          []htmlVulnerabilityFinding
-	Analyzers                []analyzerRunSnapshot
-	Decompilations           []htmlDecompileResult
-	Databases                []databaseBundleSnapshot
-	Issues                   []htmlIssue
-	VulnerabilitiesTruncated bool
-	AnalyzersTruncated       bool
-	DecompilationsTruncated  bool
-	DatabasesTruncated       bool
-	IssuesTruncated          bool
-	VulnerabilityLimit       int
-	AnalyzerLimit            int
-	DecompilationLimit       int
-	DatabaseLimit            int
-	IssueLimit               int
+	SchemaVersion                 string
+	ReportID                      string
+	GeneratedAt                   string
+	Task                          taskSnapshot
+	Execution                     executionSnapshot
+	SampleRelation                string
+	SampleRelationMessage         string
+	Limits                        string
+	Statistics                    string
+	FileCount                     uint64
+	FileTypes                     []htmlFileType
+	ImageStructures               []htmlImageStructure
+	VulnerabilitySummary          []htmlVulnerabilitySummary
+	Vulnerabilities               []htmlVulnerabilityFinding
+	CAnalysisRuns                 []cAnalysisRunSnapshot
+	CAnalysisFindings             []cAnalysisFindingSnapshot
+	JavaAnalysisRuns              []javaAnalysisRunSnapshot
+	JavaAnalysisFindings          []javaAnalysisFindingSnapshot
+	Analyzers                     []analyzerRunSnapshot
+	Decompilations                []htmlDecompileResult
+	Databases                     []databaseBundleSnapshot
+	Issues                        []htmlIssue
+	VulnerabilitiesTruncated      bool
+	CAnalysisFindingsTruncated    bool
+	JavaAnalysisFindingsTruncated bool
+	AnalyzersTruncated            bool
+	DecompilationsTruncated       bool
+	DatabasesTruncated            bool
+	IssuesTruncated               bool
+	VulnerabilityLimit            int
+	CAnalysisFindingLimit         int
+	JavaAnalysisFindingLimit      int
+	AnalyzerLimit                 int
+	DecompilationLimit            int
+	DatabaseLimit                 int
+	IssueLimit                    int
 }
 
 type htmlFileType struct {
@@ -245,18 +273,20 @@ func (r *MySQLRepository) WriteHTMLSnapshot(
 			return err
 		}
 		data := htmlReportData{
-			SchemaVersion:      SchemaVersion,
-			ReportID:           request.ReportID,
-			GeneratedAt:        request.GeneratedAt.UTC().Format("2006-01-02T15:04:05.999999999Z07:00"),
-			Task:               task,
-			Execution:          execution,
-			SampleRelation:     sampleRelationAt(task, request.GeneratedAt),
-			Statistics:         string(execution.Statistics),
-			VulnerabilityLimit: htmlVulnerabilityDetailLimit,
-			AnalyzerLimit:      htmlAnalyzerRunLimit,
-			DecompilationLimit: htmlDecompileResultLimit,
-			DatabaseLimit:      htmlDatabaseVersionLimit,
-			IssueLimit:         htmlDiagnosticLimit,
+			SchemaVersion:            SchemaVersion,
+			ReportID:                 request.ReportID,
+			GeneratedAt:              request.GeneratedAt.UTC().Format("2006-01-02T15:04:05.999999999Z07:00"),
+			Task:                     task,
+			Execution:                execution,
+			SampleRelation:           sampleRelationAt(task, request.GeneratedAt),
+			Statistics:               string(execution.Statistics),
+			VulnerabilityLimit:       htmlVulnerabilityDetailLimit,
+			CAnalysisFindingLimit:    htmlCAnalysisFindingLimit,
+			JavaAnalysisFindingLimit: htmlJavaAnalysisFindingLimit,
+			AnalyzerLimit:            htmlAnalyzerRunLimit,
+			DecompilationLimit:       htmlDecompileResultLimit,
+			DatabaseLimit:            htmlDatabaseVersionLimit,
+			IssueLimit:               htmlDiagnosticLimit,
 		}
 		data.SampleRelationMessage = sampleRelationMessage(
 			task,
@@ -288,6 +318,25 @@ func (r *MySQLRepository) WriteHTMLSnapshot(
 		); err != nil {
 			return err
 		}
+		var dependencies []CAnalysisDependency
+		if data.CAnalysisRuns, dependencies, err = loadLatestCAnalysisRuns(
+			ctx, transaction, request.TaskID,
+		); err != nil {
+			return err
+		}
+		if data.CAnalysisFindings, data.CAnalysisFindingsTruncated, err =
+			loadHTMLCAnalysisFindings(ctx, transaction, request.TaskID); err != nil {
+			return err
+		}
+		var javaDependencies []JavaAnalysisDependency
+		if data.JavaAnalysisRuns, javaDependencies, err =
+			loadLatestJavaAnalysisRuns(ctx, transaction, request.TaskID); err != nil {
+			return err
+		}
+		if data.JavaAnalysisFindings, data.JavaAnalysisFindingsTruncated, err =
+			loadHTMLJavaAnalysisFindings(ctx, transaction, request.TaskID); err != nil {
+			return err
+		}
 		if data.Analyzers, data.AnalyzersTruncated, err = loadHTMLAnalyzers(
 			ctx, transaction, request.TaskID,
 		); err != nil {
@@ -313,6 +362,8 @@ func (r *MySQLRepository) WriteHTMLSnapshot(
 		if err := reportHTML.Execute(writer, data); err != nil {
 			return fmt.Errorf("render static HTML report: %w", err)
 		}
+		recordSnapshotDependencies(request, dependencies)
+		recordJavaSnapshotDependencies(request, javaDependencies)
 		return nil
 	})
 }

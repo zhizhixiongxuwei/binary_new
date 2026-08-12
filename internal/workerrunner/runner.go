@@ -36,6 +36,7 @@ type Config struct {
 	PollInterval      time.Duration
 	HeartbeatInterval time.Duration
 	FinishTimeout     time.Duration
+	ClaimGate         func(context.Context) error
 }
 
 type Runner struct {
@@ -98,6 +99,22 @@ func (r *Runner) Run(ctx context.Context) error {
 	for {
 		if ctx.Err() != nil {
 			return nil
+		}
+		if r.config.ClaimGate != nil {
+			if err := r.config.ClaimGate(ctx); err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				r.logger.DebugContext(
+					ctx, "worker claim gate is not ready",
+					slog.String("worker_kind", string(r.config.Kind)),
+					slog.String("error", err.Error()),
+				)
+				if !wait(ctx, r.config.PollInterval) {
+					return nil
+				}
+				continue
+			}
 		}
 		lease, found, err := r.queue.Claim(ctx, r.config.Kind, r.config.Owner)
 		if err != nil {
@@ -338,7 +355,8 @@ func optionalUint64Equal(left, right *uint64) bool {
 func validKind(kind queue.Kind) bool {
 	switch kind {
 	case queue.KindScan, queue.KindImage, queue.KindNative, queue.KindBytecode,
-		queue.KindTrivy, queue.KindReport, queue.KindDecompile:
+		queue.KindTrivy, queue.KindReport, queue.KindDecompile,
+		queue.KindCAnalysis, queue.KindJavaAnalysis:
 		return true
 	default:
 		return false

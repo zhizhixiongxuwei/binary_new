@@ -55,6 +55,8 @@ var activeTaskStatuses = map[string]struct{}{
 
 var jobKinds = []string{
 	"scan", "image", "native", "bytecode", "trivy", "report", "decompile",
+	"c_analysis",
+	"java_analysis",
 }
 
 type AnalyzerRegistration struct {

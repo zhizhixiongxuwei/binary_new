@@ -1,6 +1,8 @@
 export const TASK_RESULT_TABS = [
   'files',
   'decompile',
+  'c-analysis',
+  'java-analysis',
   'vulnerabilities',
   'reports',
 ] as const
@@ -30,6 +32,8 @@ export type TaskResultStates = Partial<
 export type TaskResultCommand =
   | 'refresh-decompile'
   | 'download-decompile'
+  | 'refresh-c-analysis'
+  | 'refresh-java-analysis'
   | 'refresh-vulnerabilities'
   | 'export-vulnerabilities'
   | 'refresh-reports'

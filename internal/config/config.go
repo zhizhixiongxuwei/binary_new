@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -41,6 +42,7 @@ type Config struct {
 	ArchiveSandboxSocket     string
 	ArchiveSandboxInputRoot  string
 	ArchiveSandboxOutputRoot string
+	ArchiveSandboxRunRoot    string
 	ArchiveSandboxTimeout    time.Duration
 
 	TrivyExecutable             string
@@ -66,6 +68,19 @@ type Config struct {
 	GhidraMaxIndexBytes          int64
 	GhidraMaxOutputBytes         int64
 	GhidraMaxFunctions           int
+
+	CCheckerURL                  string
+	CCheckerVersion              string
+	CAnalysisMaxDuration         time.Duration
+	CAnalysisMaxResponseBytes    int64
+	CAnalysisMaxFindings         int
+	CAnalysisMaxDiagnostics      int
+	JavaCheckerURL               string
+	JavaCheckerVersion           string
+	JavaAnalysisMaxDuration      time.Duration
+	JavaAnalysisMaxResponseBytes int64
+	JavaAnalysisMaxFindings      int
+	JavaAnalysisMaxDiagnostics   int
 
 	QueueLeaseInterval time.Duration
 	QueuePollInterval  time.Duration
@@ -123,6 +138,7 @@ func Load(service string) (Config, error) {
 		ArchiveSandboxSocket:         "/run/binaryscan-archive/archive.sock",
 		ArchiveSandboxInputRoot:      "/var/lib/binaryscan-archive/input",
 		ArchiveSandboxOutputRoot:     "/var/lib/binaryscan-archive/output",
+		ArchiveSandboxRunRoot:        "/var/lib/binaryscan-archive/run",
 		ArchiveSandboxTimeout:        20 * time.Minute,
 		TrivyExecutable:              "/usr/local/bin/trivy",
 		TrivyVersion:                 "0.72.0",
@@ -146,6 +162,18 @@ func Load(service string) (Config, error) {
 		GhidraMaxIndexBytes:          32 * 1024 * 1024,
 		GhidraMaxOutputBytes:         128 * 1024 * 1024,
 		GhidraMaxFunctions:           3_000,
+		CCheckerURL:                  "http://c-checker:8080",
+		CCheckerVersion:              "0.1.0",
+		CAnalysisMaxDuration:         10 * time.Minute,
+		CAnalysisMaxResponseBytes:    32 * 1024 * 1024,
+		CAnalysisMaxFindings:         10_000,
+		CAnalysisMaxDiagnostics:      1_000,
+		JavaCheckerURL:               "http://java-checker:8080",
+		JavaCheckerVersion:           "0.1.0",
+		JavaAnalysisMaxDuration:      10 * time.Minute,
+		JavaAnalysisMaxResponseBytes: 32 * 1024 * 1024,
+		JavaAnalysisMaxFindings:      10_000,
+		JavaAnalysisMaxDiagnostics:   1_000,
 		QueueLeaseInterval:           60 * time.Second,
 		QueuePollInterval:            2 * time.Second,
 		QueueHeavySlots:              1,
@@ -265,10 +293,12 @@ func (c Config) Validate() error {
 		}
 	}
 	if c.ArchiveSandboxEnabled {
-		for name, value := range map[string]string{
+		archiveRoots := map[string]string{
 			"archive_sandbox.input_root":  c.ArchiveSandboxInputRoot,
 			"archive_sandbox.output_root": c.ArchiveSandboxOutputRoot,
-		} {
+			"archive_sandbox.run_root":    c.ArchiveSandboxRunRoot,
+		}
+		for name, value := range archiveRoots {
 			if !validRootPath(value) {
 				errs = append(errs, fmt.Errorf(
 					"%s must be an absolute path below the filesystem root",
@@ -276,21 +306,46 @@ func (c Config) Validate() error {
 				))
 			}
 		}
-		if validRootPath(c.ArchiveSandboxInputRoot) &&
-			validRootPath(c.ArchiveSandboxOutputRoot) &&
-			pathsOverlap(
-				c.ArchiveSandboxInputRoot,
-				c.ArchiveSandboxOutputRoot,
-			) {
+		archiveNames := []string{
+			"archive_sandbox.input_root",
+			"archive_sandbox.output_root",
+			"archive_sandbox.run_root",
+		}
+		for index, first := range archiveNames {
+			for _, second := range archiveNames[index+1:] {
+				errs = appendRootOverlapError(errs, archiveRoots, first, second)
+			}
+		}
+		archiveParent := filepath.Dir(c.ArchiveSandboxInputRoot)
+		if filepath.Base(c.ArchiveSandboxInputRoot) != "input" ||
+			filepath.Base(c.ArchiveSandboxOutputRoot) != "output" ||
+			filepath.Base(c.ArchiveSandboxRunRoot) != "run" ||
+			filepath.Dir(c.ArchiveSandboxOutputRoot) != archiveParent ||
+			filepath.Dir(c.ArchiveSandboxRunRoot) != archiveParent {
 			errs = append(errs, errors.New(
-				"archive_sandbox.input_root and archive_sandbox.output_root must not overlap",
+				"archive_sandbox roots must be input, output, and run under one dedicated parent",
 			))
+		}
+		for name, value := range roots {
+			if validRootPath(archiveParent) && validRootPath(value) &&
+				pathsOverlap(archiveParent, value) {
+				errs = append(errs, fmt.Errorf(
+					"archive_sandbox parent and %s must not overlap", name,
+				))
+			}
 		}
 		if !filepath.IsAbs(c.ArchiveSandboxSocket) ||
 			filepath.Clean(c.ArchiveSandboxSocket) == string(filepath.Separator) ||
 			filepath.Clean(c.ArchiveSandboxSocket) != c.ArchiveSandboxSocket {
 			errs = append(errs, errors.New(
 				"archive_sandbox.socket must be a canonical absolute socket path",
+			))
+		}
+		socketParent := filepath.Dir(c.ArchiveSandboxSocket)
+		if !validRootPath(socketParent) ||
+			validRootPath(archiveParent) && pathsOverlap(socketParent, archiveParent) {
+			errs = append(errs, errors.New(
+				"archive_sandbox socket parent must not overlap archive data roots",
 			))
 		}
 		if c.ArchiveSandboxTimeout <= 0 ||
@@ -369,6 +424,35 @@ func (c Config) Validate() error {
 		c.GhidraMaxOutputBytes > 128*1024*1024 ||
 		c.GhidraMaxFunctions <= 0 || c.GhidraMaxFunctions > 3_000 {
 		errs = append(errs, errors.New("Ghidra execution limits are invalid"))
+	}
+	checkerURL, checkerURLErr := url.Parse(c.CCheckerURL)
+	if checkerURLErr != nil || checkerURL.Scheme != "http" && checkerURL.Scheme != "https" ||
+		checkerURL.Host == "" || checkerURL.User != nil || checkerURL.RawQuery != "" ||
+		checkerURL.Fragment != "" || c.CCheckerVersion != "0.1.0" {
+		errs = append(errs, errors.New("c_analysis checker URL or version is invalid"))
+	}
+	if c.CAnalysisMaxDuration <= 0 || c.CAnalysisMaxDuration > 10*time.Minute ||
+		c.CAnalysisMaxResponseBytes <= 0 ||
+		c.CAnalysisMaxResponseBytes > 32*1024*1024 ||
+		c.CAnalysisMaxFindings <= 0 || c.CAnalysisMaxFindings > 10_000 ||
+		c.CAnalysisMaxDiagnostics <= 0 || c.CAnalysisMaxDiagnostics > 1_000 {
+		errs = append(errs, errors.New("C analysis execution limits are invalid"))
+	}
+	javaCheckerURL, javaCheckerURLErr := url.Parse(c.JavaCheckerURL)
+	if javaCheckerURLErr != nil ||
+		javaCheckerURL.Scheme != "http" && javaCheckerURL.Scheme != "https" ||
+		javaCheckerURL.Host == "" || javaCheckerURL.User != nil ||
+		javaCheckerURL.RawQuery != "" || javaCheckerURL.Fragment != "" ||
+		c.JavaCheckerVersion != "0.1.0" {
+		errs = append(errs, errors.New("java_analysis checker URL or version is invalid"))
+	}
+	if c.JavaAnalysisMaxDuration <= 0 ||
+		c.JavaAnalysisMaxDuration > 10*time.Minute ||
+		c.JavaAnalysisMaxResponseBytes <= 0 ||
+		c.JavaAnalysisMaxResponseBytes > 32*1024*1024 ||
+		c.JavaAnalysisMaxFindings <= 0 || c.JavaAnalysisMaxFindings > 10_000 ||
+		c.JavaAnalysisMaxDiagnostics <= 0 || c.JavaAnalysisMaxDiagnostics > 1_000 {
+		errs = append(errs, errors.New("Java analysis execution limits are invalid"))
 	}
 	if c.StorageMinFreeBytes <= 0 {
 		errs = append(errs, errors.New("BINARYSCAN_STORAGE_MIN_FREE_BYTES must be positive"))
@@ -600,6 +684,7 @@ type fileConfig struct {
 		Socket         string `yaml:"socket"`
 		InputRoot      string `yaml:"input_root"`
 		OutputRoot     string `yaml:"output_root"`
+		RunRoot        string `yaml:"run_root"`
 		TimeoutSeconds int    `yaml:"timeout_seconds"`
 	} `yaml:"archive_sandbox"`
 	Trivy struct {
@@ -628,6 +713,22 @@ type fileConfig struct {
 		MaxOutputBytes          int64  `yaml:"max_output_bytes"`
 		MaxFunctions            int    `yaml:"max_functions"`
 	} `yaml:"ghidra"`
+	CAnalysis struct {
+		CheckerURL       string `yaml:"checker_url"`
+		CheckerVersion   string `yaml:"checker_version"`
+		TimeoutSeconds   int    `yaml:"timeout_seconds"`
+		MaxResponseBytes int64  `yaml:"max_response_bytes"`
+		MaxFindings      int    `yaml:"max_findings"`
+		MaxDiagnostics   int    `yaml:"max_diagnostics"`
+	} `yaml:"c_analysis"`
+	JavaAnalysis struct {
+		CheckerURL       string `yaml:"checker_url"`
+		CheckerVersion   string `yaml:"checker_version"`
+		TimeoutSeconds   int    `yaml:"timeout_seconds"`
+		MaxResponseBytes int64  `yaml:"max_response_bytes"`
+		MaxFindings      int    `yaml:"max_findings"`
+		MaxDiagnostics   int    `yaml:"max_diagnostics"`
+	} `yaml:"java_analysis"`
 	Queue struct {
 		LeaseSeconds     int `yaml:"lease_seconds"`
 		HeartbeatSeconds int `yaml:"heartbeat_seconds"`
@@ -755,6 +856,9 @@ func applyFileConfig(cfg *Config, fileCfg fileConfig) {
 	if fileCfg.ArchiveSandbox.OutputRoot != "" {
 		cfg.ArchiveSandboxOutputRoot = fileCfg.ArchiveSandbox.OutputRoot
 	}
+	if fileCfg.ArchiveSandbox.RunRoot != "" {
+		cfg.ArchiveSandboxRunRoot = fileCfg.ArchiveSandbox.RunRoot
+	}
 	if fileCfg.ArchiveSandbox.TimeoutSeconds != 0 {
 		cfg.ArchiveSandboxTimeout = time.Duration(
 			fileCfg.ArchiveSandbox.TimeoutSeconds,
@@ -835,6 +939,43 @@ func applyFileConfig(cfg *Config, fileCfg fileConfig) {
 	}
 	if fileCfg.Ghidra.MaxFunctions != 0 {
 		cfg.GhidraMaxFunctions = fileCfg.Ghidra.MaxFunctions
+	}
+	if fileCfg.CAnalysis.CheckerURL != "" {
+		cfg.CCheckerURL = fileCfg.CAnalysis.CheckerURL
+	}
+	if fileCfg.CAnalysis.CheckerVersion != "" {
+		cfg.CCheckerVersion = fileCfg.CAnalysis.CheckerVersion
+	}
+	if fileCfg.CAnalysis.TimeoutSeconds != 0 {
+		cfg.CAnalysisMaxDuration = time.Duration(fileCfg.CAnalysis.TimeoutSeconds) * time.Second
+	}
+	if fileCfg.CAnalysis.MaxResponseBytes != 0 {
+		cfg.CAnalysisMaxResponseBytes = fileCfg.CAnalysis.MaxResponseBytes
+	}
+	if fileCfg.CAnalysis.MaxFindings != 0 {
+		cfg.CAnalysisMaxFindings = fileCfg.CAnalysis.MaxFindings
+	}
+	if fileCfg.CAnalysis.MaxDiagnostics != 0 {
+		cfg.CAnalysisMaxDiagnostics = fileCfg.CAnalysis.MaxDiagnostics
+	}
+	if fileCfg.JavaAnalysis.CheckerURL != "" {
+		cfg.JavaCheckerURL = fileCfg.JavaAnalysis.CheckerURL
+	}
+	if fileCfg.JavaAnalysis.CheckerVersion != "" {
+		cfg.JavaCheckerVersion = fileCfg.JavaAnalysis.CheckerVersion
+	}
+	if fileCfg.JavaAnalysis.TimeoutSeconds != 0 {
+		cfg.JavaAnalysisMaxDuration =
+			time.Duration(fileCfg.JavaAnalysis.TimeoutSeconds) * time.Second
+	}
+	if fileCfg.JavaAnalysis.MaxResponseBytes != 0 {
+		cfg.JavaAnalysisMaxResponseBytes = fileCfg.JavaAnalysis.MaxResponseBytes
+	}
+	if fileCfg.JavaAnalysis.MaxFindings != 0 {
+		cfg.JavaAnalysisMaxFindings = fileCfg.JavaAnalysis.MaxFindings
+	}
+	if fileCfg.JavaAnalysis.MaxDiagnostics != 0 {
+		cfg.JavaAnalysisMaxDiagnostics = fileCfg.JavaAnalysis.MaxDiagnostics
 	}
 	if fileCfg.Limits.MaxUploadBytes != 0 {
 		cfg.MaxUploadBytes = fileCfg.Limits.MaxUploadBytes
@@ -963,6 +1104,9 @@ func applyEnvironment(cfg *Config) error {
 	if value := strings.TrimSpace(os.Getenv("BINARYSCAN_ARCHIVE_OUTPUT_ROOT")); value != "" {
 		cfg.ArchiveSandboxOutputRoot = value
 	}
+	if value := strings.TrimSpace(os.Getenv("BINARYSCAN_ARCHIVE_SANDBOX_RUN_ROOT")); value != "" {
+		cfg.ArchiveSandboxRunRoot = value
+	}
 	if value := strings.TrimSpace(os.Getenv("BINARYSCAN_ARCHIVE_TIMEOUT")); value != "" {
 		parsed, err := time.ParseDuration(value)
 		if err != nil {
@@ -994,6 +1138,34 @@ func applyEnvironment(cfg *Config) error {
 	}
 	if value := strings.TrimSpace(os.Getenv("BINARYSCAN_GHIDRA_JAVA_VERSION_LINE")); value != "" {
 		cfg.GhidraJavaVersionLine = value
+	}
+	if value := strings.TrimSpace(os.Getenv("BINARYSCAN_C_CHECKER_URL")); value != "" {
+		cfg.CCheckerURL = value
+	}
+	if value := strings.TrimSpace(os.Getenv("BINARYSCAN_C_CHECKER_VERSION")); value != "" {
+		cfg.CCheckerVersion = value
+	}
+	if value := strings.TrimSpace(os.Getenv("BINARYSCAN_C_ANALYSIS_TIMEOUT")); value != "" {
+		parsed, err := time.ParseDuration(value)
+		if err != nil {
+			cfg.CAnalysisMaxDuration = -1
+		} else {
+			cfg.CAnalysisMaxDuration = parsed
+		}
+	}
+	if value := strings.TrimSpace(os.Getenv("BINARYSCAN_JAVA_CHECKER_URL")); value != "" {
+		cfg.JavaCheckerURL = value
+	}
+	if value := strings.TrimSpace(os.Getenv("BINARYSCAN_JAVA_CHECKER_VERSION")); value != "" {
+		cfg.JavaCheckerVersion = value
+	}
+	if value := strings.TrimSpace(os.Getenv("BINARYSCAN_JAVA_ANALYSIS_TIMEOUT")); value != "" {
+		parsed, err := time.ParseDuration(value)
+		if err != nil {
+			cfg.JavaAnalysisMaxDuration = -1
+		} else {
+			cfg.JavaAnalysisMaxDuration = parsed
+		}
 	}
 	if value := strings.TrimSpace(os.Getenv("BINARYSCAN_GHIDRA_MAX_DURATION")); value != "" {
 		parsed, err := time.ParseDuration(value)
@@ -1067,6 +1239,26 @@ func applyEnvironment(cfg *Config) error {
 	)
 	cfg.GhidraMaxFunctions = intOrFallback(
 		"BINARYSCAN_GHIDRA_MAX_FUNCTIONS", cfg.GhidraMaxFunctions,
+	)
+	cfg.CAnalysisMaxResponseBytes = int64OrFallback(
+		"BINARYSCAN_C_ANALYSIS_MAX_RESPONSE_BYTES", cfg.CAnalysisMaxResponseBytes,
+	)
+	cfg.CAnalysisMaxFindings = intOrFallback(
+		"BINARYSCAN_C_ANALYSIS_MAX_FINDINGS", cfg.CAnalysisMaxFindings,
+	)
+	cfg.CAnalysisMaxDiagnostics = intOrFallback(
+		"BINARYSCAN_C_ANALYSIS_MAX_DIAGNOSTICS", cfg.CAnalysisMaxDiagnostics,
+	)
+	cfg.JavaAnalysisMaxResponseBytes = int64OrFallback(
+		"BINARYSCAN_JAVA_ANALYSIS_MAX_RESPONSE_BYTES",
+		cfg.JavaAnalysisMaxResponseBytes,
+	)
+	cfg.JavaAnalysisMaxFindings = intOrFallback(
+		"BINARYSCAN_JAVA_ANALYSIS_MAX_FINDINGS", cfg.JavaAnalysisMaxFindings,
+	)
+	cfg.JavaAnalysisMaxDiagnostics = intOrFallback(
+		"BINARYSCAN_JAVA_ANALYSIS_MAX_DIAGNOSTICS",
+		cfg.JavaAnalysisMaxDiagnostics,
 	)
 	cfg.QueueHeavySlots = intOrFallback(
 		"BINARYSCAN_QUEUE_HEAVY_SLOTS",

@@ -109,13 +109,18 @@ FOR UPDATE`, record.UserID, record.IdempotencyKey).Scan(
 	var uploadStatus string
 	var blobID sql.NullInt64
 	var blobState sql.NullString
+	var inputCategory sql.NullString
+	var validationStatus sql.NullString
 	err = transaction.QueryRowContext(ctx, `
-SELECT upload.created_by, upload.status, upload.blob_id, stored_blob.state
+SELECT upload.created_by, upload.status, upload.blob_id, stored_blob.state,
+       intake.input_category, intake.validation_status
 FROM uploads upload
 LEFT JOIN blobs stored_blob ON stored_blob.id = upload.blob_id
+LEFT JOIN upload_intake_profiles intake ON intake.upload_id = upload.id
 WHERE upload.id = ?
 FOR UPDATE`, record.UploadID).Scan(
 		&uploadOwner, &uploadStatus, &blobID, &blobState,
+		&inputCategory, &validationStatus,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return View{}, false, ErrNotFound
@@ -129,13 +134,17 @@ FOR UPDATE`, record.UploadID).Scan(
 	if uploadStatus != "completed" {
 		return View{}, false, ErrUploadNotCompleted
 	}
-
 	existing, err := queryTaskByUpload(ctx, transaction, record.UploadID)
 	if err == nil {
 		return existing, false, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return View{}, false, fmt.Errorf("find existing task for upload: %w", err)
+	}
+	if !inputCategory.Valid || !validationStatus.Valid ||
+		validationStatus.String != "valid" ||
+		(inputCategory.String != "binary" && inputCategory.String != "container") {
+		return View{}, false, ErrUploadNotEligible
 	}
 	if !blobID.Valid || blobID.Int64 <= 0 || !blobState.Valid || blobState.String != "available" {
 		return View{}, false, ErrConflict

@@ -5,10 +5,12 @@ import {
   CodeXml,
   Download,
   FileArchive,
+  FileCode2,
   FileJson2,
   Inbox,
   LoaderCircle,
   RefreshCw,
+  ScanSearch,
   ShieldCheck,
 } from 'lucide-vue-next'
 import { computed, type Component } from 'vue'
@@ -60,6 +62,22 @@ const paneDefinitions: Record<TaskResultTab, PaneDefinition> = {
     emptyTitle: '暂无反编译结果',
     unavailableTitle: '反编译结果未接入',
     errorTitle: '反编译结果读取失败',
+  },
+  'c-analysis': {
+    title: 'C 源码检测',
+    icon: ScanSearch,
+    loadingTitle: '正在读取 C 源码检测',
+    emptyTitle: '暂无 C 源码检测结果',
+    unavailableTitle: 'C 源码检测未接入',
+    errorTitle: 'C 源码检测读取失败',
+  },
+  'java-analysis': {
+    title: 'Java 源码检测',
+    icon: FileCode2,
+    loadingTitle: '正在读取 Java 源码检测',
+    emptyTitle: '暂无 Java 源码检测结果',
+    unavailableTitle: 'Java 源码检测未接入',
+    errorTitle: 'Java 源码检测读取失败',
   },
   vulnerabilities: {
     title: '容器漏洞',

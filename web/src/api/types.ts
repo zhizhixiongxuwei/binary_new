@@ -304,6 +304,303 @@ export interface DecompileSourceChunk {
   size_bytes: number
 }
 
+export type DecompileProjectLayoutVersion = 'project-v1' | 'legacy-v1'
+
+export type DecompileProjectStatus =
+  | 'complete'
+  | 'partial'
+  | 'bytecode_only'
+
+export type DecompileProjectSourceKind =
+  | 'ghidra-pseudoc'
+  | 'java'
+  | 'kotlin'
+  | 'python'
+  | 'bytecode'
+
+export interface DecompileProject {
+  id: string
+  task_id: string
+  job_id?: string
+  file_node_id: string
+  target_path: string
+  layout_version: DecompileProjectLayoutVersion
+  source_kind: DecompileProjectSourceKind
+  language: string
+  engine_name: string
+  engine_version: string
+  status: DecompileProjectStatus
+  source_file_count: number
+  symbol_count: number
+  source_size_bytes: number
+  canonical_filename?: string
+  manifest_available: boolean
+  created_at: string
+  completed_at?: string
+}
+
+export interface DecompileProjectListQuery {
+  cursor?: string
+  page_size?: number
+}
+
+export type DecompileProjectPage = CursorPage<DecompileProject>
+
+export interface DecompileProjectDeletionCounts {
+  c_analysis_runs: number
+  c_analysis_findings: number
+  java_analysis_runs: number
+  java_analysis_findings: number
+  reports: number
+  report_files: number
+  artifacts: number
+  decompile_results: number
+  source_files: number
+}
+
+export interface DecompileProjectDeletionPreview {
+  project_id: string
+  counts: DecompileProjectDeletionCounts
+  typed_suffix: string
+  confirmation_token: string
+  expires_at: string
+}
+
+export interface ConfirmDecompileProjectDeletionInput {
+  confirmation_token: string
+  cascade: true
+  typed_suffix: string
+}
+
+export type DecompileProjectDeletionStatus =
+  | 'pending'
+  | 'cancelling'
+  | 'deleting'
+  | 'complete'
+  | 'failed'
+
+export interface DecompileProjectDeletionOperation {
+  id: string
+  project_id: string
+  status: DecompileProjectDeletionStatus
+  counts: DecompileProjectDeletionCounts
+  created_at: string
+  completed_at: string | null
+  error_code: string | null
+  error_message: string | null
+}
+
+export type CAnalysisRunStatus =
+  | 'queued'
+  | 'running'
+  | 'succeeded'
+  | 'partial'
+  | 'failed'
+  | 'cancel_requested'
+  | 'cancelled'
+
+export type CAnalysisSeverity = 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'
+
+export type CAnalysisSeverityCounts = Readonly<
+  Record<CAnalysisSeverity, number>
+>
+
+export interface CAnalysisProjectSummary {
+  id: string
+  target_path: string
+  status: 'complete' | 'partial'
+  engine_name: string
+  engine_version: string
+}
+
+export interface CAnalysisCoverage {
+  total_functions: number
+  parsed_functions: number
+  failed_functions: number
+}
+
+export interface CAnalysisRun {
+  id: string
+  task_id: string
+  source_project_id: string
+  source_project: CAnalysisProjectSummary
+  job_id: string
+  status: CAnalysisRunStatus
+  analyzer_name: string
+  analyzer_version: string
+  ruleset_version?: string
+  source_sha256: string
+  source_size_bytes: number
+  finding_count: number
+  diagnostic_count: number
+  coverage: CAnalysisCoverage
+  severity_counts: CAnalysisSeverityCounts
+  findings_truncated: boolean
+  diagnostics_truncated: boolean
+  error_code: string | null
+  error_message: string | null
+  started_at: string | null
+  completed_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface CAnalysisRunListQuery {
+  project_id?: string
+  cursor?: string
+  page_size?: number
+}
+
+export type CAnalysisRunPage = CursorPage<CAnalysisRun>
+
+export interface CAnalysisFunctionIdentity {
+  result_id: string
+  address: string
+  name: string
+}
+
+export interface CAnalysisLocation {
+  start_line: number
+  start_column: number
+  end_line: number
+  end_column: number
+}
+
+export interface CAnalysisFinding {
+  id: string
+  cwe: string
+  rule_id: string
+  severity: CAnalysisSeverity
+  function: CAnalysisFunctionIdentity
+  location: CAnalysisLocation
+  message: string
+  snippet?: string
+  created_at?: string
+}
+
+export interface CAnalysisFindingListQuery {
+  cursor?: string
+  page_size?: number
+  cwe?: string
+  severity?: CAnalysisSeverity
+  function?: string
+}
+
+export type CAnalysisFindingPage = CursorPage<CAnalysisFinding>
+
+export type JavaAnalysisRunStatus =
+  | 'queued'
+  | 'running'
+  | 'succeeded'
+  | 'partial'
+  | 'failed'
+  | 'cancel_requested'
+  | 'cancelled'
+
+export type JavaAnalysisSeverity = 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'
+
+export type JavaAnalysisSeverityCounts = Readonly<
+  Record<JavaAnalysisSeverity, number>
+>
+
+export interface JavaAnalysisProjectSummary {
+  id: string
+  target_path: string
+  status: 'complete' | 'partial'
+  engine_name: string
+  engine_version: string
+}
+
+export interface JavaAnalysisCoverage {
+  total_files: number
+  analyzed_files: number
+  parsed_files: number
+  recovered_files: number
+  failed_files: number
+}
+
+export interface JavaAnalysisRun {
+  id: string
+  task_id: string
+  source_project_id: string
+  source_project: JavaAnalysisProjectSummary
+  job_id: string
+  status: JavaAnalysisRunStatus
+  analyzer_name: string
+  analyzer_version: string
+  ruleset_version: string
+  source_manifest_sha256: string
+  input_sha256: string
+  bundle_sha256: string
+  source_size_bytes: number
+  source_file_count: number
+  finding_count: number
+  diagnostic_count: number
+  coverage: JavaAnalysisCoverage
+  severity_counts: JavaAnalysisSeverityCounts
+  findings_truncated: boolean
+  diagnostics_truncated: boolean
+  error_code: string | null
+  error_message: string | null
+  started_at: string | null
+  completed_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface JavaAnalysisRunListQuery {
+  project_id?: string
+  cursor?: string
+  page_size?: number
+}
+
+export type JavaAnalysisRunPage = CursorPage<JavaAnalysisRun>
+
+export interface JavaAnalysisFileIdentity {
+  result_id: string
+  logical_path: string
+  binary_name: string
+}
+
+export interface JavaAnalysisCallableIdentity {
+  kind: string
+  type_name: string
+  name: string
+  signature: string
+}
+
+export interface JavaAnalysisLocation {
+  start_line: number
+  start_column: number
+  end_line: number
+  end_column: number
+}
+
+export interface JavaAnalysisFinding {
+  id: string
+  cwe: string
+  rule_id: string
+  severity: JavaAnalysisSeverity
+  file: JavaAnalysisFileIdentity
+  callable: JavaAnalysisCallableIdentity
+  location: JavaAnalysisLocation
+  message: string
+  snippet?: string
+  snippet_start_line?: number
+  created_at?: string
+}
+
+export interface JavaAnalysisFindingListQuery {
+  cursor?: string
+  page_size?: number
+  cwe?: string
+  severity?: JavaAnalysisSeverity
+  file?: string
+  callable?: string
+}
+
+export type JavaAnalysisFindingPage = CursorPage<JavaAnalysisFinding>
+
 export type VulnerabilitySeverity =
   | 'UNKNOWN'
   | 'LOW'
@@ -626,13 +923,34 @@ export interface AuditLogPage {
   next_cursor?: string
 }
 
+export type InputCategory = 'binary' | 'archive' | 'container'
+
+export type UploadValidationStatus =
+  | 'pending'
+  | 'valid'
+  | 'mismatch'
+  | 'unsupported'
+
+export interface UploadValidationError {
+  code: string
+  message: string
+}
+
 export interface UploadSession {
   id: string
   part_size: number
+  sha256?: string
   size_bytes?: number
   status: 'created' | 'uploading' | 'assembling' | 'completed' | 'failed' | 'expired' | 'cancelled'
   uploaded_parts: number[]
   expires_at: string
+  input_category?: InputCategory
+  validation_status?: UploadValidationStatus
+  detected_category?: InputCategory
+  detected_format?: string
+  validation_error?: UploadValidationError
+  archive_import_id?: string
+  task_id?: string
 }
 
 export interface CompletedUpload extends UploadSession {
@@ -658,10 +976,96 @@ export interface CreateUploadInput {
   filename: string
   size: number
   content_type: string
+  input_category: InputCategory
 }
 
 export interface CreatedTask {
   id: string
+}
+
+export type ArchiveImportStatus =
+  | 'queued'
+  | 'running'
+  | 'ready'
+  | 'failed'
+  | 'deleting'
+  | 'deleted'
+
+export interface ArchiveImport {
+  id: string
+  upload_id: string
+  filename: string
+  status: ArchiveImportStatus
+  scanned_entries: number
+  total_entries: number
+  eligible_entries: number
+  skipped_entries: number
+  created_tasks: number
+  error_code?: string
+  error_message?: string
+  created_at: string
+  updated_at: string
+}
+
+export interface ArchiveImportListQuery {
+  cursor?: string
+  page_size?: number
+}
+
+export interface ArchiveImportPage {
+  items: ArchiveImport[]
+  next_cursor?: string
+}
+
+export type ArchiveImportEntryStatus =
+  | 'eligible'
+  | 'skipped'
+  | 'created'
+  | 'failed'
+
+export interface ArchiveImportEntry {
+  id: string
+  path: string
+  size_bytes: number
+  sha256: string | null
+  detected_format: string | null
+  detected_category: Exclude<InputCategory, 'archive'> | null
+  status: ArchiveImportEntryStatus
+  skip_reason?: string
+  task_id?: string
+}
+
+export type ArchiveImportEntryFilter =
+  | 'all'
+  | ArchiveImportEntryStatus
+
+export interface ArchiveImportEntryListQuery {
+  filter?: ArchiveImportEntryFilter
+  cursor?: string
+  page_size?: number
+}
+
+export interface ArchiveImportEntryPage {
+  items: ArchiveImportEntry[]
+  next_cursor?: string
+}
+
+export interface CreateArchiveTaskBatchInput {
+  entry_ids: string[]
+}
+
+export type ArchiveTaskBatchOutcome = 'created' | 'existing' | 'failed'
+
+export interface ArchiveTaskBatchResultItem {
+  entry_id: string
+  outcome: ArchiveTaskBatchOutcome
+  task_id?: string
+  error_code?: string
+  message?: string
+}
+
+export interface ArchiveTaskBatchResult {
+  items: readonly ArchiveTaskBatchResultItem[]
 }
 
 export interface ApiErrorBody {

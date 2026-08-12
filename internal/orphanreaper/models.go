@@ -23,7 +23,8 @@ var (
 	canonicalObjectID = regexp.MustCompile(
 		`^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`,
 	)
-	ErrUnsafeInventory = errors.New("unsafe orphan inventory")
+	canonicalStagingNonce = regexp.MustCompile(`^[0-9a-f]{24}$`)
+	ErrUnsafeInventory    = errors.New("unsafe orphan inventory")
 )
 
 type BlobCandidate struct {
@@ -40,12 +41,33 @@ type UploadCandidate struct {
 	fileInfo   fs.FileInfo
 }
 
+type SourceProjectCandidate struct {
+	ID         string
+	StorageKey string
+	ModifiedAt time.Time
+	fileInfo   fs.FileInfo
+}
+
+type PendingSourceProject struct {
+	ID            string
+	TaskID        string
+	LayoutVersion string
+}
+
+type SourceProjectCleanupTarget struct {
+	ProjectID       string
+	TaskID          string
+	LayoutVersion   string
+	LegacyResultIDs []string
+}
+
 type StoredFileKind string
 
 const (
-	StoredFileReport    StoredFileKind = "report"
-	StoredFileArtifact  StoredFileKind = "artifact"
-	StoredFileDecompile StoredFileKind = "decompile"
+	StoredFileReport        StoredFileKind = "report"
+	StoredFileReportStaging StoredFileKind = "report-staging"
+	StoredFileArtifact      StoredFileKind = "artifact"
+	StoredFileDecompile     StoredFileKind = "decompile"
 )
 
 var storedFileNamespaces = []struct {
@@ -86,29 +108,50 @@ type Diagnostic struct {
 }
 
 type Report struct {
-	BlobFilesScanned        int
-	UploadDirsScanned       int
-	StoredFilesScanned      int
-	BlobReferencesScanned   int
-	ReferencedBlobs         int
-	ReferencedUploads       int
-	ReferencedStoredFiles   int
-	DriftedBlobReferences   int
-	CorrectedBlobReferences int
-	OrphanBlobs             int
-	OrphanUploads           int
-	OrphanStoredFiles       int
-	RemovedBlobs            int
-	RemovedUploads          int
-	RemovedStoredFiles      int
-	RecheckProtected        int
-	DeferredYoungBlobs      int
-	DeferredYoungUpload     int
-	DeferredYoungStored     int
-	Skipped                 int
-	Failures                int
-	DryRun                  bool
-	Diagnostics             []Diagnostic
+	BlobFilesScanned           int
+	UploadDirsScanned          int
+	SourceProjectDirsScanned   int
+	StoredFilesScanned         int
+	BlobReferencesScanned      int
+	ReferencedBlobs            int
+	ReferencedUploads          int
+	ReferencedSourceProjects   int
+	ReferencedStoredFiles      int
+	DriftedBlobReferences      int
+	CorrectedBlobReferences    int
+	OrphanBlobs                int
+	OrphanUploads              int
+	OrphanSourceProjects       int
+	OrphanStoredFiles          int
+	RemovedBlobs               int
+	RemovedUploads             int
+	RemovedSourceProjects      int
+	RemovedStoredFiles         int
+	PendingSourceProjects      int
+	CompletedSourceProjects    int
+	RecheckProtected           int
+	DeferredYoungBlobs         int
+	DeferredYoungUpload        int
+	DeferredYoungSourceProject int
+	DeferredYoungStored        int
+	Skipped                    int
+	Failures                   int
+	DryRun                     bool
+	Diagnostics                []Diagnostic
+}
+
+func validSourceProjectCandidate(candidate SourceProjectCandidate) bool {
+	return canonicalObjectID.MatchString(candidate.ID) &&
+		candidate.StorageKey == path.Join("source-projects", candidate.ID)
+}
+
+func validPendingSourceProject(candidate PendingSourceProject) bool {
+	if !canonicalObjectID.MatchString(candidate.ID) ||
+		!canonicalObjectID.MatchString(candidate.TaskID) {
+		return false
+	}
+	return candidate.LayoutVersion == "project-v1" ||
+		candidate.LayoutVersion == "legacy-v1"
 }
 
 func (r *Report) addDiagnostic(kind string, name string, err error) {
@@ -127,6 +170,10 @@ func validStoredFileCandidate(candidate StoredFileCandidate) bool {
 		path.Clean(candidate.StorageKey) != candidate.StorageKey {
 		return false
 	}
+	if candidate.Kind == StoredFileReportStaging {
+		_, _, valid := reportStagingIdentity(candidate.StorageKey)
+		return valid
+	}
 	for _, namespace := range storedFileNamespaces {
 		if candidate.Kind == namespace.Kind {
 			return strings.HasPrefix(
@@ -136,4 +183,28 @@ func validStoredFileCandidate(candidate StoredFileCandidate) bool {
 		}
 	}
 	return false
+}
+
+func reportStagingIdentity(storageKey string) (string, string, bool) {
+	components := strings.Split(storageKey, "/")
+	if len(components) != 3 || components[0] != "reports" ||
+		!canonicalObjectID.MatchString(components[1]) {
+		return "", "", false
+	}
+	name := components[2]
+	if !strings.HasPrefix(name, ".") || !strings.HasSuffix(name, ".staging") {
+		return "", "", false
+	}
+	body := strings.TrimSuffix(strings.TrimPrefix(name, "."), ".staging")
+	separator := strings.LastIndexByte(body, '.')
+	if separator < 0 {
+		return "", "", false
+	}
+	reportID := body[:separator]
+	nonce := body[separator+1:]
+	if !canonicalObjectID.MatchString(reportID) ||
+		!canonicalStagingNonce.MatchString(nonce) {
+		return "", "", false
+	}
+	return components[1], reportID, true
 }

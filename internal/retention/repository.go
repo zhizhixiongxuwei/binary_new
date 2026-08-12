@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"binaryscan/internal/audit"
+	"binaryscan/internal/blobfence"
 	"binaryscan/internal/taskevent"
 )
 
@@ -50,6 +51,80 @@ const (
           FROM upload_parts p
           WHERE p.upload_id = u.id
       )
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM upload_intake_profiles intake
+      JOIN blobs candidate_blob ON candidate_blob.id = u.blob_id
+      WHERE intake.upload_id = u.id
+        AND u.status = 'completed'
+        AND intake.source_kind = 'direct'
+        AND intake.validation_status = 'valid'
+        AND intake.input_category IN ('binary', 'container')
+        AND intake.detected_category = intake.input_category
+        AND intake.detected_format IS NOT NULL
+        AND candidate_blob.state = 'available'
+        AND NOT EXISTS (
+            SELECT 1
+            FROM tasks claimed_task
+            WHERE claimed_task.upload_id = u.id
+        )
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM upload_intake_profiles archive_intake
+      JOIN blobs archive_blob ON archive_blob.id = u.blob_id
+      WHERE archive_intake.upload_id = u.id
+        AND u.status = 'completed'
+        AND archive_intake.source_kind = 'direct'
+        AND archive_intake.validation_status = 'valid'
+        AND archive_intake.input_category = 'archive'
+        AND archive_intake.detected_category = 'archive'
+        AND archive_intake.detected_format IS NOT NULL
+        AND archive_blob.state = 'available'
+        AND (
+            archive_intake.archive_import_id IS NULL
+            OR EXISTS (
+                SELECT 1
+                FROM archive_imports active_import
+                WHERE active_import.id = archive_intake.archive_import_id
+                  AND active_import.upload_id = u.id
+                  AND active_import.status IN ('queued', 'running')
+            )
+        )
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM archive_import_entries pending_entry
+      JOIN upload_intake_profiles derived_intake
+        ON derived_intake.upload_id = pending_entry.derived_upload_id
+      WHERE pending_entry.derived_upload_id = u.id
+        AND u.status = 'completed'
+        AND derived_intake.source_kind = 'archive_entry'
+        AND pending_entry.status IN ('eligible', 'failed')
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM upload_intake_profiles derived_provenance
+      JOIN archive_imports parent_import
+        ON parent_import.upload_id = derived_provenance.source_parent_upload_id
+      JOIN uploads provenance_parent
+        ON provenance_parent.id = parent_import.upload_id
+      JOIN archive_import_entries pending_provenance
+        ON pending_provenance.archive_import_id = parent_import.id
+       AND pending_provenance.logical_path = derived_provenance.source_entry_path
+       AND pending_provenance.status IN ('eligible', 'failed')
+       AND pending_provenance.size_bytes = u.declared_size_bytes
+       AND pending_provenance.sha256 = u.actual_sha256
+       AND pending_provenance.detected_category = derived_provenance.input_category
+       AND pending_provenance.detected_format = derived_provenance.detected_format
+       AND pending_provenance.blob_id = u.blob_id
+      WHERE derived_provenance.upload_id = u.id
+        AND u.status = 'completed'
+        AND derived_provenance.source_kind = 'archive_entry'
+        AND derived_provenance.validation_status = 'valid'
+        AND derived_provenance.source_archive_name = provenance_parent.display_name
+        AND pending_provenance.derived_upload_id IS NULL
   )`
 	pendingUploadPartCleanupPredicate = `
   AND u.parts_cleaned_at IS NULL
@@ -160,7 +235,8 @@ WHERE id = ?
 		ObjectID:   taskID,
 		Outcome:    audit.OutcomeSuccess,
 		Metadata: map[string]any{
-			"reason": "sample_retention_expired",
+			"reason":                      "sample_retention_expired",
+			"decompile_sources_preserved": true,
 		},
 	}); err != nil {
 		return false, fmt.Errorf("append task sample retention audit: %w", err)
@@ -576,6 +652,32 @@ func (r *MySQLRepository) FinalizeDeletingBlob(
 	if deleteFile == nil {
 		return false, errors.New("blob delete callback is required")
 	}
+	var sha256 string
+	if err := r.db.QueryRowContext(ctx, `
+SELECT sha256
+FROM blobs
+WHERE id = ?`, blobID).Scan(&sha256); errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	} else if err != nil {
+		return false, fmt.Errorf("read deleting blob content address: %w", err)
+	}
+	var changed bool
+	err := blobfence.With(ctx, r.db, sha256, func() error {
+		var finalizeErr error
+		changed, finalizeErr = r.finalizeDeletingBlob(ctx, blobID, deleteFile)
+		return finalizeErr
+	})
+	if err != nil {
+		return false, fmt.Errorf("fence deleting blob: %w", err)
+	}
+	return changed, nil
+}
+
+func (r *MySQLRepository) finalizeDeletingBlob(
+	ctx context.Context,
+	blobID uint64,
+	deleteFile func(Blob) error,
+) (bool, error) {
 	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return false, fmt.Errorf("begin blob deletion transaction: %w", err)

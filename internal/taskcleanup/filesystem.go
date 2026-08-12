@@ -332,6 +332,11 @@ func cleanupScopeKey(scope Scope) (string, error) {
 			return "", errors.New("task decompile scope is invalid")
 		}
 		return path.Join("decompile", scope.RecordID), nil
+	case FileSourceProject:
+		if !canonicalID.MatchString(scope.RecordID) {
+			return "", errors.New("source project scope is invalid")
+		}
+		return path.Join("source-projects", scope.RecordID), nil
 	default:
 		return "", errors.New("task output scope kind is invalid")
 	}

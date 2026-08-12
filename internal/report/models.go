@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-const SchemaVersion = "1.1.0"
+const SchemaVersion = "1.3.0"
 
 type Format string
 
@@ -21,6 +21,8 @@ type Report struct {
 	Format          Format     `json:"format"`
 	SchemaVersion   string     `json:"schema_version"`
 	Status          string     `json:"status"`
+	SnapshotState   string     `json:"snapshot_state"`
+	Generation      uint64     `json:"generation"`
 	SHA256          *string    `json:"sha256"`
 	SizeBytes       *uint64    `json:"size_bytes"`
 	ErrorCode       *string    `json:"error_code"`
@@ -47,16 +49,41 @@ type Claim struct {
 }
 
 type SnapshotRequest struct {
-	TaskID      string
-	ReportID    string
-	GeneratedAt time.Time
+	TaskID           string
+	ReportID         string
+	GeneratedAt      time.Time
+	Dependencies     *[]CAnalysisDependency
+	JavaDependencies *[]JavaAnalysisDependency
+}
+
+// CAnalysisDependency binds a report snapshot to the immutable C-analysis
+// result selected for one source project. It deliberately contains only
+// provenance, never source text or finding evidence.
+type CAnalysisDependency struct {
+	RunID        string
+	ProjectID    string
+	CompletedAt  time.Time
+	SourceSHA256 string
+}
+
+// JavaAnalysisDependency binds a report snapshot to the immutable Java
+// analysis selected for one source project. Source content and finding text are
+// intentionally excluded from this persistence boundary.
+type JavaAnalysisDependency struct {
+	RunID                string
+	ProjectID            string
+	CompletedAt          time.Time
+	SourceManifestSHA256 string
+	InputSHA256          string
 }
 
 type ArtifactMetadata struct {
-	StorageKey  string
-	SHA256      string
-	SizeBytes   uint64
-	CompletedAt time.Time
+	StorageKey       string
+	SHA256           string
+	SizeBytes        uint64
+	CompletedAt      time.Time
+	Dependencies     []CAnalysisDependency
+	JavaDependencies []JavaAnalysisDependency
 }
 
 type DownloadDescriptor struct {

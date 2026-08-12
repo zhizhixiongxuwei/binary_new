@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
@@ -33,7 +34,14 @@ type Processor struct {
 	taskWorkRoot   string
 	newExtractor   extractorFactory
 	newWorkspace   workspaceFactory
+	reserveArchive ArchiveStorageReserve
 }
+
+type ArchiveStorageReserve func(
+	context.Context,
+	int64,
+	int64,
+) (func(), error)
 
 type extractionEngine interface {
 	Supports(string) bool
@@ -112,12 +120,16 @@ func NewProcessor(
 // no-network archive service while preserving the processor's normal limits.
 func (p *Processor) EnableArchiveSandbox(
 	adapter extract.ExternalArchiveAdapter,
+	reserve ArchiveStorageReserve,
 ) error {
 	if p == nil {
 		return errors.New("scan processor is nil")
 	}
 	if adapter == nil {
 		return errors.New("archive sandbox adapter is required")
+	}
+	if reserve == nil {
+		return errors.New("archive sandbox storage reservation is required")
 	}
 	p.newExtractor = func(
 		detector Detector,
@@ -133,6 +145,7 @@ func (p *Processor) EnableArchiveSandbox(
 		}
 		return engine
 	}
+	p.reserveArchive = reserve
 	return nil
 }
 
@@ -215,6 +228,32 @@ func (p *Processor) Process(
 	if err := p.reportProgress(ctx, lease, "EXTRACTING"); err != nil {
 		return queue.FinishInput{}, err
 	}
+	releaseArchiveStorage := func() {}
+	if detected.Format == "7z" || detected.Format == "cab" {
+		if p.reserveArchive == nil {
+			return queue.FinishInput{}, errors.New(
+				"archive sandbox storage reservation is unavailable",
+			)
+		}
+		expandedBytes, capacityErr := archiveExpandedCapacity(
+			sample.SizeBytes, sample.Limits,
+		)
+		if capacityErr != nil {
+			return queue.FinishInput{}, capacityErr
+		}
+		releaseArchiveStorage, err = p.reserveArchive(ctx, sample.SizeBytes, expandedBytes)
+		if err != nil {
+			return queue.FinishInput{}, fmt.Errorf(
+				"reserve archive sandbox storage: %w", err,
+			)
+		}
+		if releaseArchiveStorage == nil {
+			return queue.FinishInput{}, errors.New(
+				"archive sandbox storage reservation returned no release function",
+			)
+		}
+	}
+	defer releaseArchiveStorage()
 	if sample.Limits.MaxNodes == 0 {
 		if err := p.reportProgress(ctx, lease, "INDEXING"); err != nil {
 			return queue.FinishInput{}, err
@@ -296,6 +335,23 @@ func (p *Processor) Process(
 	return p.finishPublishedTree(
 		ctx, lease, sources, sample.Limits, result.Partial,
 	)
+}
+
+func archiveExpandedCapacity(sourceBytes int64, limits extract.Limits) (int64, error) {
+	if sourceBytes < 0 || limits.MaxExpandedBytes < 0 || limits.MaxRatio < 1 {
+		return 0, errors.New("archive sandbox capacity inputs are invalid")
+	}
+	expanded := limits.MaxExpandedBytes
+	if sourceBytes == 0 {
+		return 0, nil
+	}
+	if sourceBytes <= math.MaxInt64/limits.MaxRatio {
+		ratioBound := sourceBytes * limits.MaxRatio
+		if ratioBound < expanded {
+			expanded = ratioBound
+		}
+	}
+	return expanded, nil
 }
 
 func (p *Processor) finishPublishedTree(

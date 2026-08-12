@@ -2,7 +2,9 @@
 import {
   CodeXml,
   FileArchive,
+  FileCode2,
   FileJson2,
+  ScanSearch,
   ShieldCheck,
 } from 'lucide-vue-next'
 import {
@@ -70,6 +72,16 @@ const slots = defineSlots<{
     state: TaskResultState
     mode: TaskResultMode
   }) => unknown
+  'c-analysis'?: (props: {
+    taskId: string
+    state: TaskResultState
+    mode: TaskResultMode
+  }) => unknown
+  'java-analysis'?: (props: {
+    taskId: string
+    state: TaskResultState
+    mode: TaskResultMode
+  }) => unknown
   reports?: (props: {
     taskId: string
     state: TaskResultState
@@ -86,6 +98,8 @@ interface TabDefinition {
 const tabDefinitions: readonly TabDefinition[] = [
   { id: 'files', label: '文件结构', icon: FileArchive },
   { id: 'decompile', label: '反编译', icon: CodeXml },
+  { id: 'c-analysis', label: 'C 源码检测', icon: ScanSearch },
+  { id: 'java-analysis', label: 'Java 源码检测', icon: FileCode2 },
   { id: 'vulnerabilities', label: '容器漏洞', icon: ShieldCheck },
   { id: 'reports', label: '报告', icon: FileJson2 },
 ]
@@ -111,6 +125,16 @@ const unavailableStates: Readonly<Record<TaskResultTab, TaskResultState>> = {
     status: 'unavailable',
     title: '反编译结果未接入',
     description: '当前任务没有可读取的反编译结果。',
+  },
+  'c-analysis': {
+    status: 'unavailable',
+    title: 'C 源码检测未接入',
+    description: '当前任务没有可读取的 Ghidra 类 C 源码检测结果。',
+  },
+  'java-analysis': {
+    status: 'unavailable',
+    title: 'Java 源码检测未接入',
+    description: '当前任务没有可读取的 Java 源码检测结果。',
   },
   vulnerabilities: {
     status: 'unavailable',
@@ -148,6 +172,8 @@ function resolveState(tab: TaskResultTab): TaskResultState {
 const paneStates = computed<Readonly<Record<TaskResultTab, TaskResultState>>>(() => ({
   files: resolveState('files'),
   decompile: resolveState('decompile'),
+  'c-analysis': resolveState('c-analysis'),
+  'java-analysis': resolveState('java-analysis'),
   vulnerabilities: resolveState('vulnerabilities'),
   reports: resolveState('reports'),
 }))
@@ -190,6 +216,12 @@ const actions = computed<Readonly<Record<TaskResultTab, readonly TaskResultPaneA
     action('download-decompile', '下载反编译结果', 'download', {
       requiresReady: true,
     }),
+  ],
+  'c-analysis': [
+    action('refresh-c-analysis', '刷新 C 源码检测结果', 'refresh'),
+  ],
+  'java-analysis': [
+    action('refresh-java-analysis', '刷新 Java 源码检测结果', 'refresh'),
   ],
   vulnerabilities: [
     action('refresh-vulnerabilities', '刷新容器漏洞结果', 'refresh'),
@@ -328,6 +360,24 @@ watch(
       </TaskResultPane>
 
       <TaskResultPane
+        v-else-if="activeTab === 'java-analysis'"
+        kind="java-analysis"
+        :state="paneStates['java-analysis']"
+        :actions="actions['java-analysis']"
+        :preview="mode === 'preview'"
+        :content-owns-state="contentOwnsState('java-analysis')"
+        @command="emit('command', $event)"
+      >
+        <slot
+          v-if="slots['java-analysis']"
+          name="java-analysis"
+          :task-id="taskId"
+          :state="paneStates['java-analysis']"
+          :mode="mode"
+        />
+      </TaskResultPane>
+
+      <TaskResultPane
         v-else-if="activeTab === 'decompile'"
         kind="decompile"
         :state="paneStates.decompile"
@@ -341,6 +391,24 @@ watch(
           name="decompile"
           :task-id="taskId"
           :state="paneStates.decompile"
+          :mode="mode"
+        />
+      </TaskResultPane>
+
+      <TaskResultPane
+        v-else-if="activeTab === 'c-analysis'"
+        kind="c-analysis"
+        :state="paneStates['c-analysis']"
+        :actions="actions['c-analysis']"
+        :preview="mode === 'preview'"
+        :content-owns-state="contentOwnsState('c-analysis')"
+        @command="emit('command', $event)"
+      >
+        <slot
+          v-if="slots['c-analysis']"
+          name="c-analysis"
+          :task-id="taskId"
+          :state="paneStates['c-analysis']"
           :mode="mode"
         />
       </TaskResultPane>

@@ -12,6 +12,7 @@ import (
 	"binaryscan/internal/orphanreaper"
 	"binaryscan/internal/retention"
 	"binaryscan/internal/taskcleanup"
+	"binaryscan/internal/upload"
 	"binaryscan/internal/workspace"
 )
 
@@ -47,9 +48,123 @@ type recovererStub struct {
 	onCall  func(int)
 }
 
+type cAnalysisRunDeletionRecovererStub struct {
+	mu      sync.Mutex
+	results []recoverResult
+	calls   int
+	limits  []int
+	events  *[]string
+	event   string
+}
+
 type recoverResult struct {
 	count int
 	err   error
+}
+
+type directTaskRecovererStub struct {
+	mu      sync.Mutex
+	results []directTaskRecoveryResult
+	calls   int
+	limits  []int
+	events  *[]string
+}
+
+type directTaskRecoveryResult struct {
+	report upload.DirectTaskRecoveryReport
+	err    error
+}
+
+type archiveAssociationRecovererStub struct {
+	mu      sync.Mutex
+	results []archiveAssociationRecoveryResult
+	calls   int
+	limits  []int
+	events  *[]string
+}
+
+type archiveAssociationRecoveryResult struct {
+	report upload.ArchiveImportRecoveryReport
+	err    error
+}
+
+func (s *archiveAssociationRecovererStub) RecoverArchiveImports(
+	_ context.Context,
+	limit int,
+) (upload.ArchiveImportRecoveryReport, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	s.limits = append(s.limits, limit)
+	if s.events != nil {
+		*s.events = append(*s.events, "archive-association")
+	}
+	result := archiveAssociationRecoveryResult{}
+	if len(s.results) > 0 {
+		result = s.results[0]
+		s.results = s.results[1:]
+	}
+	return result.report, result.err
+}
+
+func (s *archiveAssociationRecovererStub) snapshot() (int, []int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls, append([]int(nil), s.limits...)
+}
+
+func (s *directTaskRecovererStub) RecoverDirectTasks(
+	_ context.Context,
+	limit int,
+) (upload.DirectTaskRecoveryReport, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	s.limits = append(s.limits, limit)
+	if s.events != nil {
+		*s.events = append(*s.events, "direct-task")
+	}
+	result := directTaskRecoveryResult{}
+	if len(s.results) > 0 {
+		result = s.results[0]
+		s.results = s.results[1:]
+	}
+	return result.report, result.err
+}
+
+func (s *directTaskRecovererStub) snapshot() (int, []int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls, append([]int(nil), s.limits...)
+}
+
+func (s *cAnalysisRunDeletionRecovererStub) RecoverPending(
+	_ context.Context,
+	limit int,
+) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	s.limits = append(s.limits, limit)
+	if s.events != nil {
+		event := s.event
+		if event == "" {
+			event = "c-analysis-run-deletion"
+		}
+		*s.events = append(*s.events, event)
+	}
+	result := recoverResult{}
+	if len(s.results) > 0 {
+		result = s.results[0]
+		s.results = s.results[1:]
+	}
+	return result.count, result.err
+}
+
+func (s *cAnalysisRunDeletionRecovererStub) snapshot() (int, []int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls, append([]int(nil), s.limits...)
 }
 
 type workspaceSweeperStub struct {
@@ -301,8 +416,12 @@ func newTestRunner(
 	runner, err := NewRunner(RunnerConfig{
 		Interval: interval, PingTimeout: 50 * time.Millisecond,
 		Database: database, Queue: recoverer,
-		TaskDeletion: &taskDeletionSweeperStub{},
-		Retention:    &retentionSweeperStub{}, Workspace: sweeper,
+		CAnalysisRunDeletion:    &cAnalysisRunDeletionRecovererStub{},
+		JavaAnalysisRunDeletion: &cAnalysisRunDeletionRecovererStub{},
+		TaskDeletion:            &taskDeletionSweeperStub{},
+		DirectTaskRecovery:      &directTaskRecovererStub{},
+		ArchiveAssociation:      &archiveAssociationRecovererStub{},
+		Retention:               &retentionSweeperStub{}, Workspace: sweeper,
 		Logger: logger,
 	})
 	if err != nil {
@@ -336,6 +455,162 @@ func TestRunnerRecoversImmediatelyAndLogsCount(t *testing.T) {
 	}
 	if !handler.hasRecord(slog.LevelInfo, "expired jobs recovered", "recovered_jobs", 3) {
 		t.Fatal("structured recovery count log not found")
+	}
+}
+
+func TestRunnerRecoversPendingCAnalysisRunDeletions(t *testing.T) {
+	events := make([]string, 0, 2)
+	recoverer := &cAnalysisRunDeletionRecovererStub{
+		results: []recoverResult{{count: 2}},
+		events:  &events,
+	}
+	taskDeletion := &taskDeletionSweeperStub{events: &events}
+	handler := &recordHandler{}
+	runner, err := NewRunner(RunnerConfig{
+		Interval: time.Hour, PingTimeout: 50 * time.Millisecond,
+		Database:                &databaseStub{},
+		Queue:                   &recovererStub{},
+		CAnalysisRunDeletion:    recoverer,
+		JavaAnalysisRunDeletion: &cAnalysisRunDeletionRecovererStub{},
+		TaskDeletion:            taskDeletion,
+		DirectTaskRecovery:      &directTaskRecovererStub{},
+		ArchiveAssociation:      &archiveAssociationRecovererStub{},
+		Retention:               &retentionSweeperStub{},
+		Workspace:               &workspaceSweeperStub{},
+		Logger:                  slog.New(handler),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runner.recover(context.Background())
+
+	if strings.Join(events, ",") != "c-analysis-run-deletion,task-deletion" {
+		t.Fatalf("maintenance deletion recovery order = %v", events)
+	}
+	if calls, limits := recoverer.snapshot(); calls != 1 || len(limits) != 1 ||
+		limits[0] != cAnalysisRunDeletionBatchSize {
+		t.Fatalf("C-analysis deletion recovery calls=%d limits=%v", calls, limits)
+	}
+	if !handler.hasRecord(
+		slog.LevelInfo,
+		"pending C-analysis run deletions recovered",
+		"recovered_runs",
+		2,
+	) {
+		t.Fatal("C-analysis deletion recovery count log not found")
+	}
+}
+
+func TestRunnerRecoversArchiveImportsBeforeOtherDeletionWork(t *testing.T) {
+	events := make([]string, 0, 2)
+	archiveRecovery := &cAnalysisRunDeletionRecovererStub{
+		results: []recoverResult{{count: 4}},
+		events:  &events,
+		event:   "archive-import",
+	}
+	cRecovery := &cAnalysisRunDeletionRecovererStub{events: &events}
+	handler := &recordHandler{}
+	runner, err := NewRunner(RunnerConfig{
+		Interval: time.Hour, PingTimeout: 50 * time.Millisecond,
+		Database: &databaseStub{}, Queue: &recovererStub{},
+		ArchiveImport:           archiveRecovery,
+		CAnalysisRunDeletion:    cRecovery,
+		JavaAnalysisRunDeletion: &cAnalysisRunDeletionRecovererStub{},
+		TaskDeletion:            &taskDeletionSweeperStub{},
+		DirectTaskRecovery:      &directTaskRecovererStub{},
+		ArchiveAssociation:      &archiveAssociationRecovererStub{},
+		Retention:               &retentionSweeperStub{},
+		Workspace:               &workspaceSweeperStub{},
+		Logger:                  slog.New(handler),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runner.recover(context.Background())
+
+	if strings.Join(events, ",") != "archive-import,c-analysis-run-deletion" {
+		t.Fatalf("archive recovery order = %v", events)
+	}
+	if calls, limits := archiveRecovery.snapshot(); calls != 1 ||
+		len(limits) != 1 || limits[0] != recoveryBatchSize {
+		t.Fatalf("archive recovery calls=%d limits=%v", calls, limits)
+	}
+	if !handler.hasRecord(
+		slog.LevelInfo, "archive imports recovered", "recovered_archive_imports", 4,
+	) {
+		t.Fatal("archive import recovery count log not found")
+	}
+}
+
+func TestRunnerRecoversArchiveUploadAssociationBeforeSameCycleRetention(t *testing.T) {
+	events := make([]string, 0, 2)
+	association := &archiveAssociationRecovererStub{events: &events}
+	retentionSweep := &retentionSweeperStub{events: &events}
+	runner, err := NewRunner(RunnerConfig{
+		Interval: time.Hour, PingTimeout: 50 * time.Millisecond,
+		Database:                &databaseStub{},
+		Queue:                   &recovererStub{},
+		CAnalysisRunDeletion:    &cAnalysisRunDeletionRecovererStub{},
+		JavaAnalysisRunDeletion: &cAnalysisRunDeletionRecovererStub{},
+		TaskDeletion:            &taskDeletionSweeperStub{},
+		DirectTaskRecovery:      &directTaskRecovererStub{},
+		ArchiveAssociation:      association,
+		Retention:               retentionSweep,
+		Workspace:               &workspaceSweeperStub{},
+		Logger:                  slog.New(&recordHandler{}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runner.recover(context.Background())
+
+	if strings.Join(events, ",") != "archive-association,retention" {
+		t.Fatalf("archive association/retention order = %v", events)
+	}
+}
+
+func TestRunnerRecoversPendingJavaAnalysisRunDeletions(t *testing.T) {
+	events := make([]string, 0, 3)
+	javaRecoverer := &cAnalysisRunDeletionRecovererStub{
+		results: []recoverResult{{count: 3}},
+		events:  &events, event: "java-analysis-run-deletion",
+	}
+	cRecoverer := &cAnalysisRunDeletionRecovererStub{events: &events}
+	taskDeletion := &taskDeletionSweeperStub{events: &events}
+	handler := &recordHandler{}
+	runner, err := NewRunner(RunnerConfig{
+		Interval: time.Hour, PingTimeout: 50 * time.Millisecond,
+		Database: &databaseStub{}, Queue: &recovererStub{},
+		CAnalysisRunDeletion:    cRecoverer,
+		JavaAnalysisRunDeletion: javaRecoverer,
+		TaskDeletion:            taskDeletion,
+		DirectTaskRecovery:      &directTaskRecovererStub{},
+		ArchiveAssociation:      &archiveAssociationRecovererStub{},
+		Retention:               &retentionSweeperStub{},
+		Workspace:               &workspaceSweeperStub{}, Logger: slog.New(handler),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runner.recover(context.Background())
+
+	if strings.Join(events, ",") !=
+		"c-analysis-run-deletion,java-analysis-run-deletion,task-deletion" {
+		t.Fatalf("maintenance deletion recovery order = %v", events)
+	}
+	if calls, limits := javaRecoverer.snapshot(); calls != 1 ||
+		len(limits) != 1 || limits[0] != javaAnalysisRunDeletionBatchSize {
+		t.Fatalf("Java-analysis deletion recovery calls=%d limits=%v", calls, limits)
+	}
+	if !handler.hasRecord(
+		slog.LevelInfo, "pending Java-analysis run deletions recovered",
+		"recovered_runs", 3,
+	) {
+		t.Fatal("Java-analysis deletion recovery count log not found")
 	}
 }
 
@@ -538,13 +813,35 @@ func TestRunnerRetentionFailureDoesNotStopWorkspaceSweepOrLeakDetails(t *testing
 			},
 		}},
 	}
+	directTaskRecoverer := &directTaskRecovererStub{
+		events: &events,
+		results: []directTaskRecoveryResult{{
+			report: upload.DirectTaskRecoveryReport{
+				Candidates: 2, Ensured: 1, Failures: 1,
+			},
+			err: errors.New("private direct task recovery detail"),
+		}},
+	}
+	archiveAssociationRecoverer := &archiveAssociationRecovererStub{
+		events: &events,
+		results: []archiveAssociationRecoveryResult{{
+			report: upload.ArchiveImportRecoveryReport{
+				Candidates: 3, Ensured: 2, Failures: 1,
+			},
+			err: errors.New("private archive association recovery detail"),
+		}},
+	}
 	workspaceSweeper := &workspaceSweeperStub{events: &events}
 	handler := &recordHandler{}
 	runner, err := NewRunner(RunnerConfig{
 		Interval: time.Hour, PingTimeout: 50 * time.Millisecond,
 		Database: &databaseStub{}, Queue: recoverer,
-		TaskDeletion: taskDeletionSweeper,
-		Retention:    retentionSweeper, Workspace: workspaceSweeper,
+		CAnalysisRunDeletion:    &cAnalysisRunDeletionRecovererStub{},
+		JavaAnalysisRunDeletion: &cAnalysisRunDeletionRecovererStub{},
+		TaskDeletion:            taskDeletionSweeper,
+		DirectTaskRecovery:      directTaskRecoverer,
+		ArchiveAssociation:      archiveAssociationRecoverer,
+		Retention:               retentionSweeper, Workspace: workspaceSweeper,
 		Logger: slog.New(handler),
 	})
 	if err != nil {
@@ -553,7 +850,8 @@ func TestRunnerRetentionFailureDoesNotStopWorkspaceSweepOrLeakDetails(t *testing
 
 	runner.recover(context.Background())
 
-	if strings.Join(events, ",") != "recover,task-deletion,retention,sweep" {
+	if strings.Join(events, ",") !=
+		"recover,task-deletion,direct-task,archive-association,retention,sweep" {
 		t.Fatalf("maintenance order = %v", events)
 	}
 	if calls, limits := taskDeletionSweeper.snapshot(); calls != 1 ||
@@ -564,10 +862,32 @@ func TestRunnerRetentionFailureDoesNotStopWorkspaceSweepOrLeakDetails(t *testing
 		len(limits) != 1 || limits[0] != retentionBatchSize {
 		t.Fatalf("retention calls=%d limits=%v", calls, limits)
 	}
+	if calls, limits := directTaskRecoverer.snapshot(); calls != 1 ||
+		len(limits) != 1 || limits[0] != directTaskRecoveryBatchSize {
+		t.Fatalf("direct task recovery calls=%d limits=%v", calls, limits)
+	}
+	if calls, limits := archiveAssociationRecoverer.snapshot(); calls != 1 ||
+		len(limits) != 1 || limits[0] != archiveAssociationBatchSize {
+		t.Fatalf("archive association recovery calls=%d limits=%v", calls, limits)
+	}
 	if calls, _ := workspaceSweeper.snapshot(); calls != 1 {
 		t.Fatalf("workspace sweep calls=%d, want 1", calls)
 	}
 	if !handler.hasMessage(slog.LevelWarn, "retention sweep failed") ||
+		!handler.hasMessage(slog.LevelWarn, "direct upload task recovery failed") ||
+		!handler.hasMessage(slog.LevelWarn, "archive upload association recovery failed") ||
+		!handler.hasRecord(
+			slog.LevelInfo,
+			"direct upload task recovery completed",
+			"ensured_tasks",
+			1,
+		) ||
+		!handler.hasRecord(
+			slog.LevelInfo,
+			"archive upload association recovery completed",
+			"ensured_imports",
+			2,
+		) ||
 		!handler.hasRecord(
 			slog.LevelInfo,
 			"task deletion sweep completed",
@@ -602,6 +922,7 @@ func TestRunnerOrphanFailureIsObservableAndDoesNotStopWorkspaceSweep(t *testing.
 		},
 	}
 	taskDeletionSweeper := &taskDeletionSweeperStub{events: &events}
+	directTaskRecoverer := &directTaskRecovererStub{events: &events}
 	retentionSweeper := &retentionSweeperStub{events: &events}
 	orphanSweeper := &orphanSweeperStub{
 		events: &events,
@@ -622,11 +943,15 @@ func TestRunnerOrphanFailureIsObservableAndDoesNotStopWorkspaceSweep(t *testing.
 	runner, err := NewRunner(RunnerConfig{
 		Interval: time.Hour, PingTimeout: 50 * time.Millisecond,
 		Database: &databaseStub{}, Queue: recoverer,
-		TaskDeletion: taskDeletionSweeper,
-		Retention:    retentionSweeper,
-		Orphans:      orphanSweeper,
-		Workspace:    workspaceSweeper,
-		Logger:       slog.New(handler),
+		CAnalysisRunDeletion:    &cAnalysisRunDeletionRecovererStub{},
+		JavaAnalysisRunDeletion: &cAnalysisRunDeletionRecovererStub{},
+		TaskDeletion:            taskDeletionSweeper,
+		DirectTaskRecovery:      directTaskRecoverer,
+		ArchiveAssociation:      &archiveAssociationRecovererStub{events: &events},
+		Retention:               retentionSweeper,
+		Orphans:                 orphanSweeper,
+		Workspace:               workspaceSweeper,
+		Logger:                  slog.New(handler),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -634,7 +959,8 @@ func TestRunnerOrphanFailureIsObservableAndDoesNotStopWorkspaceSweep(t *testing.
 
 	runner.recover(context.Background())
 
-	if strings.Join(events, ",") != "recover,task-deletion,retention,orphan,sweep" {
+	if strings.Join(events, ",") !=
+		"recover,task-deletion,direct-task,archive-association,retention,orphan,sweep" {
 		t.Fatalf("maintenance order = %v", events)
 	}
 	if calls, limits := orphanSweeper.snapshot(); calls != 1 ||

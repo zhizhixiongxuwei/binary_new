@@ -13,9 +13,11 @@ import (
 	"os/signal"
 	"syscall"
 
+	"binaryscan/internal/archiveimport"
 	"binaryscan/internal/auth"
 	"binaryscan/internal/config"
 	"binaryscan/internal/database"
+	"binaryscan/internal/decompile"
 	"binaryscan/internal/healthcheck"
 	"binaryscan/internal/logging"
 	maintenancerunner "binaryscan/internal/maintenance"
@@ -23,7 +25,9 @@ import (
 	"binaryscan/internal/queue"
 	"binaryscan/internal/report"
 	"binaryscan/internal/retention"
+	"binaryscan/internal/task"
 	"binaryscan/internal/taskcleanup"
+	"binaryscan/internal/upload"
 	"binaryscan/internal/workspace"
 )
 
@@ -165,7 +169,10 @@ func run(args []string) error {
 		}
 		if err := authService.CreateInitialAdministrator(
 			ctx, *adminUsername, *adminDisplayName, password,
-		); err != nil {
+		); errors.Is(err, auth.ErrAlreadyInitialized) {
+			logger.Info("initial administrator already exists")
+			return nil
+		} else if err != nil {
 			return err
 		}
 		logger.Info("initial administrator created", "username", *adminUsername)
@@ -211,11 +218,103 @@ func run(args []string) error {
 	if err != nil {
 		return fmt.Errorf("initialize task deletion lease owner: %w", err)
 	}
+	sourceProjectDeletionOwner, err := decompile.NewSourceProjectDeletionLeaseOwner(
+		os.Getpid(), rand.Reader,
+	)
+	if err != nil {
+		return fmt.Errorf("initialize source project deletion lease owner: %w", err)
+	}
 	retentionSweeper, err := newRetentionSweeper(
 		db, cfg, taskDeletionDeleter, blobDeleter, uploadDeleter,
 	)
 	if err != nil {
 		return err
+	}
+	archiveRepository, err := archiveimport.NewMySQLRepository(db)
+	if err != nil {
+		return fmt.Errorf("initialize archive import recovery repository: %w", err)
+	}
+	archiveStorage, err := archiveimport.NewBlobStorage(cfg.RepositoryRoot)
+	if err != nil {
+		return fmt.Errorf("initialize archive import recovery storage: %w", err)
+	}
+	var archiveTaskService *task.Service
+	var archiveService *archiveimport.Service
+	archiveUploadService, err := upload.NewService(
+		upload.NewMySQLRepository(db),
+		upload.Config{
+			UploadsRoot: cfg.UploadsRoot, RepositoryRoot: cfg.RepositoryRoot,
+			MaxUploadBytes: cfg.MaxUploadBytes, PartSize: upload.DefaultPartSize,
+			Retention: cfg.IncompleteUploadRetention, PartDeleter: uploadDeleter,
+			EnsureArchiveImport: func(
+				ctx context.Context,
+				request upload.ArchiveImportRequest,
+			) (string, error) {
+				if archiveService == nil {
+					return "", errors.New("archive import service is not initialized")
+				}
+				return archiveService.EnsureForUpload(ctx, archiveimport.EnsureInput{
+					UploadID: request.UploadID, CreatedBy: request.CreatedBy,
+					Filename: request.Filename, Size: request.Size,
+					SHA256: request.SHA256, DetectedFormat: request.DetectedFormat,
+				})
+			},
+			EnsureDirectTask: func(
+				ctx context.Context,
+				request upload.DirectTaskRequest,
+			) (string, error) {
+				if archiveTaskService == nil {
+					return "", errors.New("task service is not initialized")
+				}
+				value, _, err := archiveTaskService.Create(
+					ctx, request.CreatedBy, auth.RoleOperator,
+					request.UploadID, request.TaskName, request.IdempotencyKey,
+				)
+				return value.ID, err
+			},
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("initialize archive import recovery uploads: %w", err)
+	}
+	archiveTaskService, err = task.NewService(
+		task.NewMySQLRepository(db),
+		task.ServiceConfig{
+			Limits: task.LimitsSnapshot{
+				MaxUploadBytes: cfg.MaxUploadBytes, MaxExpandedBytes: cfg.MaxExpandedBytes,
+				MaxArchiveRatio: cfg.MaxArchiveRatio, MaxDepth: cfg.MaxDepth,
+				MaxFileNodes: cfg.MaxFileNodes, MaxNestedImages: cfg.MaxNestedImages,
+			},
+			SampleRetention: cfg.SampleRetention,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("initialize archive import recovery tasks: %w", err)
+	}
+	archiveUploadAdapter := archiveimport.UploadServiceAdapter{Service: archiveUploadService}
+	archiveService, err = archiveimport.NewService(
+		archiveRepository,
+		archiveimport.ServiceConfig{
+			Limits: archiveimport.Limits{
+				MaxUploadBytes: cfg.MaxUploadBytes, MaxExpandedBytes: cfg.MaxExpandedBytes,
+				MaxArchiveRatio: int64(cfg.MaxArchiveRatio), MaxEntries: cfg.MaxFileNodes,
+				MaxEntryBytes: cfg.MaxUploadBytes, MaxDepth: cfg.MaxDepth,
+			},
+			BatchLeaseDuration: cfg.QueueLeaseInterval,
+			BatchRecoveryAge:   cfg.QueueLeaseInterval,
+			DerivedUploads:     archiveUploadAdapter, DeleteDerived: archiveUploadAdapter,
+			Tasks:   archiveimport.TaskServiceAdapter{Service: archiveTaskService},
+			Storage: archiveStorage,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("initialize archive import recovery service: %w", err)
+	}
+	archiveRecovery, err := archiveimport.NewMaintenanceRecoverer(
+		archiveRepository, archiveService, cfg.QueuePollInterval,
+	)
+	if err != nil {
+		return fmt.Errorf("initialize archive import recovery: %w", err)
 	}
 	orphanSweeper, err := orphanreaper.NewSweeper(
 		orphanreaper.NewMySQLRepository(db),
@@ -240,15 +339,43 @@ func run(args []string) error {
 	if err != nil {
 		return fmt.Errorf("initialize task deletion sweeper: %w", err)
 	}
+	sourceProjectDeletionSweeper, err := decompile.NewSourceProjectDeletionSweeper(
+		decompile.NewMySQLRepository(db),
+		taskDeletionDeleter,
+		decompile.SourceProjectDeletionSweeperConfig{
+			LeaseOwner:    sourceProjectDeletionOwner,
+			LeaseDuration: cfg.QueueLeaseInterval,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("initialize source project deletion sweeper: %w", err)
+	}
+	cAnalysisRunDeletionRecoverer, err := report.NewCAnalysisRunCascadeDeleter(
+		db, cfg.RepositoryRoot,
+	)
+	if err != nil {
+		return fmt.Errorf("initialize C-analysis run deletion recovery: %w", err)
+	}
+	javaAnalysisRunDeletionRecoverer, err := report.NewJavaAnalysisRunCascadeDeleter(
+		db, cfg.RepositoryRoot,
+	)
+	if err != nil {
+		return fmt.Errorf("initialize Java-analysis run deletion recovery: %w", err)
+	}
 	runner, err := maintenancerunner.NewRunner(maintenancerunner.RunnerConfig{
 		Interval: cfg.QueuePollInterval, PingTimeout: cfg.DatabasePingTimeout,
-		Database: db, Queue: queueService,
-		ReportGeneration: report.NewMySQLRepository(db),
-		TaskDeletion:     taskDeletionSweeper,
-		Retention:        retentionSweeper,
-		Orphans:          orphanSweeper,
-		Workspace:        workspaceReaper,
-		Logger:           logger,
+		Database: db, Queue: queueService, ArchiveImport: archiveRecovery,
+		ReportGeneration:        report.NewMySQLRepository(db),
+		SourceProjectDeletion:   sourceProjectDeletionSweeper,
+		CAnalysisRunDeletion:    cAnalysisRunDeletionRecoverer,
+		JavaAnalysisRunDeletion: javaAnalysisRunDeletionRecoverer,
+		TaskDeletion:            taskDeletionSweeper,
+		DirectTaskRecovery:      archiveUploadService,
+		ArchiveAssociation:      archiveUploadService,
+		Retention:               retentionSweeper,
+		Orphans:                 orphanSweeper,
+		Workspace:               workspaceReaper,
+		Logger:                  logger,
 	})
 	if err != nil {
 		return fmt.Errorf("initialize maintenance runner: %w", err)

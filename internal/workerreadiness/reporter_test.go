@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -114,5 +115,54 @@ func TestReporterFailsClosedOnInitialRegistration(t *testing.T) {
 	}
 	if err := reporter.Register(context.Background()); err == nil {
 		t.Fatal("Register() error = nil")
+	}
+}
+
+func TestReporterStopsFreshnessHeartbeatsWhileRuntimeProbeFails(t *testing.T) {
+	repository := &repositoryStub{heartbeat: make(chan struct{}, 1)}
+	reporter, err := NewReporter(
+		repository,
+		Registration{
+			Owner: "c-analysis:fixture", WorkerKind: "c_analysis",
+			AnalyzerName: "binaryscan-c-checker", AnalyzerVersion: "0.1.0",
+		},
+		10*time.Millisecond,
+		5*time.Millisecond,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ready atomic.Bool
+	if err := reporter.SetRuntimeProbe(func(context.Context) error {
+		if !ready.Load() {
+			return errors.New("checker unavailable")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		reporter.Run(ctx)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	time.Sleep(35 * time.Millisecond)
+	repository.mu.Lock()
+	heartbeats := repository.heartbeats
+	repository.mu.Unlock()
+	if heartbeats != 0 {
+		t.Fatalf("heartbeats while checker unavailable = %d, want 0", heartbeats)
+	}
+	ready.Store(true)
+	select {
+	case <-repository.heartbeat:
+	case <-time.After(time.Second):
+		t.Fatal("reporter did not restore heartbeat after checker recovery")
 	}
 }

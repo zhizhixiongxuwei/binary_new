@@ -24,6 +24,7 @@ import { useRoute, useRouter } from 'vue-router'
 
 import { ApiError } from '@/api/client'
 import LogoutErrorAlert from '@/components/auth/LogoutErrorAlert.vue'
+import { useTaskCreationLauncher } from '@/composables/useTaskCreationLauncher'
 import {
   PRODUCT_DESCRIPTION,
   PRODUCT_NAME,
@@ -34,6 +35,7 @@ import { useSessionStore } from '@/stores/session'
 const route = useRoute()
 const router = useRouter()
 const session = useSessionStore()
+const { launchTaskCreation } = useTaskCreationLauncher()
 const collapsed = shallowRef(false)
 const mobileOpen = shallowRef(false)
 const narrowLayout = shallowRef(false)
@@ -48,7 +50,7 @@ const navigation = computed(() => {
   const entries = [
     { label: '系统概览', to: '/', icon: CircleGauge, adminOnly: false },
     { label: '检测任务', to: '/tasks', icon: FileScan, adminOnly: false },
-    { label: '新建任务', to: '/tasks/new', icon: Plus, adminOnly: false, operatorOnly: true },
+    { label: '新建任务', to: '/tasks/new', icon: Plus, adminOnly: false, operatorOnly: true, command: true },
     { label: '系统维护', to: '/system', icon: ServerCog, adminOnly: true },
   ]
   return entries.filter((entry) => {
@@ -87,6 +89,11 @@ function closeMobileNavigation(restoreFocus = false): void {
   if (restoreFocus) {
     void nextTick(() => mobileMenuButton.value?.focus())
   }
+}
+
+function launchFromNavigation(): void {
+  closeMobileNavigation()
+  void launchTaskCreation()
 }
 
 function syncNarrowLayout(event: MediaQueryList | MediaQueryListEvent): void {
@@ -202,20 +209,37 @@ onScopeDispose(() => {
       </div>
 
       <nav class="primary-nav" aria-label="主导航">
-        <RouterLink
+        <template
           v-for="item in navigation"
           :key="item.to"
-          :to="item.to"
-          class="nav-item"
-          :class="{ 'nav-item--active': isActive(item.to) }"
-          :aria-current="isActive(item.to) ? 'page' : false"
-          :aria-label="item.label"
-          :title="collapsed ? item.label : ''"
-          @click="closeMobileNavigation()"
         >
-          <component :is="item.icon" :size="19" aria-hidden="true" />
-          <span v-show="!collapsed">{{ item.label }}</span>
-        </RouterLink>
+          <button
+            v-if="item.command"
+            class="nav-item nav-item--command"
+            :class="{ 'nav-item--active': isActive(item.to) }"
+            type="button"
+            :aria-current="isActive(item.to) ? 'page' : false"
+            :aria-label="item.label"
+            :title="collapsed ? item.label : ''"
+            @click="launchFromNavigation"
+          >
+            <component :is="item.icon" :size="19" aria-hidden="true" />
+            <span v-show="!collapsed">{{ item.label }}</span>
+          </button>
+          <RouterLink
+            v-else
+            :to="item.to"
+            class="nav-item"
+            :class="{ 'nav-item--active': isActive(item.to) }"
+            :aria-current="isActive(item.to) ? 'page' : false"
+            :aria-label="item.label"
+            :title="collapsed ? item.label : ''"
+            @click="closeMobileNavigation()"
+          >
+            <component :is="item.icon" :size="19" aria-hidden="true" />
+            <span v-show="!collapsed">{{ item.label }}</span>
+          </RouterLink>
+        </template>
       </nav>
 
       <div class="sidebar-bottom">
@@ -401,6 +425,13 @@ onScopeDispose(() => {
   color: #9dafb2;
   font-size: 14px;
   white-space: nowrap;
+}
+
+.nav-item--command {
+  width: 100%;
+  font-family: inherit;
+  cursor: pointer;
+  text-align: left;
 }
 
 .nav-item span {

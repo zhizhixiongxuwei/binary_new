@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 
+	"binaryscan/internal/report"
 	"binaryscan/internal/taskevent"
 	"binaryscan/internal/taskprogress"
 	"binaryscan/internal/trivyhandoff"
@@ -40,7 +41,59 @@ WHERE j.kind = ?
           AND task.deleted_at IS NULL
       )
       OR (
-          j.kind NOT IN ('decompile', 'image')
+          j.kind = 'c_analysis'
+          AND task.status IN (
+              'SUCCEEDED', 'PARTIAL_SUCCEEDED', 'FAILED', 'CANCELLED'
+          )
+          AND task.deleted_at IS NULL
+          AND EXISTS (
+              SELECT 1
+              FROM c_analysis_runs analysis
+              JOIN decompile_source_projects project
+                ON project.task_id = analysis.task_id
+               AND project.id = analysis.source_project_id
+              WHERE analysis.task_id = j.task_id
+                AND analysis.job_id = j.id
+                AND analysis.status = 'queued'
+                AND project.deleted_at IS NULL
+                AND project.storage_deleted_at IS NULL
+                AND project.layout_version = 'project-v1'
+                AND project.source_kind = 'ghidra-pseudoc'
+                AND project.language = 'c'
+                AND project.status IN ('complete', 'partial')
+                AND project.canonical_sha256 = analysis.source_sha256
+                AND project.canonical_size_bytes = analysis.source_size_bytes
+          )
+      )
+      OR (
+          j.kind = 'java_analysis'
+          AND task.status IN (
+              'SUCCEEDED', 'PARTIAL_SUCCEEDED', 'FAILED', 'CANCELLED'
+          )
+          AND task.deleted_at IS NULL
+          AND EXISTS (
+              SELECT 1
+              FROM java_analysis_runs analysis
+              JOIN decompile_source_projects project
+                ON project.task_id = analysis.task_id
+               AND project.id = analysis.source_project_id
+              WHERE analysis.task_id = j.task_id
+                AND analysis.job_id = j.id
+                AND analysis.status = 'queued'
+                AND project.deleted_at IS NULL
+                AND project.storage_deleted_at IS NULL
+                AND project.layout_version = 'project-v1'
+                AND project.source_kind = 'java'
+                AND project.language IN ('java', 'mixed')
+                AND project.status IN ('complete', 'partial')
+                AND project.manifest_sha256 = analysis.source_manifest_sha256
+                AND analysis.input_sha256 REGEXP '^[0-9a-f]{64}$'
+                AND analysis.source_size_bytes > 0
+                AND analysis.source_file_count > 0
+          )
+      )
+      OR (
+          j.kind NOT IN ('decompile', 'image', 'c_analysis', 'java_analysis')
           AND task.status NOT IN (
               'SUCCEEDED', 'PARTIAL_SUCCEEDED', 'FAILED',
               'CANCEL_REQUESTED', 'CANCELLED', 'DELETING', 'DELETED'
@@ -270,6 +323,22 @@ WHERE id = ? AND task_id = ? AND fencing_token = ? AND status = 'running'`
 		); err != nil {
 			return Lease{}, false, err
 		}
+		if requiresResourcePool(requirements, resourcePoolGlobal) {
+			var archiveImportRunning bool
+			if err := transaction.QueryRowContext(ctx, `
+SELECT EXISTS (
+    SELECT 1 FROM archive_imports WHERE status = 'running'
+)`).Scan(&archiveImportRunning); err != nil {
+				return Lease{}, false, fmt.Errorf(
+					"check archive import resource exclusion: %w", err,
+				)
+			}
+			if archiveImportRunning {
+				// Rolling back also releases the provisional job lease and task
+				// attempt fence advanced earlier in this transaction.
+				return Lease{}, false, nil
+			}
+		}
 	}
 	for _, requirement := range requirements {
 		slot, err := acquireResourceSlot(
@@ -296,6 +365,18 @@ WHERE id = ?`, lease.JobID).Scan(&lease.LeaseUntil); err != nil {
 		return Lease{}, false, fmt.Errorf("commit job claim: %w", err)
 	}
 	return lease, true, nil
+}
+
+func requiresResourcePool(
+	requirements []resourceRequirement,
+	pool string,
+) bool {
+	for _, requirement := range requirements {
+		if requirement.pool == pool {
+			return true
+		}
+	}
+	return false
 }
 
 func synchronizeResourceLimits(
@@ -424,6 +505,10 @@ func claimResourceRequirements(
 		case resourcePoolNative:
 			limit = request.NativeSlotLimit
 		}
+		if (request.Kind == KindCAnalysis || request.Kind == KindJavaAnalysis) &&
+			pool == resourcePoolGlobal {
+			limit = 1
+		}
 		requirements = append(requirements, resourceRequirement{
 			pool:  pool,
 			limit: limit,
@@ -435,7 +520,7 @@ func claimResourceRequirements(
 func heavyResourceKind(kind Kind) bool {
 	switch kind {
 	case KindScan, KindImage, KindNative, KindBytecode, KindTrivy,
-		KindDecompile:
+		KindDecompile, KindCAnalysis, KindJavaAnalysis:
 		return true
 	default:
 		return false
@@ -529,6 +614,68 @@ func (r *MySQLRepository) Start(ctx context.Context, lease Lease) error {
 		}
 		if err != nil {
 			return fmt.Errorf("validate post-scan job task start: %w", err)
+		}
+	}
+	if lease.Kind == KindCAnalysis {
+		var valid uint8
+		err := transaction.QueryRowContext(ctx, `
+SELECT 1
+FROM jobs job
+JOIN tasks task ON task.id = job.task_id
+JOIN c_analysis_runs analysis
+  ON analysis.task_id = job.task_id AND analysis.job_id = job.id
+JOIN decompile_source_projects project
+  ON project.task_id = analysis.task_id
+ AND project.id = analysis.source_project_id
+WHERE job.id = ? AND job.task_id = ? AND job.kind = 'c_analysis'
+  AND job.status = 'leased' AND job.lease_owner = ?
+  AND job.fencing_token = ? AND job.lease_until > UTC_TIMESTAMP(6)
+  AND task.status IN ('SUCCEEDED', 'PARTIAL_SUCCEEDED', 'FAILED', 'CANCELLED')
+  AND task.deleted_at IS NULL
+  AND analysis.status = 'queued'
+  AND project.deleted_at IS NULL AND project.storage_deleted_at IS NULL
+  AND project.layout_version = 'project-v1'
+  AND project.source_kind = 'ghidra-pseudoc' AND project.language = 'c'
+  AND project.status IN ('complete', 'partial')
+  AND project.canonical_sha256 = analysis.source_sha256
+  AND project.canonical_size_bytes = analysis.source_size_bytes
+FOR UPDATE`, lease.JobID, lease.TaskID, lease.Owner, lease.FencingToken).Scan(&valid)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrLeaseLost
+		}
+		if err != nil {
+			return fmt.Errorf("validate C analysis job start: %w", err)
+		}
+	}
+	if lease.Kind == KindJavaAnalysis {
+		var valid uint8
+		err := transaction.QueryRowContext(ctx, `
+SELECT 1
+FROM jobs job
+JOIN tasks task ON task.id = job.task_id
+JOIN java_analysis_runs analysis
+  ON analysis.task_id = job.task_id AND analysis.job_id = job.id
+JOIN decompile_source_projects project
+  ON project.task_id = analysis.task_id
+ AND project.id = analysis.source_project_id
+WHERE job.id = ? AND job.task_id = ? AND job.kind = 'java_analysis'
+  AND job.status = 'leased' AND job.lease_owner = ?
+  AND job.fencing_token = ? AND job.lease_until > UTC_TIMESTAMP(6)
+  AND task.status IN ('SUCCEEDED', 'PARTIAL_SUCCEEDED', 'FAILED', 'CANCELLED')
+  AND task.deleted_at IS NULL AND analysis.status = 'queued'
+  AND project.deleted_at IS NULL AND project.storage_deleted_at IS NULL
+  AND project.layout_version = 'project-v1'
+  AND project.source_kind = 'java' AND project.language IN ('java', 'mixed')
+  AND project.status IN ('complete', 'partial')
+  AND project.manifest_sha256 = analysis.source_manifest_sha256
+  AND analysis.input_sha256 REGEXP '^[0-9a-f]{64}$'
+  AND analysis.source_size_bytes > 0 AND analysis.source_file_count > 0
+FOR UPDATE`, lease.JobID, lease.TaskID, lease.Owner, lease.FencingToken).Scan(&valid)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrLeaseLost
+		}
+		if err != nil {
+			return fmt.Errorf("validate Java analysis job start: %w", err)
 		}
 	}
 
@@ -809,7 +956,7 @@ SELECT EXISTS (
 	      AND job.fencing_token = ?
 	      AND job.status IN ('leased', 'running', 'cancel_requested')
 	      AND (
-	          job.kind IN ('decompile', 'image')
+	          job.kind IN ('decompile', 'image', 'c_analysis', 'java_analysis')
 	          OR attempt.fencing_token = ?
 	      )
 )`,
@@ -1550,16 +1697,152 @@ FOR UPDATE SKIP LOCKED`, limit)
 		return 0, fmt.Errorf("iterate expired job leases: %w", err)
 	}
 	for _, job := range jobs {
+		useSavepoint := len(jobs) > 1
+		if useSavepoint {
+			if _, err := transaction.ExecContext(ctx, "SAVEPOINT recover_expired_job"); err != nil {
+				return 0, fmt.Errorf("create expired job recovery savepoint: %w", err)
+			}
+		}
 		if err := recoverExpiredJob(
 			ctx, transaction, job, retryDelayMicros, sampleRetentionMicros,
 		); err != nil {
-			return 0, err
+			if !errors.Is(err, ErrInconsistentState) {
+				return 0, err
+			}
+			if !useSavepoint {
+				_ = transaction.Rollback()
+				if quarantineErr := r.quarantineExpiredJob(
+					ctx, job, sampleRetentionMicros,
+				); quarantineErr != nil {
+					return 0, errors.Join(err, quarantineErr)
+				}
+				return 1, nil
+			}
+			if _, rollbackErr := transaction.ExecContext(
+				ctx, "ROLLBACK TO SAVEPOINT recover_expired_job",
+			); rollbackErr != nil {
+				return 0, errors.Join(err, rollbackErr)
+			}
+			if quarantineErr := quarantineExpiredJobTx(
+				ctx, transaction, job, sampleRetentionMicros,
+			); quarantineErr != nil {
+				return 0, errors.Join(err, quarantineErr)
+			}
+		}
+		if useSavepoint {
+			if _, err := transaction.ExecContext(ctx, "RELEASE SAVEPOINT recover_expired_job"); err != nil {
+				return 0, fmt.Errorf("release expired job recovery savepoint: %w", err)
+			}
 		}
 	}
 	if err := transaction.Commit(); err != nil {
 		return 0, fmt.Errorf("commit expired lease recovery: %w", err)
 	}
 	return len(jobs), nil
+}
+
+func (r *MySQLRepository) quarantineExpiredJob(
+	ctx context.Context,
+	job expiredJob,
+	sampleRetentionMicros int64,
+) error {
+	transaction, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin expired job quarantine: %w", err)
+	}
+	defer transaction.Rollback()
+	if err := quarantineExpiredJobTx(
+		ctx, transaction, job, sampleRetentionMicros,
+	); err != nil {
+		return err
+	}
+	if err := transaction.Commit(); err != nil {
+		return fmt.Errorf("commit expired job quarantine: %w", err)
+	}
+	return nil
+}
+
+func quarantineExpiredJobTx(
+	ctx context.Context,
+	transaction *sql.Tx,
+	job expiredJob,
+	sampleRetentionMicros int64,
+) error {
+	result, err := transaction.ExecContext(ctx, `
+UPDATE jobs
+SET status = 'failed',
+    lease_owner = NULL,
+    lease_until = NULL,
+    heartbeat_at = NULL,
+    completed_at = UTC_TIMESTAMP(6),
+    error_code = 'lease_recovery_inconsistent',
+    error_message = 'The expired worker lease had inconsistent durable state.'
+WHERE id = ?
+  AND fencing_token = ?
+  AND (
+      (status IN ('leased', 'running') AND lease_until <= UTC_TIMESTAMP(6))
+      OR (
+          status = 'cancel_requested'
+          AND (lease_until IS NULL OR lease_until <= UTC_TIMESTAMP(6))
+      )
+  )`, job.ID, job.FencingToken)
+	if err != nil {
+		return fmt.Errorf("quarantine inconsistent expired job: %w", err)
+	}
+	if err := requireOne(
+		result, ErrInconsistentState, "inspect inconsistent expired job quarantine",
+	); err != nil {
+		return err
+	}
+	// The job/fence pair is authoritative even if corrupt payload or related
+	// rows made the normal pool calculation impossible. Release every slot it
+	// owns so one poison record cannot permanently block the global heavy gate.
+	if _, err := transaction.ExecContext(ctx, `
+UPDATE job_resource_slots
+SET job_id = NULL,
+    job_fencing_token = NULL,
+    lease_owner = NULL,
+    acquired_at = NULL
+WHERE job_id = ? AND job_fencing_token = ?`, job.ID, job.FencingToken); err != nil {
+		return fmt.Errorf("release inconsistent expired job slots: %w", err)
+	}
+	if job.Kind != KindScan && job.Kind != KindTrivy {
+		return nil
+	}
+	if job.TaskAttemptID.Valid && job.TaskAttemptID.Int64 > 0 {
+		if _, err := transaction.ExecContext(ctx, `
+UPDATE task_attempts
+SET status = 'failed', completed_at = UTC_TIMESTAMP(6),
+    error_code = 'lease_recovery_inconsistent',
+    error_message = 'The expired worker lease had inconsistent durable state.'
+WHERE id = ? AND task_id = ? AND fencing_token = ?
+  AND status IN ('queued', 'running')`,
+			job.TaskAttemptID.Int64, job.TaskID, job.FencingToken,
+		); err != nil {
+			return fmt.Errorf("fail inconsistent expired task attempt: %w", err)
+		}
+	}
+	if _, err := transaction.ExecContext(ctx, `
+UPDATE tasks
+SET status = 'FAILED', stage = NULL, completed_at = UTC_TIMESTAMP(6),
+    error_code = 'lease_recovery_inconsistent',
+    error_message = 'The expired worker lease had inconsistent durable state.',
+    sample_expires_at = CASE
+        WHEN sample_deleted_at IS NULL AND deleted_at IS NULL
+        THEN GREATEST(
+            sample_expires_at,
+            DATE_ADD(UTC_TIMESTAMP(6), INTERVAL ? MICROSECOND)
+        )
+        ELSE sample_expires_at
+    END,
+    event_sequence = event_sequence + 1
+WHERE id = ?
+  AND status NOT IN ('SUCCEEDED', 'PARTIAL_SUCCEEDED', 'FAILED', 'CANCELLED', 'DELETED')`,
+		sampleRetentionMicros, job.TaskID,
+	); err != nil {
+		return fmt.Errorf("fail inconsistent expired task: %w", err)
+	}
+	return nil
 }
 
 func recoverExpiredJob(
@@ -1573,6 +1856,24 @@ func recoverExpiredJob(
 		return recoverCancelledJob(
 			ctx, transaction, job, sampleRetentionMicros,
 		)
+	}
+	if job.Kind == KindCAnalysis {
+		finalized, err := recoverTerminalCAnalysisJob(ctx, transaction, job)
+		if err != nil {
+			return err
+		}
+		if finalized {
+			return nil
+		}
+	}
+	if job.Kind == KindJavaAnalysis {
+		finalized, err := recoverTerminalJavaAnalysisJob(ctx, transaction, job)
+		if err != nil {
+			return err
+		}
+		if finalized {
+			return nil
+		}
 	}
 	retry := job.Attempt < job.MaxAttempts
 	status := "failed"
@@ -1628,6 +1929,12 @@ WHERE id = ?
 		job,
 	); err != nil {
 		return err
+	}
+	if job.Kind == KindCAnalysis {
+		return recoverExpiredCAnalysisJob(ctx, transaction, job, retry)
+	}
+	if job.Kind == KindJavaAnalysis {
+		return recoverExpiredJavaAnalysisJob(ctx, transaction, job, retry)
 	}
 	if job.Kind == KindTrivy {
 		return recoverExpiredTrivyJob(
@@ -1700,6 +2007,166 @@ WHERE id = ?
 		ctx, transaction, job.TaskID,
 		"task.status_changed", "Task recovered after a worker lease expired.",
 	)
+}
+
+// C analysis publishes its immutable result before the generic queue finish.
+// If that final queue write was interrupted, preserve the published result and
+// complete the expired job instead of re-running (or stranding) the analysis.
+func recoverTerminalCAnalysisJob(
+	ctx context.Context,
+	transaction *sql.Tx,
+	job expiredJob,
+) (bool, error) {
+	var runStatus, analyzerStatus string
+	var errorCode, errorMessage sql.NullString
+	err := transaction.QueryRowContext(ctx, `
+SELECT analysis.status, analyzer.status,
+       analysis.error_code, analysis.error_message
+FROM c_analysis_runs analysis
+JOIN analyzer_runs analyzer
+  ON analyzer.task_id = analysis.task_id AND analyzer.id = analysis.id
+WHERE analysis.task_id = ? AND analysis.job_id = ?
+FOR UPDATE`, job.TaskID, job.ID).Scan(
+		&runStatus, &analyzerStatus, &errorCode, &errorMessage,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, ErrInconsistentState
+	}
+	if err != nil {
+		return false, fmt.Errorf("read expired C analysis state: %w", err)
+	}
+	jobStatus := ""
+	switch runStatus {
+	case "queued", "running", "cancel_requested":
+		return false, nil
+	case "succeeded", "partial":
+		if analyzerStatus != runStatus || errorCode.Valid || errorMessage.Valid {
+			return false, ErrInconsistentState
+		}
+		jobStatus = "succeeded"
+	case "failed":
+		if analyzerStatus != "failed" || !errorCode.Valid || !errorMessage.Valid {
+			return false, ErrInconsistentState
+		}
+		jobStatus = "failed"
+	case "cancelled":
+		if analyzerStatus != "cancelled" || errorCode.Valid || errorMessage.Valid {
+			return false, ErrInconsistentState
+		}
+		jobStatus = "cancelled"
+	default:
+		return false, ErrInconsistentState
+	}
+	var storedCode, storedMessage any
+	if jobStatus == "failed" {
+		storedCode, storedMessage = errorCode.String, errorMessage.String
+	}
+	result, err := transaction.ExecContext(ctx, `
+UPDATE jobs
+SET status = ?,
+    lease_owner = NULL,
+    lease_until = NULL,
+    heartbeat_at = NULL,
+    completed_at = UTC_TIMESTAMP(6),
+    error_code = ?,
+    error_message = ?
+WHERE id = ? AND task_id = ? AND kind = 'c_analysis'
+  AND fencing_token = ?
+  AND status IN ('leased', 'running')
+  AND lease_until <= UTC_TIMESTAMP(6)`,
+		jobStatus, storedCode, storedMessage,
+		job.ID, job.TaskID, job.FencingToken,
+	)
+	if err != nil {
+		return false, fmt.Errorf("finish published C analysis job: %w", err)
+	}
+	if err := requireOne(
+		result, ErrInconsistentState,
+		"inspect published C analysis job recovery",
+	); err != nil {
+		return false, err
+	}
+	if err := releaseRecoveredResourceSlots(ctx, transaction, job); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// Java analysis also publishes before the generic queue finish. Recover the
+// final job state without running the immutable source project a second time.
+func recoverTerminalJavaAnalysisJob(
+	ctx context.Context,
+	transaction *sql.Tx,
+	job expiredJob,
+) (bool, error) {
+	var runStatus, analyzerStatus string
+	var errorCode, errorMessage sql.NullString
+	err := transaction.QueryRowContext(ctx, `
+SELECT analysis.status, analyzer.status,
+       analysis.error_code, analysis.error_message
+FROM java_analysis_runs analysis
+JOIN analyzer_runs analyzer
+  ON analyzer.task_id = analysis.task_id AND analyzer.id = analysis.id
+WHERE analysis.task_id = ? AND analysis.job_id = ?
+FOR UPDATE`, job.TaskID, job.ID).Scan(
+		&runStatus, &analyzerStatus, &errorCode, &errorMessage,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, ErrInconsistentState
+	}
+	if err != nil {
+		return false, fmt.Errorf("read expired Java analysis state: %w", err)
+	}
+	jobStatus := ""
+	switch runStatus {
+	case "queued", "running", "cancel_requested":
+		return false, nil
+	case "succeeded", "partial":
+		if analyzerStatus != runStatus || errorCode.Valid || errorMessage.Valid {
+			return false, ErrInconsistentState
+		}
+		jobStatus = "succeeded"
+	case "failed":
+		if analyzerStatus != "failed" || !errorCode.Valid || !errorMessage.Valid {
+			return false, ErrInconsistentState
+		}
+		jobStatus = "failed"
+	case "cancelled":
+		if analyzerStatus != "cancelled" || errorCode.Valid || errorMessage.Valid {
+			return false, ErrInconsistentState
+		}
+		jobStatus = "cancelled"
+	default:
+		return false, ErrInconsistentState
+	}
+	var storedCode, storedMessage any
+	if jobStatus == "failed" {
+		storedCode, storedMessage = errorCode.String, errorMessage.String
+	}
+	result, err := transaction.ExecContext(ctx, `
+UPDATE jobs
+SET status = ?, lease_owner = NULL, lease_until = NULL,
+    heartbeat_at = NULL, completed_at = UTC_TIMESTAMP(6),
+    error_code = ?, error_message = ?
+WHERE id = ? AND task_id = ? AND kind = 'java_analysis'
+  AND fencing_token = ? AND status IN ('leased', 'running')
+  AND lease_until <= UTC_TIMESTAMP(6)`,
+		jobStatus, storedCode, storedMessage,
+		job.ID, job.TaskID, job.FencingToken,
+	)
+	if err != nil {
+		return false, fmt.Errorf("finish published Java analysis job: %w", err)
+	}
+	if err := requireOne(
+		result, ErrInconsistentState,
+		"inspect published Java analysis job recovery",
+	); err != nil {
+		return false, err
+	}
+	if err := releaseRecoveredResourceSlots(ctx, transaction, job); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func recoverExpiredTrivyJob(
@@ -1820,6 +2287,168 @@ WHERE id = ? AND status IN ('SCANNING', 'REPORTING')`,
 	)
 }
 
+func recoverExpiredCAnalysisJob(
+	ctx context.Context,
+	transaction *sql.Tx,
+	job expiredJob,
+	retry bool,
+) error {
+	if retry {
+		result, err := transaction.ExecContext(ctx, `
+UPDATE c_analysis_runs analysis
+JOIN analyzer_runs analyzer
+  ON analyzer.task_id = analysis.task_id AND analyzer.id = analysis.id
+SET analysis.status = 'queued',
+    analysis.started_at = NULL,
+    analysis.completed_at = NULL,
+    analysis.error_code = NULL,
+    analysis.error_message = NULL,
+    analyzer.status = 'queued',
+    analyzer.started_at = NULL,
+    analyzer.completed_at = NULL,
+    analyzer.error_code = NULL,
+    analyzer.error_message = NULL
+WHERE analysis.task_id = ? AND analysis.job_id = ?
+	  AND analysis.status = analyzer.status
+	  AND analysis.status IN ('queued', 'running')`,
+			job.TaskID, job.ID,
+		)
+		if err != nil {
+			return fmt.Errorf("requeue expired C analysis run: %w", err)
+		}
+		mutated, err := recoveredAnalysisMutation(result)
+		if err != nil {
+			return fmt.Errorf("inspect requeued expired C analysis run: %w", err)
+		}
+		if mutated {
+			if err := report.InvalidateTaskSourceAnalysisReports(
+				ctx, transaction, job.TaskID,
+			); err != nil {
+				return fmt.Errorf(
+					"invalidate reports after requeuing expired C analysis: %w", err,
+				)
+			}
+		}
+		return nil
+	}
+	result, err := transaction.ExecContext(ctx, `
+UPDATE c_analysis_runs analysis
+JOIN analyzer_runs analyzer
+  ON analyzer.task_id = analysis.task_id AND analyzer.id = analysis.id
+SET analysis.status = 'failed',
+    analysis.error_code = 'lease_expired',
+    analysis.error_message = 'The worker lease expired after the final attempt.',
+    analysis.completed_at = UTC_TIMESTAMP(6),
+    analyzer.status = 'failed',
+    analyzer.error_code = 'lease_expired',
+    analyzer.error_message = 'The worker lease expired after the final attempt.',
+    analyzer.completed_at = UTC_TIMESTAMP(6)
+WHERE analysis.task_id = ? AND analysis.job_id = ?
+	  AND analysis.status = analyzer.status
+	  AND analysis.status IN ('queued', 'running')`,
+		job.TaskID, job.ID,
+	)
+	if err != nil {
+		return fmt.Errorf("fail expired C analysis run: %w", err)
+	}
+	if err := requireRecoveredAnalysisMutation(
+		result, ErrInconsistentState,
+		"inspect failed expired C analysis run",
+	); err != nil {
+		return err
+	}
+	if err := report.InvalidateTaskSourceAnalysisReports(
+		ctx, transaction, job.TaskID,
+	); err != nil {
+		return fmt.Errorf(
+			"invalidate reports after failing expired C analysis: %w", err,
+		)
+	}
+	return nil
+}
+
+func recoverExpiredJavaAnalysisJob(
+	ctx context.Context,
+	transaction *sql.Tx,
+	job expiredJob,
+	retry bool,
+) error {
+	if retry {
+		result, err := transaction.ExecContext(ctx, `
+UPDATE java_analysis_runs analysis
+JOIN analyzer_runs analyzer
+  ON analyzer.task_id = analysis.task_id AND analyzer.id = analysis.id
+SET analysis.status = 'queued', analysis.bundle_sha256 = NULL,
+    analysis.started_at = NULL, analysis.completed_at = NULL,
+    analysis.ruleset_version = NULL, analysis.analyzed_files = 0,
+    analysis.parsed_files = 0, analysis.recovered_files = 0,
+    analysis.failed_files = 0, analysis.finding_count = 0,
+    analysis.diagnostic_count = 0, analysis.low_count = 0,
+    analysis.medium_count = 0, analysis.high_count = 0,
+    analysis.critical_count = 0, analysis.findings_truncated = FALSE,
+    analysis.diagnostics_truncated = FALSE,
+    analysis.error_code = NULL, analysis.error_message = NULL,
+    analyzer.status = 'queued', analyzer.started_at = NULL,
+    analyzer.completed_at = NULL, analyzer.error_code = NULL,
+    analyzer.error_message = NULL
+WHERE analysis.task_id = ? AND analysis.job_id = ?
+  AND analysis.status = analyzer.status
+  AND analysis.status IN ('queued', 'running')`,
+			job.TaskID, job.ID,
+		)
+		if err != nil {
+			return fmt.Errorf("requeue expired Java analysis run: %w", err)
+		}
+		mutated, err := recoveredAnalysisMutation(result)
+		if err != nil {
+			return fmt.Errorf("inspect requeued expired Java analysis run: %w", err)
+		}
+		if mutated {
+			if err := report.InvalidateTaskSourceAnalysisReports(
+				ctx, transaction, job.TaskID,
+			); err != nil {
+				return fmt.Errorf(
+					"invalidate reports after requeuing expired Java analysis: %w", err,
+				)
+			}
+		}
+		return nil
+	}
+	result, err := transaction.ExecContext(ctx, `
+UPDATE java_analysis_runs analysis
+JOIN analyzer_runs analyzer
+  ON analyzer.task_id = analysis.task_id AND analyzer.id = analysis.id
+SET analysis.status = 'failed',
+    analysis.error_code = 'lease_expired',
+    analysis.error_message = 'The worker lease expired after the final attempt.',
+    analysis.completed_at = UTC_TIMESTAMP(6),
+    analyzer.status = 'failed', analyzer.error_code = 'lease_expired',
+    analyzer.error_message = 'The worker lease expired after the final attempt.',
+    analyzer.completed_at = UTC_TIMESTAMP(6)
+WHERE analysis.task_id = ? AND analysis.job_id = ?
+  AND analysis.status = analyzer.status
+  AND analysis.status IN ('queued', 'running')`,
+		job.TaskID, job.ID,
+	)
+	if err != nil {
+		return fmt.Errorf("fail expired Java analysis run: %w", err)
+	}
+	if err := requireRecoveredAnalysisMutation(
+		result, ErrInconsistentState,
+		"inspect failed expired Java analysis run",
+	); err != nil {
+		return err
+	}
+	if err := report.InvalidateTaskSourceAnalysisReports(
+		ctx, transaction, job.TaskID,
+	); err != nil {
+		return fmt.Errorf(
+			"invalidate reports after failing expired Java analysis: %w", err,
+		)
+	}
+	return nil
+}
+
 func recoverCancelledJob(
 	ctx context.Context,
 	transaction *sql.Tx,
@@ -1853,6 +2482,72 @@ WHERE id = ?
 		job,
 	); err != nil {
 		return err
+	}
+	if job.Kind == KindCAnalysis {
+		analysisResult, err := transaction.ExecContext(ctx, `
+UPDATE c_analysis_runs analysis
+JOIN analyzer_runs analyzer
+  ON analyzer.task_id = analysis.task_id AND analyzer.id = analysis.id
+SET analysis.status = 'cancelled',
+    analysis.error_code = NULL,
+    analysis.error_message = NULL,
+    analysis.completed_at = UTC_TIMESTAMP(6),
+    analyzer.status = 'cancelled',
+    analyzer.error_code = NULL,
+    analyzer.error_message = NULL,
+    analyzer.completed_at = UTC_TIMESTAMP(6)
+WHERE analysis.task_id = ? AND analysis.job_id = ?
+	  AND analysis.status IN ('queued', 'running', 'cancel_requested')
+	  AND analyzer.status IN ('queued', 'running')`, job.TaskID, job.ID)
+		if err != nil {
+			return fmt.Errorf("finalize cancelled C analysis run: %w", err)
+		}
+		mutated, err := recoveredAnalysisMutation(analysisResult)
+		if err != nil {
+			return fmt.Errorf("inspect cancelled C analysis run: %w", err)
+		}
+		if mutated {
+			if err := report.InvalidateTaskSourceAnalysisReports(
+				ctx, transaction, job.TaskID,
+			); err != nil {
+				return fmt.Errorf(
+					"invalidate reports after recovering cancelled C analysis: %w", err,
+				)
+			}
+		}
+		return nil
+	}
+	if job.Kind == KindJavaAnalysis {
+		analysisResult, err := transaction.ExecContext(ctx, `
+UPDATE java_analysis_runs analysis
+JOIN analyzer_runs analyzer
+  ON analyzer.task_id = analysis.task_id AND analyzer.id = analysis.id
+SET analysis.status = 'cancelled', analysis.error_code = NULL,
+    analysis.error_message = NULL,
+    analysis.completed_at = UTC_TIMESTAMP(6),
+    analyzer.status = 'cancelled', analyzer.error_code = NULL,
+    analyzer.error_message = NULL,
+    analyzer.completed_at = UTC_TIMESTAMP(6)
+WHERE analysis.task_id = ? AND analysis.job_id = ?
+	  AND analysis.status IN ('queued', 'running', 'cancel_requested')
+	  AND analyzer.status IN ('queued', 'running')`, job.TaskID, job.ID)
+		if err != nil {
+			return fmt.Errorf("finalize cancelled Java analysis run: %w", err)
+		}
+		mutated, err := recoveredAnalysisMutation(analysisResult)
+		if err != nil {
+			return fmt.Errorf("inspect cancelled Java analysis run: %w", err)
+		}
+		if mutated {
+			if err := report.InvalidateTaskSourceAnalysisReports(
+				ctx, transaction, job.TaskID,
+			); err != nil {
+				return fmt.Errorf(
+					"invalidate reports after recovering cancelled Java analysis: %w", err,
+				)
+			}
+		}
+		return nil
 	}
 	if job.Kind == KindScan || job.Kind == KindTrivy {
 		if !job.TaskAttemptID.Valid || job.TaskAttemptID.Int64 <= 0 {
@@ -1942,6 +2637,35 @@ WHERE id = ? AND status = 'CANCEL_REQUESTED'`,
 		ctx, transaction, job.TaskID,
 		"task.status_changed", "Task cancellation completed.",
 	)
+}
+
+func recoveredAnalysisMutation(result sql.Result) (bool, error) {
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected != 0 && affected != 2 {
+		return false, ErrInconsistentState
+	}
+	return affected == 2, nil
+}
+
+func requireRecoveredAnalysisMutation(
+	result sql.Result,
+	zeroError error,
+	operation string,
+) error {
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("%s: %w", operation, err)
+	}
+	if affected == 0 {
+		return zeroError
+	}
+	if affected != 2 {
+		return ErrInconsistentState
+	}
+	return nil
 }
 
 func releaseRecoveredResourceSlots(

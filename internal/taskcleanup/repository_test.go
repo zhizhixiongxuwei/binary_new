@@ -63,11 +63,16 @@ func TestMySQLRepositoryClaimCreatesFencedOperationAndCollectsOutputs(
 		WillReturnRows(sqlmock.NewRows(
 			[]string{"id", "storage_key", "sha256", "size_bytes"},
 		))
-	mock.ExpectQuery(`(?s)SELECT id, storage_key, content_sha256, size_bytes.*FROM decompile_results`).
+	mock.ExpectQuery(`(?s)SELECT id, layout_version, root_storage_key, storage_deleted_at.*FROM decompile_source_projects`).
 		WithArgs(testTaskID).
 		WillReturnRows(sqlmock.NewRows(
-			[]string{"id", "storage_key", "content_sha256", "size_bytes"},
-		).AddRow(testResultID, nil, nil, nil))
+			[]string{"id", "layout_version", "root_storage_key", "storage_deleted_at"},
+		))
+	mock.ExpectQuery(`(?s)SELECT id, analyzer_run_id, storage_key, content_sha256, size_bytes.*FROM decompile_results`).
+		WithArgs(testTaskID).
+		WillReturnRows(sqlmock.NewRows(
+			[]string{"id", "analyzer_run_id", "storage_key", "content_sha256", "size_bytes"},
+		).AddRow(testResultID, nil, nil, nil, nil))
 	expectCleanupAudit(
 		mock, "task.deletion_cleanup_started", "success", testTaskID,
 	)
@@ -81,6 +86,75 @@ func TestMySQLRepositoryClaimCreatesFencedOperationAndCollectsOutputs(
 		claim.Files[0].StorageKey != reportKey ||
 		len(claim.Scopes) != 3 {
 		t.Fatalf("Claim() = (%+v, %v, %v)", claim, claimed, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCollectOutputsDeletesProjectRootOnceInsteadOfSharedFunctionFile(
+	t *testing.T,
+) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	const projectID = "223e4567-e89b-42d3-a456-426614174004"
+	const secondResultID = "323e4567-e89b-42d3-a456-426614174005"
+	projectRoot := "source-projects/" + projectID
+	canonicalKey := projectRoot + "/src/decompiled.c"
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`(?s)SELECT id, format, storage_key, sha256, size_bytes.*FROM reports`).
+		WithArgs(testTaskID).
+		WillReturnRows(sqlmock.NewRows(
+			[]string{"id", "format", "storage_key", "sha256", "size_bytes"},
+		))
+	mock.ExpectQuery(`(?s)SELECT id, storage_key, sha256, size_bytes.*FROM artifacts`).
+		WithArgs(testTaskID).
+		WillReturnRows(sqlmock.NewRows(
+			[]string{"id", "storage_key", "sha256", "size_bytes"},
+		))
+	mock.ExpectQuery(`(?s)SELECT id, layout_version, root_storage_key, storage_deleted_at.*FROM decompile_source_projects`).
+		WithArgs(testTaskID).
+		WillReturnRows(sqlmock.NewRows(
+			[]string{"id", "layout_version", "root_storage_key", "storage_deleted_at"},
+		).AddRow(projectID, "project-v1", projectRoot, nil))
+	mock.ExpectQuery(`(?s)SELECT id, analyzer_run_id, storage_key, content_sha256, size_bytes.*FROM decompile_results`).
+		WithArgs(testTaskID).
+		WillReturnRows(sqlmock.NewRows(
+			[]string{"id", "analyzer_run_id", "storage_key", "content_sha256", "size_bytes"},
+		).
+			AddRow(testResultID, projectID, canonicalKey, cleanupSHA([]byte("one")), 3).
+			AddRow(secondResultID, projectID, canonicalKey, cleanupSHA([]byte("two")), 3))
+	mock.ExpectRollback()
+
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := Claim{TaskID: testTaskID}
+	if err := collectOutputs(context.Background(), tx, &claim); err != nil {
+		t.Fatal(err)
+	}
+	if len(claim.Files) != 0 || len(claim.Scopes) != 3 {
+		t.Fatalf("collected files=%+v scopes=%+v", claim.Files, claim.Scopes)
+	}
+	projectScopes := 0
+	for _, scope := range claim.Scopes {
+		if scope.Kind == FileSourceProject {
+			projectScopes++
+			if scope.RecordID != projectID {
+				t.Fatalf("project scope = %+v", scope)
+			}
+		}
+	}
+	if projectScopes != 1 {
+		t.Fatalf("project root scopes = %d, want 1", projectScopes)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
@@ -141,7 +215,7 @@ func TestMySQLRepositoryRenewRequiresNoActiveReportGeneration(t *testing.T) {
 	}
 }
 
-func TestMySQLRepositoryCompleteReleasesCASAndDeletesResultsButNotAudit(
+func TestMySQLRepositoryCompleteReleasesCASDeletesCompletedProjectOperationsAndKeepsAudit(
 	t *testing.T,
 ) {
 	db, mock, err := sqlmock.New()
@@ -175,9 +249,17 @@ func TestMySQLRepositoryCompleteReleasesCASAndDeletesResultsButNotAudit(
 		WithArgs(testTaskID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	expectBlobRelease(mock, rootBlobID, 2, "available")
+	mock.ExpectExec(`(?s)DELETE FROM source_project_deletion_tokens.*decompile_source_projects.*task_id = \?`).
+		WithArgs(testTaskID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`DELETE FROM source_project_deletion_operations WHERE task_id = \?`).
+		WithArgs(testTaskID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 	for _, table := range []string{
-		"reports", "vulnerability_findings", "decompile_results",
-		"artifacts", "analyzer_runs", "file_nodes",
+		"reports", "c_analysis_findings", "c_analysis_runs",
+		"java_analysis_findings", "java_analysis_runs",
+		"vulnerability_findings", "decompile_results", "artifacts",
+		"analyzer_runs", "file_nodes",
 	} {
 		mock.ExpectExec(`DELETE FROM ` + table + ` WHERE task_id = \?`).
 			WithArgs(testTaskID).

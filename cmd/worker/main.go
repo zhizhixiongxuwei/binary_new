@@ -19,20 +19,28 @@ import (
 	"time"
 
 	trivyadapter "binaryscan/internal/analyzers/trivy"
+	"binaryscan/internal/archiveimport"
 	"binaryscan/internal/archivesandbox"
 	"binaryscan/internal/bytecode"
+	"binaryscan/internal/canalysis"
 	"binaryscan/internal/config"
 	"binaryscan/internal/containerarchive"
 	"binaryscan/internal/database"
 	"binaryscan/internal/decompile"
+	"binaryscan/internal/extract"
 	"binaryscan/internal/filetype"
 	"binaryscan/internal/ghidra"
 	"binaryscan/internal/healthcheck"
+	"binaryscan/internal/javaanalysis"
 	"binaryscan/internal/logging"
 	"binaryscan/internal/queue"
+	"binaryscan/internal/report"
+	"binaryscan/internal/retention"
 	"binaryscan/internal/scan"
+	"binaryscan/internal/task"
 	"binaryscan/internal/trivydb"
 	"binaryscan/internal/trivyscan"
+	"binaryscan/internal/upload"
 	"binaryscan/internal/workerreadiness"
 	"binaryscan/internal/workerrunner"
 )
@@ -43,11 +51,14 @@ const (
 )
 
 var validKinds = map[string]struct{}{
-	"scan":     {},
-	"image":    {},
-	"native":   {},
-	"bytecode": {},
-	"trivy":    {},
+	"scan":           {},
+	"image":          {},
+	"native":         {},
+	"bytecode":       {},
+	"trivy":          {},
+	"c_analysis":     {},
+	"java_analysis":  {},
+	"archive_import": {},
 }
 
 func main() {
@@ -104,13 +115,30 @@ func run(args []string) error {
 			return nil
 		}
 	}
+	if archiveSandboxRequired(kind, cfg) {
+		if !awaitArchiveSandboxReady(ctx, cfg, logger) {
+			return nil
+		}
+		// Exactly one required child performs the full production-tool probe for
+		// the scanner container. A failure is fatal, so supervisor tears down the
+		// group instead of leaving a Ping-healthy scanner that cannot extract
+		// 7Z/CAB. The scan worker waits only for Ping and therefore does not race
+		// this probe for the sandbox's single execution slot.
+		if kind == "archive_import" {
+			if err := selfTestArchiveSandbox(ctx, cfg); err != nil {
+				return fmt.Errorf("archive sandbox startup self-test: %w", err)
+			}
+		}
+	}
 
 	owner := ""
-	if isQueueWorker(kind) {
+	if isQueueWorker(kind) || kind == "archive_import" {
 		owner, err = generateWorkerOwner(kind)
 		if err != nil {
 			return fmt.Errorf("generate worker owner: %w", err)
 		}
+	}
+	if isQueueWorker(kind) {
 		queueService, err := queue.NewService(
 			queue.NewMySQLRepository(db),
 			workerQueueConfig(cfg),
@@ -141,13 +169,42 @@ func run(args []string) error {
 		if err != nil {
 			return fmt.Errorf("initialize analyzer readiness reporter: %w", err)
 		}
+		if kind == string(queue.KindCAnalysis) {
+			client, err := canalysis.NewHTTPClient(canalysis.ClientConfig{
+				BaseURL: cfg.CCheckerURL, MaxDuration: cfg.CAnalysisMaxDuration,
+				MaxResponseBytes: cfg.CAnalysisMaxResponseBytes,
+				MaxFindings:      cfg.CAnalysisMaxFindings,
+				MaxDiagnostics:   cfg.CAnalysisMaxDiagnostics,
+			})
+			if err != nil {
+				return fmt.Errorf("initialize C checker readiness probe: %w", err)
+			}
+			if err := reporter.SetRuntimeProbe(client.Ready); err != nil {
+				return fmt.Errorf("configure C checker readiness probe: %w", err)
+			}
+		}
+		if kind == string(queue.KindJavaAnalysis) {
+			client, err := javaanalysis.NewHTTPClient(javaanalysis.ClientConfig{
+				BaseURL:          cfg.JavaCheckerURL,
+				MaxDuration:      cfg.JavaAnalysisMaxDuration,
+				MaxResponseBytes: cfg.JavaAnalysisMaxResponseBytes,
+				MaxFindings:      cfg.JavaAnalysisMaxFindings,
+				MaxDiagnostics:   cfg.JavaAnalysisMaxDiagnostics,
+			})
+			if err != nil {
+				return fmt.Errorf("initialize Java checker readiness probe: %w", err)
+			}
+			if err := reporter.SetRuntimeProbe(client.Ready); err != nil {
+				return fmt.Errorf("configure Java checker readiness probe: %w", err)
+			}
+		}
 		runner = &readinessWorkerLoop{
 			workerLoop: runner,
 			reporter:   reporter,
 			logger:     logger,
 		}
 	}
-	if isQueueWorker(kind) {
+	if isQueueWorker(kind) || kind == "archive_import" {
 		logger.Info("worker started", "worker_kind", kind, "worker_owner", owner)
 	} else {
 		logger.Info("worker started in safe idle mode", "worker_kind", kind)
@@ -165,11 +222,88 @@ func checkWorkerHealth(
 	cfg config.Config,
 	db *sql.DB,
 ) error {
-	return healthcheck.CheckDatabase(
+	if err := healthcheck.CheckDatabase(
 		ctx,
 		db,
 		cfg.DatabasePingTimeout,
-	)
+	); err != nil {
+		return err
+	}
+	if kind == "archive_import" {
+		return checkArchiveSandbox(ctx, cfg)
+	}
+	return nil
+}
+
+func archiveSandboxRequired(kind string, cfg config.Config) bool {
+	return kind == "archive_import" || (kind == string(queue.KindScan) && cfg.ArchiveSandboxEnabled)
+}
+
+func awaitArchiveSandboxReady(
+	ctx context.Context,
+	cfg config.Config,
+	logger *slog.Logger,
+) bool {
+	for {
+		if err := checkArchiveSandbox(ctx, cfg); err == nil {
+			return true
+		} else if ctx.Err() == nil {
+			logger.WarnContext(ctx, "archive sandbox is not ready; claims remain paused", "error", err)
+		}
+		if !waitWorkerContext(ctx, cfg.QueuePollInterval) {
+			return false
+		}
+	}
+}
+
+func checkArchiveSandbox(ctx context.Context, cfg config.Config) error {
+	if !cfg.ArchiveSandboxEnabled {
+		return errors.New("archive sandbox must be enabled")
+	}
+	client, err := newArchiveSandboxClient(cfg)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	checkCtx, cancel := context.WithTimeout(ctx, min(cfg.DatabasePingTimeout, cfg.ArchiveSandboxTimeout))
+	defer cancel()
+	return client.Ping(checkCtx)
+}
+
+func selfTestArchiveSandbox(ctx context.Context, cfg config.Config) error {
+	if !cfg.ArchiveSandboxEnabled {
+		return errors.New("archive sandbox must be enabled")
+	}
+	client, err := newArchiveSandboxClient(cfg)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	selfTestTimeout := min(cfg.ArchiveSandboxTimeout, 45*time.Second)
+	selfTestCtx, cancel := context.WithTimeout(ctx, selfTestTimeout)
+	defer cancel()
+	return client.SelfTest(selfTestCtx)
+}
+
+func waitWorkerContext(ctx context.Context, duration time.Duration) bool {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func newArchiveSandboxClient(cfg config.Config) (*archivesandbox.Client, error) {
+	return archivesandbox.NewClient(archivesandbox.ClientConfig{
+		SocketPath:       cfg.ArchiveSandboxSocket,
+		InputRoot:        cfg.ArchiveSandboxInputRoot,
+		OutputRoot:       cfg.ArchiveSandboxOutputRoot,
+		Timeout:          cfg.ArchiveSandboxTimeout,
+		MinimumFreeBytes: cfg.StorageMinFreeBytes,
+	})
 }
 
 func checkAnalyzerRuntimeReady(
@@ -190,6 +324,41 @@ func checkAnalyzerRuntimeReady(
 			cfg.GhidraJavaVersionLine,
 		); err != nil {
 			return fmt.Errorf("Ghidra runtime is not ready: %w", err)
+		}
+		return nil
+	}
+	if kind == string(queue.KindCAnalysis) {
+		client, err := canalysis.NewHTTPClient(canalysis.ClientConfig{
+			BaseURL: cfg.CCheckerURL, MaxDuration: cfg.CAnalysisMaxDuration,
+			MaxResponseBytes: cfg.CAnalysisMaxResponseBytes,
+			MaxFindings:      cfg.CAnalysisMaxFindings,
+			MaxDiagnostics:   cfg.CAnalysisMaxDiagnostics,
+		})
+		if err != nil {
+			return fmt.Errorf("initialize C checker readiness client: %w", err)
+		}
+		checkCtx, cancel := context.WithTimeout(ctx, cfg.DatabasePingTimeout)
+		defer cancel()
+		if err := client.Ready(checkCtx); err != nil {
+			return fmt.Errorf("C checker runtime is not ready: %w", err)
+		}
+		return nil
+	}
+	if kind == string(queue.KindJavaAnalysis) {
+		client, err := javaanalysis.NewHTTPClient(javaanalysis.ClientConfig{
+			BaseURL:          cfg.JavaCheckerURL,
+			MaxDuration:      cfg.JavaAnalysisMaxDuration,
+			MaxResponseBytes: cfg.JavaAnalysisMaxResponseBytes,
+			MaxFindings:      cfg.JavaAnalysisMaxFindings,
+			MaxDiagnostics:   cfg.JavaAnalysisMaxDiagnostics,
+		})
+		if err != nil {
+			return fmt.Errorf("initialize Java checker readiness client: %w", err)
+		}
+		checkCtx, cancel := context.WithTimeout(ctx, cfg.DatabasePingTimeout)
+		defer cancel()
+		if err := client.Ready(checkCtx); err != nil {
+			return fmt.Errorf("Java checker runtime is not ready: %w", err)
 		}
 		return nil
 	}
@@ -259,7 +428,9 @@ func isAnalyzerWorker(kind string) bool {
 	return kind == string(queue.KindNative) ||
 		kind == string(queue.KindBytecode) ||
 		kind == string(queue.KindImage) ||
-		kind == string(queue.KindTrivy)
+		kind == string(queue.KindTrivy) ||
+		kind == string(queue.KindCAnalysis) ||
+		kind == string(queue.KindJavaAnalysis)
 }
 
 func checkTrivyExecutable(ctx context.Context, cfg config.Config) error {
@@ -291,7 +462,10 @@ func parseCommand(args []string) (command, kind string, err error) {
 		return "run", args[0], nil
 	}
 	flags := flag.NewFlagSet("worker", flag.ContinueOnError)
-	kindFlag := flags.String("kind", "", "worker kind: scan, image, native, bytecode, or trivy")
+	kindFlag := flags.String(
+		"kind", "",
+		"worker kind: scan, image, native, bytecode, trivy, c_analysis, java_analysis, or archive_import",
+	)
 	if err := flags.Parse(args); err != nil {
 		return "", "", err
 	}
@@ -373,6 +547,20 @@ func analyzerReadinessRegistration(
 			Owner: owner, WorkerKind: kind,
 			AnalyzerName: "trivy", AnalyzerVersion: cfg.TrivyVersion,
 		}, true
+	case string(queue.KindCAnalysis):
+		return workerreadiness.Registration{
+			Owner: owner, WorkerKind: kind,
+			AnalyzerName:    canalysis.AnalyzerName,
+			AnalyzerVersion: cfg.CCheckerVersion,
+			RuntimeName:     "spring-boot",
+		}, true
+	case string(queue.KindJavaAnalysis):
+		return workerreadiness.Registration{
+			Owner: owner, WorkerKind: kind,
+			AnalyzerName:    javaanalysis.AnalyzerName,
+			AnalyzerVersion: cfg.JavaCheckerVersion,
+			RuntimeName:     "spring-boot",
+		}, true
 	default:
 		return workerreadiness.Registration{}, false
 	}
@@ -397,6 +585,129 @@ func assembleWorkerRunner(
 	}
 
 	switch kind {
+	case "archive_import":
+		if !cfg.ArchiveSandboxEnabled {
+			return nil, errors.New("archive import requires the archive sandbox")
+		}
+		sandboxClient, err := newArchiveSandboxClient(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("initialize archive import sandbox client: %w", err)
+		}
+		// Structural classification stays in-process; the sandbox is reserved
+		// for 7Z/CAB extraction rather than forking file(1) per archive member.
+		detector := filetype.Detector{}
+		engine, err := extract.NewEngineWithArchiveSandbox(
+			detector,
+			extract.Limits{
+				MaxExpandedBytes: cfg.MaxExpandedBytes,
+				MaxEntryBytes:    cfg.MaxUploadBytes,
+				MaxNodes:         cfg.MaxFileNodes,
+				MaxDepth:         cfg.MaxDepth,
+				MaxRatio:         int64(cfg.MaxArchiveRatio),
+			},
+			sandboxClient,
+		)
+		if err != nil {
+			_ = sandboxClient.Close()
+			return nil, fmt.Errorf("initialize logical archive extractor: %w", err)
+		}
+		repository, err := archiveimport.NewMySQLRepository(db)
+		if err != nil {
+			_ = sandboxClient.Close()
+			return nil, err
+		}
+		storage, err := archiveimport.NewBlobStorage(cfg.RepositoryRoot)
+		if err != nil {
+			_ = sandboxClient.Close()
+			return nil, err
+		}
+		partDeleter, err := retention.NewRepositoryUploadDirectoryDeleter(cfg.UploadsRoot)
+		if err != nil {
+			_ = sandboxClient.Close()
+			return nil, fmt.Errorf("initialize derived upload cleanup: %w", err)
+		}
+		uploadService, err := upload.NewService(
+			upload.NewMySQLRepository(db),
+			upload.Config{
+				UploadsRoot: cfg.UploadsRoot, RepositoryRoot: cfg.RepositoryRoot,
+				MaxUploadBytes: cfg.MaxUploadBytes, PartSize: upload.DefaultPartSize,
+				Retention: cfg.IncompleteUploadRetention, PartDeleter: partDeleter,
+				Detector: detector,
+			},
+		)
+		if err != nil {
+			_ = sandboxClient.Close()
+			return nil, fmt.Errorf("initialize derived archive uploads: %w", err)
+		}
+		taskService, err := task.NewService(
+			task.NewMySQLRepository(db),
+			task.ServiceConfig{
+				Limits: task.LimitsSnapshot{
+					MaxUploadBytes:   cfg.MaxUploadBytes,
+					MaxExpandedBytes: cfg.MaxExpandedBytes,
+					MaxArchiveRatio:  cfg.MaxArchiveRatio,
+					MaxDepth:         cfg.MaxDepth, MaxFileNodes: cfg.MaxFileNodes,
+					MaxNestedImages: cfg.MaxNestedImages,
+				},
+				SampleRetention: cfg.SampleRetention,
+			},
+		)
+		if err != nil {
+			_ = sandboxClient.Close()
+			return nil, fmt.Errorf("initialize archive entry tasks: %w", err)
+		}
+		uploadAdapter := archiveimport.UploadServiceAdapter{Service: uploadService}
+		service, err := archiveimport.NewService(
+			repository,
+			archiveimport.ServiceConfig{
+				Limits: archiveimport.Limits{
+					MaxUploadBytes:   cfg.MaxUploadBytes,
+					MaxExpandedBytes: cfg.MaxExpandedBytes,
+					MaxArchiveRatio:  int64(cfg.MaxArchiveRatio),
+					MaxEntries:       cfg.MaxFileNodes, MaxEntryBytes: cfg.MaxUploadBytes,
+					MaxDepth: cfg.MaxDepth,
+				},
+				BatchLeaseDuration: cfg.QueueLeaseInterval,
+				BatchRecoveryAge:   cfg.QueueLeaseInterval,
+				DerivedUploads:     uploadAdapter, DeleteDerived: uploadAdapter,
+				Tasks:   archiveimport.TaskServiceAdapter{Service: taskService},
+				Storage: storage,
+			},
+		)
+		if err != nil {
+			_ = sandboxClient.Close()
+			return nil, fmt.Errorf("initialize archive import service: %w", err)
+		}
+		archiveStorageGuard, err := newArchiveStorageGuard(cfg)
+		if err != nil {
+			_ = sandboxClient.Close()
+			return nil, err
+		}
+		processor, err := archiveimport.NewProcessor(
+			repository, engine, storage,
+			archiveimport.ProcessorConfig{
+				WorkRoot: cfg.TaskWorkRoot, LeaseDuration: cfg.QueueLeaseInterval,
+				HeartbeatInterval: cfg.HeartbeatInterval, Logger: logger,
+				StorageGuard: archiveStorageGuard,
+			},
+		)
+		if err != nil {
+			_ = sandboxClient.Close()
+			return nil, fmt.Errorf("initialize archive import processor: %w", err)
+		}
+		runner, err := archiveimport.NewRunner(
+			repository, processor, service,
+			archiveimport.RunnerConfig{
+				Owner: owner, PollInterval: cfg.QueuePollInterval,
+				LeaseDuration: cfg.QueueLeaseInterval,
+				RetryDelay:    cfg.QueuePollInterval, Logger: logger,
+			},
+		)
+		if err != nil {
+			_ = sandboxClient.Close()
+			return nil, fmt.Errorf("initialize archive import runner: %w", err)
+		}
+		return &closingWorkerLoop{workerLoop: runner, closer: sandboxClient}, nil
 	case string(queue.KindScan):
 		queueService, err := queue.NewService(
 			queue.NewMySQLRepository(db),
@@ -408,21 +719,13 @@ func assembleWorkerRunner(
 		var sandboxClient *archivesandbox.Client
 		detector := filetype.Detector{}
 		if cfg.ArchiveSandboxEnabled {
-			sandboxClient, err = archivesandbox.NewClient(
-				archivesandbox.ClientConfig{
-					SocketPath: cfg.ArchiveSandboxSocket,
-					InputRoot:  cfg.ArchiveSandboxInputRoot,
-					OutputRoot: cfg.ArchiveSandboxOutputRoot,
-					Timeout:    cfg.ArchiveSandboxTimeout,
-				},
-			)
+			sandboxClient, err = newArchiveSandboxClient(cfg)
 			if err != nil {
 				return nil, fmt.Errorf(
 					"initialize archive sandbox client: %w",
 					err,
 				)
 			}
-			detector = filetype.NewDetector(sandboxClient)
 		}
 		processor, err := scan.NewProcessor(
 			scan.NewMySQLRepository(db),
@@ -438,7 +741,22 @@ func assembleWorkerRunner(
 			return nil, fmt.Errorf("initialize scan processor: %w", err)
 		}
 		if sandboxClient != nil {
-			if err := processor.EnableArchiveSandbox(sandboxClient); err != nil {
+			archiveStorageGuard, guardErr := newArchiveStorageGuard(cfg)
+			if guardErr != nil {
+				_ = sandboxClient.Close()
+				return nil, guardErr
+			}
+			reserveArchive := func(
+				ctx context.Context,
+				sourceBytes, expandedBytes int64,
+			) (func(), error) {
+				return archiveStorageGuard.ReservePlan(ctx, archiveimport.StoragePlan{
+					SourceBytes: sourceBytes, ExpandedBytes: expandedBytes,
+				})
+			}
+			if err := processor.EnableArchiveSandbox(
+				sandboxClient, reserveArchive,
+			); err != nil {
 				_ = sandboxClient.Close()
 				return nil, fmt.Errorf(
 					"enable archive sandbox extraction: %w",
@@ -617,8 +935,120 @@ func assembleWorkerRunner(
 			return nil, fmt.Errorf("initialize queue runner: %w", err)
 		}
 		return runner, nil
+	case string(queue.KindCAnalysis):
+		queueService, err := queue.NewService(
+			queue.NewMySQLRepository(db), workerQueueConfig(cfg),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("initialize C analysis queue service: %w", err)
+		}
+		repository, err := canalysis.NewMySQLRepository(db, canalysis.RepositoryConfig{
+			AnalyzerVersion: cfg.CCheckerVersion,
+			ReadyMaxAge:     3 * cfg.HeartbeatInterval,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("initialize C analysis repository: %w", err)
+		}
+		client, err := canalysis.NewHTTPClient(canalysis.ClientConfig{
+			BaseURL: cfg.CCheckerURL, MaxDuration: cfg.CAnalysisMaxDuration,
+			MaxResponseBytes: cfg.CAnalysisMaxResponseBytes,
+			MaxFindings:      cfg.CAnalysisMaxFindings,
+			MaxDiagnostics:   cfg.CAnalysisMaxDiagnostics,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("initialize C checker client: %w", err)
+		}
+		processor, err := canalysis.NewProcessor(
+			repository, client,
+			canalysis.ProcessorConfig{
+				RepositoryRoot: cfg.RepositoryRoot,
+				TaskWorkRoot:   cfg.TaskWorkRoot,
+			},
+		)
+		if err != nil {
+			return nil, fmt.Errorf("initialize C analysis processor: %w", err)
+		}
+		runnerConfig := workerRunnerConfig(cfg, queue.KindCAnalysis, owner)
+		runnerConfig.ClaimGate = checkerClaimGate(client.Ready)
+		runner, err := workerrunner.New(
+			queueService, processor, logger,
+			runnerConfig,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("initialize C analysis worker runner: %w", err)
+		}
+		return runner, nil
+	case string(queue.KindJavaAnalysis):
+		queueService, err := queue.NewService(
+			queue.NewMySQLRepository(db), workerQueueConfig(cfg),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("initialize Java analysis queue service: %w", err)
+		}
+		repository, err := javaanalysis.NewMySQLRepository(
+			db, javaAnalysisRepositoryConfig(cfg),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("initialize Java analysis repository: %w", err)
+		}
+		client, err := javaanalysis.NewHTTPClient(javaanalysis.ClientConfig{
+			BaseURL:          cfg.JavaCheckerURL,
+			MaxDuration:      cfg.JavaAnalysisMaxDuration,
+			MaxResponseBytes: cfg.JavaAnalysisMaxResponseBytes,
+			MaxFindings:      cfg.JavaAnalysisMaxFindings,
+			MaxDiagnostics:   cfg.JavaAnalysisMaxDiagnostics,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("initialize Java checker client: %w", err)
+		}
+		processor, err := javaanalysis.NewProcessor(
+			repository, client, javaanalysis.ProcessorConfig{
+				RepositoryRoot: cfg.RepositoryRoot,
+				TaskWorkRoot:   cfg.TaskWorkRoot,
+			},
+		)
+		if err != nil {
+			return nil, fmt.Errorf("initialize Java analysis processor: %w", err)
+		}
+		runnerConfig := workerRunnerConfig(cfg, queue.KindJavaAnalysis, owner)
+		runnerConfig.ClaimGate = checkerClaimGate(client.Ready)
+		runner, err := workerrunner.New(
+			queueService, processor, logger,
+			runnerConfig,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("initialize Java analysis worker runner: %w", err)
+		}
+		return runner, nil
 	default:
 		return nil, fmt.Errorf("unsupported worker kind %q", kind)
+	}
+}
+
+func newArchiveStorageGuard(cfg config.Config) (archiveimport.StorageGuard, error) {
+	checker, err := archiveimport.NewCapacityGuard(archiveimport.CapacityGuardConfig{
+		SandboxRoots: []string{
+			cfg.ArchiveSandboxInputRoot,
+			cfg.ArchiveSandboxOutputRoot,
+			cfg.ArchiveSandboxRunRoot,
+			cfg.TaskWorkRoot,
+		},
+		RepositoryRoot: cfg.RepositoryRoot,
+		MinimumFree:    cfg.StorageMinFreeBytes,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("initialize archive storage guard: %w", err)
+	}
+	return checker, nil
+}
+
+func javaAnalysisRepositoryConfig(cfg config.Config) javaanalysis.RepositoryConfig {
+	return javaanalysis.RepositoryConfig{
+		AnalyzerVersion: cfg.JavaCheckerVersion,
+		ReadyMaxAge:     3 * cfg.HeartbeatInterval,
+		InvalidateReports: func(ctx context.Context, tx *sql.Tx, taskID string) error {
+			return report.InvalidateTaskSourceAnalysisReports(ctx, tx, taskID)
+		},
 	}
 }
 
@@ -713,12 +1143,24 @@ func workerRunnerConfig(
 	}
 }
 
+func checkerClaimGate(
+	ready func(context.Context) error,
+) func(context.Context) error {
+	return func(ctx context.Context) error {
+		probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		return ready(probeCtx)
+	}
+}
+
 func isQueueWorker(kind string) bool {
 	return kind == string(queue.KindScan) ||
 		kind == string(queue.KindImage) ||
 		kind == string(queue.KindNative) ||
 		kind == string(queue.KindBytecode) ||
-		kind == string(queue.KindTrivy)
+		kind == string(queue.KindTrivy) ||
+		kind == string(queue.KindCAnalysis) ||
+		kind == string(queue.KindJavaAnalysis)
 }
 
 type nativeQueue struct{ *queue.Service }

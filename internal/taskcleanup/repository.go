@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"path"
 	"sort"
+	"strings"
 	"time"
 
 	"binaryscan/internal/audit"
@@ -53,6 +55,12 @@ WHERE task.status = 'DELETING'
       WHERE report.task_id = task.id
         AND report.status IN ('queued', 'generating')
   )
+	  AND NOT EXISTS (
+	      SELECT 1
+	      FROM source_project_deletion_operations project_deletion
+	      WHERE project_deletion.task_id = task.id
+	        AND project_deletion.status IN ('pending', 'cancelling', 'deleting', 'failed')
+	  )
   AND NOT EXISTS (
       SELECT 1
       FROM task_deletion_operations operation
@@ -135,6 +143,12 @@ WHERE task.id = ?
       WHERE report.task_id = task.id
         AND report.status IN ('queued', 'generating')
   )
+	  AND NOT EXISTS (
+	      SELECT 1
+	      FROM source_project_deletion_operations project_deletion
+	      WHERE project_deletion.task_id = task.id
+	        AND project_deletion.status IN ('pending', 'cancelling', 'deleting', 'failed')
+	  )
 LIMIT 1
 FOR UPDATE SKIP LOCKED`, taskID).Scan(&databaseNow)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -358,7 +372,13 @@ WHERE operation.task_id = ?
       FROM reports report
       WHERE report.task_id = task.id
         AND report.status IN ('queued', 'generating')
-  )`,
+	  )
+	  AND NOT EXISTS (
+	      SELECT 1
+	      FROM source_project_deletion_operations project_deletion
+	      WHERE project_deletion.task_id = task.id
+	        AND project_deletion.status IN ('pending', 'cancelling', 'deleting', 'failed')
+	  )`,
 		leaseMicros, claim.TaskID, claim.FencingToken, claim.LeaseOwner,
 	)
 	if err != nil {
@@ -412,6 +432,12 @@ WHERE task.id = ?
       WHERE report.task_id = task.id
         AND report.status IN ('queued', 'generating')
   )
+	  AND NOT EXISTS (
+	      SELECT 1
+	      FROM source_project_deletion_operations project_deletion
+	      WHERE project_deletion.task_id = task.id
+	        AND project_deletion.status IN ('pending', 'cancelling', 'deleting', 'failed')
+	  )
 LIMIT 1
 FOR UPDATE`, claim.TaskID).Scan(&blobID, &sampleDeletedAt)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -613,7 +639,11 @@ func collectOutputs(
 	if err := collectArtifactFiles(ctx, tx, claim); err != nil {
 		return err
 	}
-	if err := collectDecompileFiles(ctx, tx, claim); err != nil {
+	projects, err := collectSourceProjectScopes(ctx, tx, claim)
+	if err != nil {
+		return err
+	}
+	if err := collectDecompileFiles(ctx, tx, claim, projects); err != nil {
 		return err
 	}
 	if len(claim.Files) > maxOutputFiles || len(claim.Scopes) > maxOutputFiles+2 {
@@ -636,7 +666,94 @@ func collectOutputs(
 			index--
 		}
 	}
+	sort.Slice(claim.Scopes, func(left, right int) bool {
+		if claim.Scopes[left].Kind != claim.Scopes[right].Kind {
+			return claim.Scopes[left].Kind < claim.Scopes[right].Kind
+		}
+		return claim.Scopes[left].RecordID < claim.Scopes[right].RecordID
+	})
+	for index := 1; index < len(claim.Scopes); index++ {
+		if claim.Scopes[index-1] == claim.Scopes[index] {
+			claim.Scopes = append(
+				claim.Scopes[:index], claim.Scopes[index+1:]...,
+			)
+			index--
+		}
+	}
 	return nil
+}
+
+type deletingSourceProject struct {
+	layoutVersion string
+	rootKey       string
+}
+
+func collectSourceProjectScopes(
+	ctx context.Context,
+	tx *sql.Tx,
+	claim *Claim,
+) (map[string]deletingSourceProject, error) {
+	rows, err := tx.QueryContext(ctx, `
+SELECT id, layout_version, root_storage_key, storage_deleted_at
+FROM decompile_source_projects
+WHERE task_id = ?
+ORDER BY id`, claim.TaskID)
+	if err != nil {
+		return nil, fmt.Errorf("list deleting task source projects: %w", err)
+	}
+	defer rows.Close()
+	projects := make(map[string]deletingSourceProject)
+	for rows.Next() {
+		var (
+			id               string
+			layoutVersion    string
+			rootStorageKey   sql.NullString
+			storageDeletedAt sql.NullTime
+		)
+		if err := rows.Scan(
+			&id, &layoutVersion, &rootStorageKey, &storageDeletedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan deleting task source project: %w", err)
+		}
+		if !canonicalID.MatchString(id) {
+			return nil, errors.New("deleting task source project ID is invalid")
+		}
+		project := deletingSourceProject{layoutVersion: layoutVersion}
+		switch layoutVersion {
+		case "project-v1":
+			if !rootStorageKey.Valid {
+				if !storageDeletedAt.Valid {
+					return nil, errors.New(
+						"deleting task source project storage is incomplete",
+					)
+				}
+				break
+			}
+			project.rootKey = rootStorageKey.String
+			if project.rootKey != path.Join("source-projects", id) ||
+				!canonicalStorageKey(project.rootKey) {
+				return nil, errors.New(
+					"deleting task source project root is invalid",
+				)
+			}
+			claim.Scopes = append(claim.Scopes, Scope{
+				Kind: FileSourceProject, TaskID: claim.TaskID, RecordID: id,
+			})
+		case "legacy-v1":
+			if rootStorageKey.Valid {
+				return nil, errors.New(
+					"legacy source project unexpectedly owns a project root",
+				)
+			}
+		default:
+			return nil, errors.New("deleting task source project layout is invalid")
+		}
+		projects[id] = project
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate deleting task source projects: %w", err)
+	}
+	return projects, nil
 }
 
 func collectReportFiles(
@@ -709,9 +826,10 @@ func collectDecompileFiles(
 	ctx context.Context,
 	tx *sql.Tx,
 	claim *Claim,
+	projects map[string]deletingSourceProject,
 ) error {
 	rows, err := tx.QueryContext(ctx, `
-SELECT id, storage_key, content_sha256, size_bytes
+SELECT id, analyzer_run_id, storage_key, content_sha256, size_bytes
 FROM decompile_results
 WHERE task_id = ?
 ORDER BY id`, claim.TaskID)
@@ -722,12 +840,35 @@ ORDER BY id`, claim.TaskID)
 	for rows.Next() {
 		var (
 			id         string
+			runID      sql.NullString
 			storageKey sql.NullString
 			sha        sql.NullString
 			size       sql.Null[uint64]
 		)
-		if err := rows.Scan(&id, &storageKey, &sha, &size); err != nil {
+		if err := rows.Scan(&id, &runID, &storageKey, &sha, &size); err != nil {
 			return fmt.Errorf("scan deleting task decompile result: %w", err)
+		}
+		project, projectFound := deletingSourceProject{}, false
+		if runID.Valid {
+			project, projectFound = projects[runID.String]
+		}
+		if projectFound &&
+			project.layoutVersion == "project-v1" {
+			if storageKey.Valid && (project.rootKey == "" ||
+				!canonicalStorageKey(storageKey.String) ||
+				!strings.HasPrefix(storageKey.String, project.rootKey+"/")) {
+				return errors.New(
+					"deleting task result is outside its source project",
+				)
+			}
+			continue
+		}
+		if storageKey.Valid && strings.HasPrefix(
+			storageKey.String, "source-projects/",
+		) {
+			return errors.New(
+				"deleting task result references an unknown source project",
+			)
 		}
 		claim.Scopes = append(claim.Scopes, Scope{
 			Kind: FileDecompile, TaskID: claim.TaskID, RecordID: id,
@@ -854,7 +995,18 @@ func deleteStructuredResults(
 		name string
 		sql  string
 	}{
+		{"source project deletion tokens", `
+DELETE FROM source_project_deletion_tokens
+WHERE project_id IN (
+    SELECT id FROM decompile_source_projects WHERE task_id = ?
+)`},
+		{"source project deletion operations", `
+DELETE FROM source_project_deletion_operations WHERE task_id = ?`},
 		{"reports", `DELETE FROM reports WHERE task_id = ?`},
+		{"C-analysis findings", `DELETE FROM c_analysis_findings WHERE task_id = ?`},
+		{"C-analysis runs", `DELETE FROM c_analysis_runs WHERE task_id = ?`},
+		{"Java-analysis findings", `DELETE FROM java_analysis_findings WHERE task_id = ?`},
+		{"Java-analysis runs", `DELETE FROM java_analysis_runs WHERE task_id = ?`},
 		{"vulnerability findings", `DELETE FROM vulnerability_findings WHERE task_id = ?`},
 		{"decompile results", `DELETE FROM decompile_results WHERE task_id = ?`},
 		{"artifacts", `DELETE FROM artifacts WHERE task_id = ?`},

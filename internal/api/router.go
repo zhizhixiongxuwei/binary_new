@@ -24,11 +24,14 @@ type Dependencies struct {
 	Auth                AuthManager
 	AuthHTTP            AuthHTTPConfig
 	Uploads             UploadService
+	ArchiveImports      ArchiveImportService
 	Tasks               TaskService
 	TaskEvents          TaskEventService
 	TaskEventsHTTP      TaskEventHTTPConfig
 	FileTree            FileTreeService
 	Decompile           DecompileService
+	CAnalysis           CAnalysisService
+	JavaAnalysis        JavaAnalysisService
 	ManualImageScan     ManualImageScanService
 	Vulnerabilities     VulnerabilityService
 	Reports             ReportService
@@ -86,6 +89,9 @@ func NewRouter(deps Dependencies) (*gin.Engine, error) {
 		if deps.Uploads != nil {
 			registerUploadRoutes(v1, deps.Auth, deps.Uploads)
 		}
+		if deps.ArchiveImports != nil {
+			registerArchiveImportRoutes(v1, deps.Auth, deps.ArchiveImports)
+		}
 		if deps.Tasks != nil {
 			registerTaskRoutes(v1, deps.Auth, deps.Tasks)
 		}
@@ -102,6 +108,12 @@ func NewRouter(deps Dependencies) (*gin.Engine, error) {
 		}
 		if deps.Decompile != nil {
 			registerDecompileRoutes(v1, deps.Auth, deps.Decompile)
+		}
+		if deps.CAnalysis != nil {
+			registerCAnalysisRoutes(v1, deps.Auth, deps.CAnalysis)
+		}
+		if deps.JavaAnalysis != nil {
+			registerJavaAnalysisRoutes(v1, deps.Auth, deps.JavaAnalysis)
 		}
 		if deps.ManualImageScan != nil {
 			registerManualImageScanRoutes(

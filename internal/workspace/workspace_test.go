@@ -449,6 +449,33 @@ func TestReaperIgnoresValidInstallOwnershipMarkerWithoutUsingBatch(t *testing.T)
 	}
 }
 
+func TestReaperIgnoresArchiveImportWorkspaceNamespace(t *testing.T) {
+	root := t.TempDir()
+	archiveRoot := filepath.Join(root, archiveImportRoot)
+	if err := os.Mkdir(archiveRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	checker := &leaseCheckerStub{active: map[Identity]bool{}}
+	reaper, err := NewReaper(root, checker)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := reaper.Sweep(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Scanned != 0 || report.Removed != 0 || report.Skipped != 0 {
+		t.Fatalf("Sweep() report = %+v", report)
+	}
+	if info, err := os.Lstat(archiveRoot); err != nil || !info.IsDir() {
+		t.Fatalf("archive import workspace namespace changed: %v, %v", info, err)
+	}
+	if len(checker.requests) != 0 {
+		t.Fatalf("lease checker received archive namespace: %+v", checker.requests)
+	}
+}
+
 func TestReaperDiagnosesSymlinkInstallOwnershipMarker(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir()

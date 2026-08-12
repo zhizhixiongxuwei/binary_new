@@ -14,6 +14,19 @@ type Reporter struct {
 	timeout    time.Duration
 	logger     *slog.Logger
 	now        func() time.Time
+	probe      func(context.Context) error
+}
+
+// SetRuntimeProbe makes readiness heartbeats conditional on a live analyzer
+// dependency. A failed probe leaves the existing row untouched so its bounded
+// freshness window closes naturally without coupling container health to the
+// external runtime.
+func (r *Reporter) SetRuntimeProbe(probe func(context.Context) error) error {
+	if probe == nil {
+		return errors.New("worker readiness runtime probe is required")
+	}
+	r.probe = probe
+	return nil
 }
 
 func NewReporter(
@@ -63,7 +76,13 @@ func (r *Reporter) Run(ctx context.Context) {
 			return
 		case <-ticker.C:
 			operationCtx, cancel := context.WithTimeout(ctx, r.timeout)
-			err := r.repository.Heartbeat(operationCtx, r.value.Owner)
+			var err error
+			if r.probe != nil {
+				err = r.probe(operationCtx)
+			}
+			if err == nil {
+				err = r.repository.Heartbeat(operationCtx, r.value.Owner)
+			}
 			cancel()
 			if err != nil && ctx.Err() == nil {
 				r.logger.WarnContext(

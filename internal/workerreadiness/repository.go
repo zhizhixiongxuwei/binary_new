@@ -163,6 +163,14 @@ func validateRegistration(value Registration) error {
 			value.AnalyzerName != "vineflower-cfr-jadx" {
 			return errors.New("bytecode readiness requires a bytecode analyzer identity")
 		}
+	case "c_analysis":
+		if value.AnalyzerName != "binaryscan-c-checker" {
+			return errors.New("C analysis readiness requires the C checker identity")
+		}
+	case "java_analysis":
+		if value.AnalyzerName != "binaryscan-java-checker" {
+			return errors.New("Java analysis readiness requires the Java checker identity")
+		}
 	default:
 		return errors.New("worker readiness kind is invalid")
 	}

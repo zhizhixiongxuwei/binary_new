@@ -115,6 +115,37 @@ func TestWriteJSONSnapshotStreamsCompleteSanitizedSnapshot(t *testing.T) {
 			[]byte(`["https://offline.invalid/CVE-2026-0001"]`),
 			reportTestTime,
 		))
+	mock.ExpectQuery(`(?s)WITH ranked_c_analysis_runs AS.*run[.]deletion_started_at IS NULL.*SELECT id, source_project_id`).
+		WithArgs(testTaskID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "source_project_id", "analyzer_name", "analyzer_version",
+			"status", "source_sha256", "source_size_bytes", "finding_count",
+			"diagnostic_count", "findings_truncated", "diagnostics_truncated",
+			"created_at", "completed_at",
+		}))
+	mock.ExpectQuery(`(?s)WITH ranked_c_analysis_runs AS.*FROM ranked_c_analysis_runs latest.*JOIN c_analysis_findings`).
+		WithArgs(testTaskID, testTaskID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "run_id", "source_project_id", "cwe", "rule_id",
+			"severity", "function_result_id", "function_address",
+			"function_name", "start_line", "start_column", "end_line",
+			"end_column", "message", "snippet", "created_at",
+		}))
+	mock.ExpectQuery(`(?s)WITH ranked_java_analysis_runs AS.*SELECT id, source_project_id`).
+		WithArgs(testTaskID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "source_project_id", "analyzer_name", "analyzer_version",
+			"ruleset_version", "status", "source_manifest_sha256",
+			"input_sha256", "bundle_sha256", "source_size_bytes",
+			"source_file_count", "analyzed_files", "parsed_files",
+			"recovered_files", "failed_files", "finding_count",
+			"diagnostic_count", "low_count", "medium_count", "high_count",
+			"critical_count", "findings_truncated", "diagnostics_truncated",
+			"created_at", "completed_at",
+		}))
+	mock.ExpectQuery(`(?s)WITH ranked_java_analysis_runs AS.*JOIN java_analysis_findings`).
+		WithArgs(testTaskID, testTaskID, maxReportRecords+1).
+		WillReturnRows(javaAnalysisFindingRows(0))
 	mock.ExpectQuery(
 		`(?s)SELECT database_bundle\.id, database_bundle\.version.*`+
 			`FROM trivy_database_bundles`,
@@ -207,7 +238,9 @@ SELECT 'file_node', logical_path,`)).
 	}
 	for _, name := range []string{
 		"fileNodes", "analyzerRuns", "decompileResults",
-		"vulnerabilityFindings", "trivyDatabaseBundles",
+		"vulnerabilityFindings", "cAnalysisRuns", "cAnalysisFindings",
+		"javaAnalysisRuns", "javaAnalysisFindings",
+		"trivyDatabaseBundles",
 		"warnings", "unsupported", "failed",
 	} {
 		if _, ok := value[name].([]any); !ok {
@@ -270,6 +303,188 @@ func TestHTMLVulnerabilityDetailsAreBounded(t *testing.T) {
 			len(values), truncated,
 		)
 	}
+}
+
+func TestJSONCAnalysisFindingsAreNotDetailTruncated(t *testing.T) {
+	repository, mock, cleanup := newReportRepositoryMock(t)
+	defer cleanup()
+	const findingCount = htmlCAnalysisFindingLimit + 1
+	mock.ExpectBegin()
+	mock.ExpectQuery(`(?s)WITH ranked_c_analysis_runs AS.*`+
+		`JOIN c_analysis_findings.*finding[.]id ASC\s*$`).
+		WithArgs(testTaskID, testTaskID).
+		WillReturnRows(cAnalysisFindingRows(findingCount))
+	mock.ExpectRollback()
+
+	transaction, err := repository.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	stream := newJSONStream(&output)
+	stream.raw("{")
+	if err := streamLatestCAnalysisFindings(
+		context.Background(), transaction, testTaskID, stream,
+	); err != nil {
+		t.Fatal(err)
+	}
+	stream.raw("}")
+	if err := transaction.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	var value struct {
+		Findings []cAnalysisFindingSnapshot `json:"cAnalysisFindings"`
+	}
+	if err := json.Unmarshal(output.Bytes(), &value); err != nil {
+		t.Fatalf("decode C-analysis findings: %v\n%s", err, output.Bytes())
+	}
+	if len(value.Findings) != findingCount {
+		t.Fatalf("JSON C-analysis finding count = %d, want %d", len(value.Findings), findingCount)
+	}
+}
+
+func TestHTMLCAnalysisFindingDetailsAreBounded(t *testing.T) {
+	repository, mock, cleanup := newReportRepositoryMock(t)
+	defer cleanup()
+	mock.ExpectBegin()
+	mock.ExpectQuery(`(?s)WITH ranked_c_analysis_runs AS.*`+
+		`JOIN c_analysis_findings.*LIMIT \?`).
+		WithArgs(testTaskID, testTaskID, htmlCAnalysisFindingLimit+1).
+		WillReturnRows(cAnalysisFindingRows(htmlCAnalysisFindingLimit + 1))
+	mock.ExpectRollback()
+
+	transaction, err := repository.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	values, truncated, err := loadHTMLCAnalysisFindings(
+		context.Background(), transaction, testTaskID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := transaction.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if !truncated || len(values) != htmlCAnalysisFindingLimit {
+		t.Fatalf(
+			"HTML C-analysis details = %d, truncated=%v",
+			len(values), truncated,
+		)
+	}
+}
+
+func TestJSONJavaAnalysisFindingsAreGloballyBounded(t *testing.T) {
+	repository, mock, cleanup := newReportRepositoryMock(t)
+	defer cleanup()
+	mock.ExpectBegin()
+	mock.ExpectQuery(`(?s)WITH ranked_java_analysis_runs AS.*`+
+		`JOIN java_analysis_findings.*LIMIT \?`).
+		WithArgs(testTaskID, testTaskID, maxReportRecords+1).
+		WillReturnRows(javaAnalysisFindingRows(maxReportRecords + 1))
+	mock.ExpectRollback()
+
+	transaction, err := repository.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	stream := newJSONStream(&output)
+	stream.raw("{")
+	if err := streamLatestJavaAnalysisFindings(
+		context.Background(), transaction, testTaskID, stream,
+	); err != nil {
+		t.Fatal(err)
+	}
+	stream.raw("}")
+	if err := transaction.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	var value struct {
+		Findings  []javaAnalysisFindingSnapshot `json:"javaAnalysisFindings"`
+		Truncated bool                          `json:"javaAnalysisFindingsTruncated"`
+	}
+	if err := json.Unmarshal(output.Bytes(), &value); err != nil {
+		t.Fatalf("decode Java-analysis findings: %v", err)
+	}
+	if len(value.Findings) != maxReportRecords || !value.Truncated {
+		t.Fatalf(
+			"JSON Java findings = %d, truncated=%v",
+			len(value.Findings), value.Truncated,
+		)
+	}
+}
+
+func TestHTMLJavaAnalysisFindingDetailsAreBounded(t *testing.T) {
+	repository, mock, cleanup := newReportRepositoryMock(t)
+	defer cleanup()
+	mock.ExpectBegin()
+	mock.ExpectQuery(`(?s)WITH ranked_java_analysis_runs AS.*`+
+		`JOIN java_analysis_findings.*LIMIT \?`).
+		WithArgs(testTaskID, testTaskID, htmlJavaAnalysisFindingLimit+1).
+		WillReturnRows(javaAnalysisFindingRows(htmlJavaAnalysisFindingLimit + 1))
+	mock.ExpectRollback()
+
+	transaction, err := repository.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	values, truncated, err := loadHTMLJavaAnalysisFindings(
+		context.Background(), transaction, testTaskID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := transaction.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if len(values) != htmlJavaAnalysisFindingLimit || !truncated {
+		t.Fatalf(
+			"HTML Java findings = %d, truncated=%v",
+			len(values), truncated,
+		)
+	}
+}
+
+func cAnalysisFindingRows(count int) *sqlmock.Rows {
+	rows := sqlmock.NewRows([]string{
+		"id", "run_id", "source_project_id", "cwe", "rule_id",
+		"severity", "function_result_id", "function_address",
+		"function_name", "start_line", "start_column", "end_line",
+		"end_column", "message", "snippet", "created_at",
+	})
+	for index := 0; index < count; index++ {
+		rows.AddRow(
+			index+1, "323e4567-e89b-42d3-a456-426614174002",
+			"923e4567-e89b-42d3-a456-426614174009", "CWE-120",
+			"cwe-120-bounds", "LOW", testReportID, "0x401000",
+			fmt.Sprintf("function_%d", index), index+1, 1, index+1, 8,
+			"bounded copy required", "copy(dst, src)", reportTestTime,
+		)
+	}
+	return rows
+}
+
+func javaAnalysisFindingRows(count int) *sqlmock.Rows {
+	rows := sqlmock.NewRows([]string{
+		"id", "run_id", "source_project_id", "cwe", "rule_id",
+		"severity", "file_result_id", "logical_path", "binary_name",
+		"callable_kind", "type_name", "callable_name", "callable_signature",
+		"start_line", "start_column", "end_line", "end_column", "message",
+		"snippet", "snippet_start_line", "created_at",
+	})
+	for index := 0; index < count; index++ {
+		rows.AddRow(
+			index+1, "323e4567-e89b-42d3-a456-426614174002",
+			"923e4567-e89b-42d3-a456-426614174009", "CWE-89",
+			"java-sql-injection", "HIGH", testReportID,
+			"src/main/java/example/Query.java", "example.Query",
+			"method", "example.Query", "execute", "execute(String)",
+			index+1, 2, index+1, 12, "SQL input reaches execute.",
+			"statement.execute(sql);", index+1, reportTestTime,
+		)
+	}
+	return rows
 }
 
 func TestHTMLDecompileIndexUsesFunctionMetadataWithoutSourceBodies(t *testing.T) {

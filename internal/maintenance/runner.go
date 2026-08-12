@@ -3,21 +3,29 @@ package maintenance
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
+	"binaryscan/internal/decompile"
 	"binaryscan/internal/orphanreaper"
 	reporting "binaryscan/internal/report"
 	"binaryscan/internal/retention"
 	"binaryscan/internal/taskcleanup"
+	"binaryscan/internal/upload"
 	"binaryscan/internal/workspace"
 )
 
 const (
-	recoveryBatchSize     = 100
-	taskDeletionBatchSize = 10
-	retentionBatchSize    = 25
-	orphanSweepBatchSize  = 25
+	recoveryBatchSize                = 100
+	taskDeletionBatchSize            = 10
+	sourceProjectDeletionBatchSize   = 10
+	cAnalysisRunDeletionBatchSize    = 10
+	javaAnalysisRunDeletionBatchSize = 10
+	directTaskRecoveryBatchSize      = 100
+	archiveAssociationBatchSize      = 100
+	retentionBatchSize               = 25
+	orphanSweepBatchSize             = 25
 	// Root-confined recursive removal is not context-cancellable. Limit each
 	// maintenance cycle to one bounded workspace so shutdown can be delayed by
 	// at most one 50 GiB / 100,000-file task tree.
@@ -44,6 +52,10 @@ type TaskDeletionSweeper interface {
 	Sweep(context.Context, int) (taskcleanup.Report, error)
 }
 
+type SourceProjectDeletionSweeper interface {
+	Sweep(context.Context, int) (decompile.SourceProjectDeletionSweepReport, error)
+}
+
 type OrphanSweeper interface {
 	Sweep(context.Context, int) (orphanreaper.Report, error)
 }
@@ -52,30 +64,54 @@ type ReportGenerationRecoverer interface {
 	RecoverExpired(context.Context, int) (int, error)
 }
 
+type CAnalysisRunDeletionRecoverer interface {
+	RecoverPending(context.Context, int) (int, error)
+}
+
+type DirectTaskRecoverer interface {
+	RecoverDirectTasks(context.Context, int) (upload.DirectTaskRecoveryReport, error)
+}
+
+type ArchiveAssociationRecoverer interface {
+	RecoverArchiveImports(context.Context, int) (upload.ArchiveImportRecoveryReport, error)
+}
+
 type RunnerConfig struct {
-	Interval         time.Duration
-	PingTimeout      time.Duration
-	Database         Database
-	Queue            Recoverer
-	ReportGeneration ReportGenerationRecoverer
-	TaskDeletion     TaskDeletionSweeper
-	Retention        RetentionSweeper
-	Orphans          OrphanSweeper
-	Workspace        WorkspaceSweeper
-	Logger           *slog.Logger
+	Interval                time.Duration
+	PingTimeout             time.Duration
+	Database                Database
+	Queue                   Recoverer
+	ArchiveImport           CAnalysisRunDeletionRecoverer
+	ReportGeneration        ReportGenerationRecoverer
+	SourceProjectDeletion   SourceProjectDeletionSweeper
+	CAnalysisRunDeletion    CAnalysisRunDeletionRecoverer
+	JavaAnalysisRunDeletion CAnalysisRunDeletionRecoverer
+	TaskDeletion            TaskDeletionSweeper
+	DirectTaskRecovery      DirectTaskRecoverer
+	ArchiveAssociation      ArchiveAssociationRecoverer
+	Retention               RetentionSweeper
+	Orphans                 OrphanSweeper
+	Workspace               WorkspaceSweeper
+	Logger                  *slog.Logger
 }
 
 type Runner struct {
-	interval         time.Duration
-	pingTimeout      time.Duration
-	database         Database
-	queue            Recoverer
-	reportGeneration ReportGenerationRecoverer
-	taskDeletion     TaskDeletionSweeper
-	retention        RetentionSweeper
-	orphans          OrphanSweeper
-	workspace        WorkspaceSweeper
-	logger           *slog.Logger
+	interval                time.Duration
+	pingTimeout             time.Duration
+	database                Database
+	queue                   Recoverer
+	archiveImport           CAnalysisRunDeletionRecoverer
+	reportGeneration        ReportGenerationRecoverer
+	sourceProjectDeletion   SourceProjectDeletionSweeper
+	cAnalysisRunDeletion    CAnalysisRunDeletionRecoverer
+	javaAnalysisRunDeletion CAnalysisRunDeletionRecoverer
+	taskDeletion            TaskDeletionSweeper
+	directTaskRecovery      DirectTaskRecoverer
+	archiveAssociation      ArchiveAssociationRecoverer
+	retention               RetentionSweeper
+	orphans                 OrphanSweeper
+	workspace               WorkspaceSweeper
+	logger                  *slog.Logger
 }
 
 func NewRunner(config RunnerConfig) (*Runner, error) {
@@ -91,8 +127,20 @@ func NewRunner(config RunnerConfig) (*Runner, error) {
 	if config.Queue == nil {
 		return nil, errors.New("maintenance queue is required")
 	}
+	if config.CAnalysisRunDeletion == nil {
+		return nil, errors.New("maintenance C-analysis run deletion recovery is required")
+	}
+	if config.JavaAnalysisRunDeletion == nil {
+		return nil, errors.New("maintenance Java-analysis run deletion recovery is required")
+	}
 	if config.TaskDeletion == nil {
 		return nil, errors.New("maintenance task deletion sweeper is required")
+	}
+	if config.DirectTaskRecovery == nil {
+		return nil, errors.New("maintenance direct task recovery is required")
+	}
+	if config.ArchiveAssociation == nil {
+		return nil, errors.New("maintenance archive association recovery is required")
 	}
 	if config.Retention == nil {
 		return nil, errors.New("maintenance retention sweeper is required")
@@ -104,16 +152,22 @@ func NewRunner(config RunnerConfig) (*Runner, error) {
 		return nil, errors.New("maintenance logger is required")
 	}
 	return &Runner{
-		interval:         config.Interval,
-		pingTimeout:      config.PingTimeout,
-		database:         config.Database,
-		queue:            config.Queue,
-		reportGeneration: config.ReportGeneration,
-		taskDeletion:     config.TaskDeletion,
-		retention:        config.Retention,
-		orphans:          config.Orphans,
-		workspace:        config.Workspace,
-		logger:           config.Logger,
+		interval:                config.Interval,
+		pingTimeout:             config.PingTimeout,
+		database:                config.Database,
+		queue:                   config.Queue,
+		archiveImport:           config.ArchiveImport,
+		reportGeneration:        config.ReportGeneration,
+		sourceProjectDeletion:   config.SourceProjectDeletion,
+		cAnalysisRunDeletion:    config.CAnalysisRunDeletion,
+		javaAnalysisRunDeletion: config.JavaAnalysisRunDeletion,
+		taskDeletion:            config.TaskDeletion,
+		directTaskRecovery:      config.DirectTaskRecovery,
+		archiveAssociation:      config.ArchiveAssociation,
+		retention:               config.Retention,
+		orphans:                 config.Orphans,
+		workspace:               config.Workspace,
+		logger:                  config.Logger,
 	}, nil
 }
 
@@ -164,6 +218,25 @@ func (r *Runner) recover(parent context.Context) {
 	if parent.Err() != nil {
 		return
 	}
+	if r.archiveImport != nil {
+		recoveredImports, recoveryErr := r.archiveImport.RecoverPending(
+			parent, recoveryBatchSize,
+		)
+		if recoveryErr != nil {
+			if parent.Err() == nil {
+				r.logger.WarnContext(parent, "archive import recovery failed")
+			}
+		} else if recoveredImports > 0 {
+			r.logger.InfoContext(
+				parent,
+				"archive imports recovered",
+				slog.Int("recovered_archive_imports", recoveredImports),
+			)
+		}
+	}
+	if parent.Err() != nil {
+		return
+	}
 	if r.reportGeneration != nil {
 		recoveredReports, reportErr := r.reportGeneration.RecoverExpired(
 			parent, reporting.MaxRecoveryBatch,
@@ -179,6 +252,72 @@ func (r *Runner) recover(parent context.Context) {
 				parent,
 				"expired report generations recovered",
 				slog.Int("recovered_reports", recoveredReports),
+			)
+		}
+	}
+	if parent.Err() != nil {
+		return
+	}
+	if r.sourceProjectDeletion != nil {
+		deletionReport, deletionErr := r.sourceProjectDeletion.Sweep(
+			parent, sourceProjectDeletionBatchSize,
+		)
+		if deletionReport.Claimed > 0 || deletionReport.Completed > 0 ||
+			deletionReport.FilesDeleted > 0 || deletionReport.Deferred > 0 ||
+			deletionReport.Failures > 0 || deletionReport.Conflicts > 0 {
+			r.logger.InfoContext(
+				parent, "source project deletion sweep completed",
+				slog.Int("claimed_operations", deletionReport.Claimed),
+				slog.Int("completed_operations", deletionReport.Completed),
+				slog.Int("deleted_files", deletionReport.FilesDeleted),
+				slog.Int("deferred_operations", deletionReport.Deferred),
+				slog.Int("failed_operations", deletionReport.Failures),
+				slog.Int("conflicts", deletionReport.Conflicts),
+			)
+		}
+		if deletionErr != nil && parent.Err() == nil {
+			r.logger.WarnContext(parent, "source project deletion sweep failed")
+		}
+	}
+	if parent.Err() != nil {
+		return
+	}
+	if r.cAnalysisRunDeletion != nil {
+		recoveredRuns, recoveryErr := r.cAnalysisRunDeletion.RecoverPending(
+			parent, cAnalysisRunDeletionBatchSize,
+		)
+		if recoveryErr != nil {
+			if parent.Err() == nil {
+				r.logger.WarnContext(
+					parent, "pending C-analysis run deletion recovery failed",
+				)
+			}
+		} else if recoveredRuns > 0 {
+			r.logger.InfoContext(
+				parent,
+				"pending C-analysis run deletions recovered",
+				slog.Int("recovered_runs", recoveredRuns),
+			)
+		}
+	}
+	if parent.Err() != nil {
+		return
+	}
+	if r.javaAnalysisRunDeletion != nil {
+		recoveredRuns, recoveryErr := r.javaAnalysisRunDeletion.RecoverPending(
+			parent, javaAnalysisRunDeletionBatchSize,
+		)
+		if recoveryErr != nil {
+			if parent.Err() == nil {
+				r.logger.WarnContext(
+					parent, "pending Java-analysis run deletion recovery failed",
+				)
+			}
+		} else if recoveredRuns > 0 {
+			r.logger.InfoContext(
+				parent,
+				"pending Java-analysis run deletions recovered",
+				slog.Int("recovered_runs", recoveredRuns),
 			)
 		}
 	}
@@ -205,6 +344,45 @@ func (r *Runner) recover(parent context.Context) {
 	}
 	if err != nil && parent.Err() == nil {
 		r.logger.WarnContext(parent, "task deletion sweep failed")
+	}
+	if parent.Err() != nil {
+		return
+	}
+	directTaskReport, directTaskErr := r.directTaskRecovery.RecoverDirectTasks(
+		parent, directTaskRecoveryBatchSize,
+	)
+	if directTaskReport.Candidates > 0 || directTaskReport.Ensured > 0 ||
+		directTaskReport.Failures > 0 || directTaskReport.Wrapped {
+		r.logger.InfoContext(
+			parent,
+			"direct upload task recovery completed",
+			slog.Int("candidates", directTaskReport.Candidates),
+			slog.Int("ensured_tasks", directTaskReport.Ensured),
+			slog.Int("failed_items", directTaskReport.Failures),
+			slog.Bool("cursor_wrapped", directTaskReport.Wrapped),
+		)
+	}
+	if directTaskErr != nil && parent.Err() == nil {
+		r.logger.WarnContext(parent, "direct upload task recovery failed")
+	}
+	if parent.Err() != nil {
+		return
+	}
+	archiveAssociationReport, archiveAssociationErr :=
+		r.archiveAssociation.RecoverArchiveImports(parent, archiveAssociationBatchSize)
+	if archiveAssociationReport.Candidates > 0 || archiveAssociationReport.Ensured > 0 ||
+		archiveAssociationReport.Failures > 0 || archiveAssociationReport.Wrapped {
+		r.logger.InfoContext(
+			parent,
+			"archive upload association recovery completed",
+			slog.Int("candidates", archiveAssociationReport.Candidates),
+			slog.Int("ensured_imports", archiveAssociationReport.Ensured),
+			slog.Int("failed_items", archiveAssociationReport.Failures),
+			slog.Bool("cursor_wrapped", archiveAssociationReport.Wrapped),
+		)
+	}
+	if archiveAssociationErr != nil && parent.Err() == nil {
+		r.logger.WarnContext(parent, "archive upload association recovery failed")
 	}
 	if parent.Err() != nil {
 		return
@@ -272,7 +450,17 @@ func (r *Runner) recover(parent context.Context) {
 			// Candidate paths and storage keys are intentionally excluded here.
 			// Per-item identities remain available through the returned report in
 			// tests, while successful deletions have append-only audit events.
-			r.logger.WarnContext(parent, "orphan reconciliation sweep failed")
+			attributes := make([]any, 0, 6)
+			for index, diagnostic := range orphanReport.Diagnostics {
+				if index == 3 {
+					break
+				}
+				attributes = append(attributes,
+					slog.String(fmt.Sprintf("diagnostic_%d_kind", index+1), diagnostic.Kind),
+					slog.String(fmt.Sprintf("diagnostic_%d_error", index+1), diagnostic.Err.Error()),
+				)
+			}
+			r.logger.WarnContext(parent, "orphan reconciliation sweep failed", attributes...)
 		}
 	}
 	if parent.Err() != nil {

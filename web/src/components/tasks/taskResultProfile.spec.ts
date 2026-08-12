@@ -6,12 +6,33 @@ import {
 } from '@/components/tasks/taskResultProfile'
 
 describe('taskResultProfile', () => {
-  it.each(['pe32+', 'elf64', 'macho-thin', 'java-class', 'jar', 'war', 'apk', 'dex', 'pyc'])(
-    'shows decompile results for %s tasks',
+  it.each(['java-class', 'jar', 'war', 'apk', 'dex'])(
+    'adds Java source analysis for %s tasks',
     (inputType) => {
       expect(taskResultTabsForInputType(inputType)).toEqual([
         'files',
         'decompile',
+        'java-analysis',
+        'reports',
+      ])
+    },
+  )
+
+  it('keeps Python bytecode on the decompile-only result profile', () => {
+    expect(taskResultTabsForInputType('pyc')).toEqual([
+      'files',
+      'decompile',
+      'reports',
+    ])
+  })
+
+  it.each(['pe32+', 'elf64', 'macho-thin'])(
+    'adds C source analysis for native %s tasks',
+    (inputType) => {
+      expect(taskResultTabsForInputType(inputType)).toEqual([
+        'files',
+        'decompile',
+        'c-analysis',
         'reports',
       ])
     },
@@ -33,6 +54,8 @@ describe('taskResultProfile', () => {
     expect(taskResultTabsForInputType('zip')).toEqual([
       'files',
       'decompile',
+      'c-analysis',
+      'java-analysis',
       'vulnerabilities',
       'reports',
     ])

@@ -59,11 +59,7 @@ func run(args []string) error {
 			{name: "/usr/local/bin/binaryscan-web-gateway"},
 		}
 	case "scanner":
-		commands = []commandSpec{
-			{name: "/usr/local/bin/binaryscan-worker", args: []string{"--kind=scan"}},
-			{name: "/usr/local/bin/binaryscan-worker", args: []string{"--kind=image"}},
-			{name: "/usr/local/bin/binaryscan-worker", args: []string{"--kind=trivy"}},
-		}
+		commands = scannerCommands()
 	default:
 		return fmt.Errorf("unknown service %q", args[0])
 	}
@@ -90,7 +86,7 @@ func healthcheck(service string) error {
 		}
 		return nil
 	case "scanner":
-		for _, role := range []string{"scan", "image", "trivy"} {
+		for _, role := range scannerWorkerKinds() {
 			if err := runOnce(commandSpec{
 				name: "/usr/local/bin/binaryscan-worker",
 				args: []string{"healthcheck", "--role", role},
@@ -102,6 +98,25 @@ func healthcheck(service string) error {
 	default:
 		return fmt.Errorf("unknown healthcheck service %q", service)
 	}
+}
+
+func scannerCommands() []commandSpec {
+	roles := scannerWorkerKinds()
+	commands := make([]commandSpec, 0, len(roles)+1)
+	commands = append(commands, commandSpec{
+		name: "/usr/local/bin/binaryscan-archive-sandbox",
+	})
+	for _, role := range roles {
+		commands = append(commands, commandSpec{
+			name: "/usr/local/bin/binaryscan-worker",
+			args: []string{"--kind=" + role},
+		})
+	}
+	return commands
+}
+
+func scannerWorkerKinds() []string {
+	return []string{"scan", "image", "trivy", "c_analysis", "java_analysis", "archive_import"}
 }
 
 func runOnce(spec commandSpec) error {

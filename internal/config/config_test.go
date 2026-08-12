@@ -240,15 +240,17 @@ archive_sandbox:
   socket: /from-file/archive.sock
   input_root: /from-file/input
   output_root: /from-file/output
+  run_root: /from-file/run
   timeout_seconds: 120
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("BINARYSCAN_CONFIG_FILE", configFile)
 	t.Setenv("BINARYSCAN_MYSQL_DSN", testDSN)
-	t.Setenv("BINARYSCAN_ARCHIVE_SOCKET", "/from-env/archive.sock")
+	t.Setenv("BINARYSCAN_ARCHIVE_SOCKET", "/from-socket/archive.sock")
 	t.Setenv("BINARYSCAN_ARCHIVE_INPUT_ROOT", "/from-env/input")
 	t.Setenv("BINARYSCAN_ARCHIVE_OUTPUT_ROOT", "/from-env/output")
+	t.Setenv("BINARYSCAN_ARCHIVE_SANDBOX_RUN_ROOT", "/from-env/run")
 	t.Setenv("BINARYSCAN_ARCHIVE_TIMEOUT", "3m")
 
 	cfg, err := Load("scan-worker")
@@ -256,9 +258,10 @@ archive_sandbox:
 		t.Fatal(err)
 	}
 	if !cfg.ArchiveSandboxEnabled ||
-		cfg.ArchiveSandboxSocket != "/from-env/archive.sock" ||
+		cfg.ArchiveSandboxSocket != "/from-socket/archive.sock" ||
 		cfg.ArchiveSandboxInputRoot != "/from-env/input" ||
 		cfg.ArchiveSandboxOutputRoot != "/from-env/output" ||
+		cfg.ArchiveSandboxRunRoot != "/from-env/run" ||
 		cfg.ArchiveSandboxTimeout != 3*time.Minute {
 		t.Fatalf("archive sandbox environment overrides = %#v", cfg)
 	}
@@ -270,6 +273,7 @@ func TestArchiveSandboxRejectsUnsafeConfiguration(t *testing.T) {
 	t.Setenv("BINARYSCAN_ARCHIVE_SANDBOX_ENABLED", "true")
 	t.Setenv("BINARYSCAN_ARCHIVE_INPUT_ROOT", "/sandbox")
 	t.Setenv("BINARYSCAN_ARCHIVE_OUTPUT_ROOT", "/sandbox/output")
+	t.Setenv("BINARYSCAN_ARCHIVE_SANDBOX_RUN_ROOT", "/sandbox/run")
 	t.Setenv("BINARYSCAN_ARCHIVE_SOCKET", "relative/archive.sock")
 	t.Setenv("BINARYSCAN_ARCHIVE_TIMEOUT", "25h")
 

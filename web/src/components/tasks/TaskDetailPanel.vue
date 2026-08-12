@@ -26,6 +26,7 @@ import type {
   TaskEventMessage,
 } from '@/api/types'
 import StatePanel from '@/components/common/StatePanel.vue'
+import DecompileProjectPanel from '@/components/tasks/decompile-projects/DecompileProjectPanel.vue'
 import FileTreePanel from '@/components/tasks/FileTreePanel.vue'
 import SampleRetentionNotice from '@/components/tasks/SampleRetentionNotice.vue'
 import TaskAnalysisActions from '@/components/tasks/TaskAnalysisActions.vue'
@@ -82,6 +83,18 @@ const LiveDecompileResult =
     ? null
     : defineAsyncComponent(
         () => import('@/components/tasks/results/LiveDecompileResult.vue'),
+      )
+const LiveCAnalysisResult =
+  import.meta.env.VITE_APP_MODE === 'demo'
+    ? null
+    : defineAsyncComponent(
+        () => import('@/components/tasks/c-analysis/CAnalysisWorkspace.vue'),
+      )
+const LiveJavaAnalysisResult =
+  import.meta.env.VITE_APP_MODE === 'demo'
+    ? null
+    : defineAsyncComponent(
+        () => import('@/components/tasks/java-analysis/JavaAnalysisWorkspace.vue'),
       )
 const LiveVulnerabilityResult =
   import.meta.env.VITE_APP_MODE === 'demo'
@@ -142,8 +155,35 @@ const vulnerabilityResultState = shallowRef<TaskResultState>({
 const reportResultState = shallowRef<TaskResultState>({
   status: 'loading',
 })
-const liveDecompileResult = useTemplateRef<{ refresh: () => void }>(
+const cAnalysisResultState = shallowRef<TaskResultState>({
+  status: 'loading',
+})
+const cAnalysisBusy = shallowRef(false)
+const javaAnalysisResultState = shallowRef<TaskResultState>({
+  status: 'loading',
+})
+const javaAnalysisBusy = shallowRef(false)
+const liveDecompileResult = useTemplateRef<{
+  refresh: () => void
+  openResult: (resultId: string) => Promise<boolean>
+}>(
   'liveDecompileResult',
+)
+const liveCAnalysisResult = useTemplateRef<{
+  refresh: () => void
+  startProject: (projectId: string) => Promise<void>
+}>('liveCAnalysisResult')
+const pendingCAnalysisProjectId = shallowRef('')
+const liveJavaAnalysisResult = useTemplateRef<{
+  refresh: () => void
+  startProject: (projectId: string) => Promise<void>
+}>('liveJavaAnalysisResult')
+const pendingJavaAnalysisProject = shallowRef<{
+  taskId: string
+  projectId: string
+}>()
+const decompileProjectPanel = useTemplateRef<{ refresh: () => void }>(
+  'decompileProjectPanel',
 )
 const liveVulnerabilityResult = useTemplateRef<{ refresh: () => void }>(
   'liveVulnerabilityResult',
@@ -210,6 +250,8 @@ const deferredResultStates = computed<TaskResultStates>(() => {
   if (!isDemoMode) {
     return {
       decompile: decompileResultState.value,
+      'c-analysis': cAnalysisResultState.value,
+      'java-analysis': javaAnalysisResultState.value,
       vulnerabilities: vulnerabilityResultState.value,
       reports: reportResultState.value,
     }
@@ -224,6 +266,16 @@ const deferredResultStates = computed<TaskResultStates>(() => {
           title: '该输入类型没有反编译界面样例',
           description: '请选择 PE、ELF、Mach-O、CLASS、PYC、DEX、APK 或 JAR 示例任务查看。',
         },
+    'c-analysis': {
+      status: 'unavailable',
+      title: '界面预览不执行 C 源码检测',
+      description: '连接后端后可对已保存的 Ghidra 类 C 源码项目发起检测。',
+    },
+    'java-analysis': {
+      status: 'unavailable',
+      title: '界面预览不执行 Java 源码检测',
+      description: '连接后端后可对已保存的 Java 源码项目发起检测。',
+    },
     vulnerabilities: CONTAINER_PREVIEW_FORMATS.has(inputType)
       ? { status: 'ready' }
       : {
@@ -241,6 +293,22 @@ const resultCommands = computed<TaskResultCommandStates>(() =>
         'refresh-decompile': {
           enabled: decompileResultState.value.status !== 'loading',
           pending: decompileResultState.value.status === 'loading',
+        },
+        'refresh-c-analysis': {
+          enabled:
+            cAnalysisResultState.value.status !== 'loading' &&
+            !cAnalysisBusy.value,
+          pending:
+            cAnalysisResultState.value.status === 'loading' ||
+            cAnalysisBusy.value,
+        },
+        'refresh-java-analysis': {
+          enabled:
+            javaAnalysisResultState.value.status !== 'loading' &&
+            !javaAnalysisBusy.value,
+          pending:
+            javaAnalysisResultState.value.status === 'loading' ||
+            javaAnalysisBusy.value,
         },
         'refresh-vulnerabilities': {
           enabled: vulnerabilityResultState.value.status !== 'loading',
@@ -421,9 +489,16 @@ function scheduleEventRefresh(): void {
 function handleTaskEvent(message: TaskEventMessage): void {
   const logEntry = collectTaskEvent(message)
   if (logEntry && message.data.type === 'decompile.completed') {
-    void nextTick(() => liveDecompileResult.value?.refresh())
+    void nextTick(() => {
+      liveDecompileResult.value?.refresh()
+      decompileProjectPanel.value?.refresh?.()
+    })
   } else if (logEntry && message.data.type === 'trivy.completed') {
     void nextTick(() => liveVulnerabilityResult.value?.refresh())
+  } else if (logEntry && message.data.type.startsWith('c_analysis.')) {
+    void nextTick(() => liveCAnalysisResult.value?.refresh())
+  } else if (logEntry && message.data.type.startsWith('java_analysis.')) {
+    void nextTick(() => liveJavaAnalysisResult.value?.refresh())
   }
   if (
     !message.data.type.startsWith('task.') &&
@@ -464,10 +539,16 @@ async function load(): Promise<void> {
   resetExecutionLog()
   lifecycleActions.reset()
   decompileResultState.value = { status: 'loading' }
+  cAnalysisResultState.value = { status: 'loading' }
+  cAnalysisBusy.value = false
+  javaAnalysisResultState.value = { status: 'loading' }
+  javaAnalysisBusy.value = false
   vulnerabilityResultState.value = { status: 'loading' }
   reportResultState.value = { status: 'loading' }
   activeResultTab.value = 'files'
   activeDetailTab.value = 'progress'
+  pendingCAnalysisProjectId.value = ''
+  pendingJavaAnalysisProject.value = undefined
   analysisTarget.value = null
   task.value = null
   try {
@@ -527,6 +608,10 @@ function handleResultCommand(command: TaskResultCommand): void {
     liveVulnerabilityResult.value?.refresh()
   } else if (command === 'refresh-reports') {
     liveReportResult.value?.refresh()
+  } else if (command === 'refresh-c-analysis') {
+    liveCAnalysisResult.value?.refresh()
+  } else if (command === 'refresh-java-analysis') {
+    liveJavaAnalysisResult.value?.refresh()
   }
 }
 
@@ -541,7 +626,88 @@ function handleDecompileCompleted(request: FileDecompileRequest): void {
   if (wasActive) {
     void nextTick(() => liveDecompileResult.value?.refresh())
   }
+  void nextTick(() => decompileProjectPanel.value?.refresh?.())
 }
+
+function handleDecompileProjectDeleted(): void {
+  void nextTick(() => liveDecompileResult.value?.refresh())
+  void nextTick(() => liveCAnalysisResult.value?.refresh())
+  void nextTick(() => liveJavaAnalysisResult.value?.refresh())
+}
+
+function handleCAnalysisState(state: TaskResultState): void {
+  cAnalysisResultState.value = state
+}
+
+function handleCAnalysisBusy(busy: boolean): void {
+  cAnalysisBusy.value = busy
+}
+
+async function openCAnalysisSource(resultId: string): Promise<void> {
+  activeResultTab.value = 'decompile'
+  await nextTick()
+  await liveDecompileResult.value?.openResult(resultId)
+}
+
+async function startCAnalysisProject(projectId: string): Promise<void> {
+  pendingCAnalysisProjectId.value = projectId
+  activeDetailTab.value = 'results'
+  activeResultTab.value = 'c-analysis'
+  await nextTick()
+  await startPendingCAnalysisProject()
+}
+
+async function startPendingCAnalysisProject(): Promise<void> {
+  const workspace = liveCAnalysisResult.value
+  const projectId = pendingCAnalysisProjectId.value
+  if (!workspace || !projectId) return
+  pendingCAnalysisProjectId.value = ''
+  await workspace.startProject(projectId)
+}
+
+watch(liveCAnalysisResult, () => {
+  void startPendingCAnalysisProject()
+})
+
+function handleJavaAnalysisState(state: TaskResultState): void {
+  javaAnalysisResultState.value = state
+}
+
+function handleJavaAnalysisBusy(busy: boolean): void {
+  javaAnalysisBusy.value = busy
+}
+
+async function openJavaAnalysisSource(resultId: string): Promise<void> {
+  activeResultTab.value = 'decompile'
+  await nextTick()
+  await liveDecompileResult.value?.openResult(resultId)
+}
+
+async function startJavaAnalysisProject(projectId: string): Promise<void> {
+  if (javaAnalysisBusy.value) return
+  pendingJavaAnalysisProject.value = { taskId: props.taskId, projectId }
+  activeDetailTab.value = 'results'
+  activeResultTab.value = 'java-analysis'
+  await nextTick()
+  await startPendingJavaAnalysisProject()
+}
+
+async function startPendingJavaAnalysisProject(): Promise<void> {
+  const workspace = liveJavaAnalysisResult.value
+  const pending = pendingJavaAnalysisProject.value
+  if (!pending) return
+  if (pending.taskId !== props.taskId) {
+    pendingJavaAnalysisProject.value = undefined
+    return
+  }
+  if (!workspace) return
+  pendingJavaAnalysisProject.value = undefined
+  await workspace.startProject(pending.projectId)
+}
+
+watch(liveJavaAnalysisResult, () => {
+  void startPendingJavaAnalysisProject()
+})
 
 function openAnalysisFiles(): void {
   activeDetailTab.value = 'results'
@@ -663,7 +829,9 @@ function handleReportState(state: TaskResultState): void {
           :commands="resultCommands"
           :visible-tabs="visibleResultTabs"
           :managed-tabs="
-            isDemoMode ? [] : ['decompile', 'vulnerabilities', 'reports']
+            isDemoMode
+              ? []
+              : ['decompile', 'c-analysis', 'java-analysis', 'vulnerabilities', 'reports']
           "
           @command="handleResultCommand"
         >
@@ -694,6 +862,28 @@ function handleReportState(state: TaskResultState): void {
                 @state-change="handleDecompileState"
               />
             </div>
+          </template>
+          <template #c-analysis>
+            <LiveCAnalysisResult
+              v-if="!isDemoMode"
+              ref="liveCAnalysisResult"
+              :task-id="task.id"
+              :user-role="session.user?.role ?? null"
+              @busy-change="handleCAnalysisBusy"
+              @state-change="handleCAnalysisState"
+              @open-source="openCAnalysisSource"
+            />
+          </template>
+          <template #java-analysis>
+            <LiveJavaAnalysisResult
+              v-if="!isDemoMode"
+              ref="liveJavaAnalysisResult"
+              :task-id="task.id"
+              :user-role="session.user?.role ?? null"
+              @busy-change="handleJavaAnalysisBusy"
+              @state-change="handleJavaAnalysisState"
+              @open-source="openJavaAnalysisSource"
+            />
           </template>
           <template #vulnerabilities>
             <DemoVulnerabilityResult
@@ -767,6 +957,17 @@ function handleReportState(state: TaskResultState): void {
             </dl>
           </section>
         </div>
+
+        <DecompileProjectPanel
+          v-if="!isDemoMode"
+          ref="decompileProjectPanel"
+          :task-id="task.id"
+          :user-role="session.user?.role ?? null"
+          :enabled="activeDetailTab === 'information'"
+          @deleted="handleDecompileProjectDeleted"
+          @analyze="startCAnalysisProject"
+          @analyze-java="startJavaAnalysisProject"
+        />
       </template>
     </TaskDetailTabs>
   </div>

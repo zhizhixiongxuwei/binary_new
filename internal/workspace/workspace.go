@@ -39,7 +39,7 @@ var (
 		`^scan-` +
 			`[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}-` +
 			`[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}-` +
-			`[1-9][0-9]*-[1-9][0-9]*-(scan|trivy|image|decompile)-[a-f0-9]{32}$`,
+			`[1-9][0-9]*-[1-9][0-9]*-(scan|trivy|image|decompile|c_analysis|java_analysis)-[a-f0-9]{32}$`,
 	)
 )
 
@@ -58,7 +58,8 @@ func (i Identity) Validate() error {
 		i.TaskAttemptID == 0 ||
 		i.FencingToken == 0 ||
 		(i.Kind != "scan" && i.Kind != "trivy" &&
-			i.Kind != "image" && i.Kind != "decompile") {
+			i.Kind != "image" && i.Kind != "decompile" &&
+			i.Kind != "c_analysis" && i.Kind != "java_analysis") {
 		return ErrInvalidIdentity
 	}
 	return nil

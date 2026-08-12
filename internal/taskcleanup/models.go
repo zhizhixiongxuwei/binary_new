@@ -13,9 +13,10 @@ const (
 type FileKind string
 
 const (
-	FileReport    FileKind = "report"
-	FileArtifact  FileKind = "artifact"
-	FileDecompile FileKind = "decompile"
+	FileReport        FileKind = "report"
+	FileArtifact      FileKind = "artifact"
+	FileDecompile     FileKind = "decompile"
+	FileSourceProject FileKind = "source-project"
 )
 
 type StoredFile struct {

@@ -58,6 +58,19 @@
 
 每个 `files` 数组必须按规范顺序列出文件名、实际 SHA-256 和字节数。所有目录和文件在镜像中必须不可写。`content_sha256` 是按数据库类型排序后，对组件 ID、版本、schema、storage key 和文件元数据计算的固定摘要；实现见 `internal/trivydb/calculatedBundleHash`。
 
+## 归档工具
+
+`BINARYSCAN_ARCHIVE_TOOLS_IMAGE` 固定为 Alpine 3.22.5，并必须同时包含
+libmagic `file` 5.46、libarchive `bsdtar` 3.8.3 和 `7zz` 24.09。最终
+scanner 以该镜像为基础层，只复制产品 worker、supervisor、sandbox 和冻结的
+Trivy 双数据库；归档工具版本在 sandbox 启动时严格校验。
+
+7Z/CAB 工具只通过 scanner 内的短命 fail-closed launcher 执行：无网络、
+`no_new_privs`、Landlock、seccomp 和资源上限均必须成功启用。scanner 仍保持
+UID 10001、只读根文件系统、cap-drop 和 no-network；`/var/lib/binaryscan-archive`
+是 scanner 独占的可清理临时数据挂载，input/output/run 不得放入 tmpfs，也不得
+与 `/data`、Trivy cache 或 socket 目录重叠。
+
 ## Java
 
 `BINARYSCAN_JAVA_RUNTIME_IMAGE` 必须包含：
@@ -79,6 +92,18 @@
 ## MySQL
 
 `BINARYSCAN_MYSQL_IMAGE` 是单独导入的固定 MySQL 镜像。镜像标签和本地 image ID 都必须写入 `images.lock.env`。不得使用 `latest`，不得在检测机上拉取。
+
+## C Checker
+
+`BINARYSCAN_C_CHECKER_BUILDER_IMAGE` 必须包含 Maven 3.9.11、JDK 17，以及 `c-checker/pom.xml` 锁定的全部依赖和构建插件。本镜像由联网制备机通过 `c-checker/Dockerfile.builder` 生成；检测机使用 `--network=none` 和 Maven offline 模式编译。
+
+`BINARYSCAN_C_CHECKER_JRE_IMAGE` 提供最终运行镜像的 JDK 17 JRE。两个镜像都必须在 `images.lock.env` 冻结本地 image ID，并随独立镜像介质交付。最终 `binaryscan/c-checker:0.1.0` 只能包含应用 fat jar、无外部命令依赖的健康探针和法律告知文件；不得包含 Maven cache、源码、数据库、遥测代理、许可证服务器客户端或授权检查。
+
+## Java Checker
+
+`BINARYSCAN_JAVA_CHECKER_BUILDER_IMAGE` 必须包含 Maven 3.9.11、JDK 17，以及 `java-checker/pom.xml` 锁定的 Spring Boot 和 JavaParser Core 全部依赖/构建插件。该镜像由联网制备机使用 `java-checker/Dockerfile.builder` 构建；检测机必须使用 `--network=none` 和 Maven offline 模式编译。
+
+Java checker 与 C checker 共用 `BINARYSCAN_C_CHECKER_JRE_IMAGE` 提供的 JDK 17 JRE，不再引入第二个 JRE 基础镜像。builder 和 JRE 都必须在 `images.lock.env` 冻结本地 image ID。最终 `binaryscan/java-checker:0.1.0` 只能包含应用 fat jar、子 JVM 执行入口、无外部命令依赖的健康探针和法律告知文件；不得包含 Maven cache、项目源码、运行数据、遥测代理、许可证服务器客户端或授权检查。
 
 ## 身份冻结
 

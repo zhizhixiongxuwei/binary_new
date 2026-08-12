@@ -13,10 +13,9 @@ x-product-service: &product-service
   networks:
     - binaryscan
   volumes:
-    - binaryscan-data:/data
-    - ./config/app.yaml:/etc/binaryscan/app.yaml:ro
-  secrets:
-    - mysql_app_password
+    - ${BINARYSCAN_DATA_ROOT:-./runtime/data}/application:/data:z
+    - ./config/app.yaml:/etc/binaryscan/app.yaml:ro,z
+    - ./runtime/secrets/mysql_app_password:/run/secrets/mysql_app_password:ro,z
   environment:
     BINARYSCAN_CONFIG_FILE: /etc/binaryscan/app.yaml
     BINARYSCAN_LOG_LEVEL: ${BINARYSCAN_LOG_LEVEL:-info}
@@ -32,10 +31,9 @@ services:
     networks:
       - binaryscan
     volumes:
-      - mysql-data:/var/lib/mysql
-    secrets:
-      - mysql_root_password
-      - mysql_app_password
+      - ${BINARYSCAN_DATA_ROOT:-./runtime/data}/mysql:/var/lib/mysql:Z
+      - ./runtime/secrets/mysql_root_password:/run/secrets/mysql_root_password:ro,Z
+      - ./runtime/secrets/mysql_app_password:/run/secrets/mysql_app_password:ro,z
     environment:
       MYSQL_DATABASE: binaryscan
       MYSQL_USER: binaryscan
@@ -59,9 +57,11 @@ services:
       - access
     ports:
       - "127.0.0.1:${BINARYSCAN_HTTP_PORT:-8080}:8080"
-    secrets:
-      - mysql_app_password
-      - initial_admin_password
+    volumes:
+      - ${BINARYSCAN_DATA_ROOT:-./runtime/data}/application:/data:z
+      - ./config/app.yaml:/etc/binaryscan/app.yaml:ro,z
+      - ./runtime/secrets/mysql_app_password:/run/secrets/mysql_app_password:ro,z
+      - ./runtime/secrets/initial_admin_password:/run/secrets/initial_admin_password:ro,Z
     environment:
       BINARYSCAN_CONFIG_FILE: /etc/binaryscan/app.yaml
       BINARYSCAN_LOG_LEVEL: ${BINARYSCAN_LOG_LEVEL:-info}
@@ -79,6 +79,20 @@ services:
   scanner:
     <<: *product-service
     image: ${BINARYSCAN_SCANNER_IMAGE:-binaryscan/scanner:0.1.0}
+    environment:
+      BINARYSCAN_CONFIG_FILE: /etc/binaryscan/app.yaml
+      BINARYSCAN_LOG_LEVEL: ${BINARYSCAN_LOG_LEVEL:-info}
+      BINARYSCAN_C_CHECKER_URL: ${BINARYSCAN_C_CHECKER_URL:-http://c-checker:8080}
+      BINARYSCAN_JAVA_CHECKER_URL: ${BINARYSCAN_JAVA_CHECKER_URL:-http://java-checker:8080}
+      BINARYSCAN_ARCHIVE_SANDBOX_RUN_ROOT: /var/lib/binaryscan-archive/run
+    volumes:
+      - ${BINARYSCAN_DATA_ROOT:-./runtime/data}/application:/data:z
+      - ${BINARYSCAN_DATA_ROOT:-./runtime/data}/archive-sandbox:/var/lib/binaryscan-archive:Z
+      - ./config/app.yaml:/etc/binaryscan/app.yaml:ro,z
+      - ./runtime/secrets/mysql_app_password:/run/secrets/mysql_app_password:ro,z
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=512m,mode=1777
+      - /run/binaryscan-archive:rw,nosuid,nodev,noexec,size=16m,mode=0700,uid=10001,gid=10001
     depends_on:
       app:
         condition: service_healthy
@@ -115,19 +129,71 @@ services:
       retries: 6
       start_period: 45s
 
+  c-checker:
+    platform: ${BINARYSCAN_PLATFORM:-linux/amd64}
+    image: ${BINARYSCAN_C_CHECKER_IMAGE:-binaryscan/c-checker:0.1.0}
+    restart: unless-stopped
+    init: true
+    read_only: true
+    user: "10001:10001"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - binaryscan
+    environment:
+      SERVER_PORT: "8080"
+      SPRING_PROFILES_ACTIVE: production
+      JAVA_TOOL_OPTIONS: >-
+        -XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError
+        -Djava.io.tmpdir=/tmp -Duser.timezone=UTC
+    expose:
+      - "8080"
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=256m,mode=1777
+    healthcheck:
+      test: ["CMD", "/opt/binaryscan/bin/c-checker-healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 30s
+    stop_grace_period: 20s
+
+  java-checker:
+    platform: ${BINARYSCAN_PLATFORM:-linux/amd64}
+    image: ${BINARYSCAN_JAVA_CHECKER_IMAGE:-binaryscan/java-checker:0.1.0}
+    restart: unless-stopped
+    init: true
+    read_only: true
+    user: "10001:10001"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 2g
+    pids_limit: 256
+    networks:
+      - binaryscan
+    environment:
+      SERVER_PORT: "8080"
+      SPRING_PROFILES_ACTIVE: production
+      JAVA_TOOL_OPTIONS: >-
+        -Xms64m -Xmx384m -XX:+ExitOnOutOfMemoryError
+        -Djava.io.tmpdir=/tmp -Duser.timezone=UTC
+    expose:
+      - "8080"
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=512m,mode=1777
+    healthcheck:
+      test: ["CMD", "/opt/binaryscan/bin/java-checker-healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 30s
+    stop_grace_period: 20s
+
 networks:
   binaryscan:
     internal: true
   access:
-
-volumes:
-  mysql-data:
-  binaryscan-data:
-
-secrets:
-  mysql_root_password:
-    file: ./runtime/secrets/mysql_root_password
-  mysql_app_password:
-    file: ./runtime/secrets/mysql_app_password
-  initial_admin_password:
-    file: ./runtime/secrets/initial_admin_password

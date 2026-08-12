@@ -19,7 +19,12 @@ storage:
   min_free_bytes: 1073741824
 
 archive_sandbox:
-  enabled: false
+  enabled: true
+  socket: /run/binaryscan-archive/archive.sock
+  input_root: /var/lib/binaryscan-archive/input
+  output_root: /var/lib/binaryscan-archive/output
+  run_root: /var/lib/binaryscan-archive/run
+  timeout_seconds: 1200
 
 trivy:
   executable: /usr/local/bin/trivy
@@ -46,6 +51,22 @@ ghidra:
   max_index_bytes: 33554432
   max_output_bytes: 134217728
   max_functions: 3000
+
+c_analysis:
+  checker_url: http://c-checker:8080
+  checker_version: 0.1.0
+  timeout_seconds: 600
+  max_response_bytes: 33554432
+  max_findings: 10000
+  max_diagnostics: 1000
+
+java_analysis:
+  checker_url: http://java-checker:8080
+  checker_version: 0.1.0
+  timeout_seconds: 600
+  max_response_bytes: 33554432
+  max_findings: 10000
+  max_diagnostics: 1000
 
 queue:
   lease_seconds: 60

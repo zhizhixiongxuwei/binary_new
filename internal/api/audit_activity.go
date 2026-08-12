@@ -17,6 +17,8 @@ type auditedRoute struct {
 	objectType           string
 	param                string
 	skipHandledUserAdmin bool
+	enabled              func(*gin.Context) bool
+	objectID             func(*gin.Context) string
 	metadata             func(*gin.Context) map[string]any
 }
 
@@ -46,6 +48,10 @@ var auditedRoutes = map[string]auditedRoute{
 	},
 	"DELETE /api/v1/uploads/:id": {
 		action: "upload.cancel", objectType: "upload", param: "id",
+	},
+	"POST /api/v1/archive-imports/:id/task-batches": {
+		action: "archive_import.task_batch_create", objectType: "archive_import",
+		param: "id",
 	},
 	"POST /api/v1/tasks": {
 		action: "task.create", objectType: "task",
@@ -93,6 +99,48 @@ var auditedRoutes = map[string]auditedRoute{
 			return metadata
 		},
 	},
+	"POST /api/v1/tasks/:id/decompile-projects/:project_id/c-analysis-runs": {
+		action: "c_analysis.create", objectType: "decompile_project",
+		param: "project_id",
+		metadata: func(c *gin.Context) map[string]any {
+			return map[string]any{"task_id": c.Param("id")}
+		},
+	},
+	"POST /api/v1/tasks/:id/c-analysis-runs/:run_id/cancel": {
+		action: "c_analysis.cancel", objectType: "c_analysis_run",
+		param: "run_id",
+		metadata: func(c *gin.Context) map[string]any {
+			return map[string]any{"task_id": c.Param("id")}
+		},
+	},
+	"DELETE /api/v1/tasks/:id/c-analysis-runs/:run_id": {
+		action: "c_analysis.delete", objectType: "c_analysis_run",
+		param: "run_id",
+		metadata: func(c *gin.Context) map[string]any {
+			return map[string]any{"task_id": c.Param("id")}
+		},
+	},
+	"POST /api/v1/tasks/:id/decompile-projects/:project_id/java-analysis-runs": {
+		action: "java_analysis.create", objectType: "decompile_project",
+		param: "project_id",
+		metadata: func(c *gin.Context) map[string]any {
+			return map[string]any{"task_id": c.Param("id")}
+		},
+	},
+	"POST /api/v1/tasks/:id/java-analysis-runs/:run_id/cancel": {
+		action: "java_analysis.cancel", objectType: "java_analysis_run",
+		param: "run_id",
+		metadata: func(c *gin.Context) map[string]any {
+			return map[string]any{"task_id": c.Param("id")}
+		},
+	},
+	"DELETE /api/v1/tasks/:id/java-analysis-runs/:run_id": {
+		action: "java_analysis.delete", objectType: "java_analysis_run",
+		param: "run_id",
+		metadata: func(c *gin.Context) map[string]any {
+			return map[string]any{"task_id": c.Param("id")}
+		},
+	},
 	"POST /api/v1/tasks/:id/reports": {
 		action: "report.generate", objectType: "task", param: "id",
 	},
@@ -110,6 +158,54 @@ var auditedRoutes = map[string]auditedRoute{
 			}
 			if count, exists := c.Get(decompileSourceExportCountKey); exists {
 				metadata["result_count"] = count
+			}
+			return metadata
+		},
+	},
+	"GET /api/v1/tasks/:id/decompile-projects/:project_id": {
+		action: "decompile.project_export", objectType: "decompile_project",
+		enabled: func(c *gin.Context) bool {
+			return c.GetString(decompileProjectExportAuditIDKey) != ""
+		},
+		objectID: func(c *gin.Context) string {
+			return c.GetString(decompileProjectExportAuditIDKey)
+		},
+		metadata: func(c *gin.Context) map[string]any {
+			metadata := map[string]any{"task_id": c.Param("id")}
+			if count, exists := c.Get(decompileSourceExportCountKey); exists {
+				metadata["result_count"] = count
+			}
+			return metadata
+		},
+	},
+	"DELETE /api/v1/tasks/:id/decompile-projects/:project_id": {
+		action: "decompile.project_delete", objectType: "decompile_project",
+		param: "project_id",
+		metadata: func(c *gin.Context) map[string]any {
+			return map[string]any{"task_id": c.Param("id")}
+		},
+	},
+	"POST /api/v1/tasks/:id/decompile-projects/:project_id/deletion-preview": {
+		action: "decompile.project_delete_preview", objectType: "decompile_project",
+		param: "project_id",
+		metadata: func(c *gin.Context) map[string]any {
+			metadata := map[string]any{"task_id": c.Param("id")}
+			if counts, exists := c.Get(decompileProjectDeletionCountsAuditKey); exists {
+				metadata["impact_counts"] = counts
+			}
+			return metadata
+		},
+	},
+	"POST /api/v1/tasks/:id/decompile-projects/:project_id/deletion": {
+		action: "decompile.project_delete_confirm", objectType: "decompile_project",
+		param: "project_id",
+		metadata: func(c *gin.Context) map[string]any {
+			metadata := map[string]any{"task_id": c.Param("id")}
+			if operationID := c.GetString(decompileProjectDeletionOperationAuditKey); operationID != "" {
+				metadata["operation_id"] = operationID
+			}
+			if counts, exists := c.Get(decompileProjectDeletionCountsAuditKey); exists {
+				metadata["impact_counts"] = counts
 			}
 			return metadata
 		},
@@ -156,6 +252,9 @@ func recordAuditedActivity(
 	if !ok {
 		return
 	}
+	if route.enabled != nil && !route.enabled(c) {
+		return
+	}
 	if route.skipHandledUserAdmin &&
 		c.GetBool(userAdminAuditHandledKey) {
 		return
@@ -186,8 +285,13 @@ func recordAuditedActivity(
 		}
 	}
 	objectID := ""
-	if route.param != "" {
-		rawObjectID := c.Param(route.param)
+	if route.param != "" || route.objectID != nil {
+		rawObjectID := ""
+		if route.objectID != nil {
+			rawObjectID = route.objectID(c)
+		} else {
+			rawObjectID = c.Param(route.param)
+		}
 		if safeAuditObjectID(rawObjectID) {
 			objectID = rawObjectID
 		} else if rawObjectID != "" {

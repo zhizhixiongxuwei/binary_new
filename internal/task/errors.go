@@ -10,4 +10,5 @@ var (
 	ErrInvalidState       = errors.New("task state does not permit the operation")
 	ErrSampleUnavailable  = errors.New("task sample is deleted or expired")
 	ErrUploadNotCompleted = errors.New("upload is not completed")
+	ErrUploadNotEligible  = errors.New("upload intake validation does not permit task creation")
 )

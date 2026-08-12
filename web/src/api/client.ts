@@ -3,16 +3,39 @@ import type {
   AdminUserListQuery,
   AdminUserPage,
   ApiErrorBody,
+  ArchiveImport,
+  ArchiveImportListQuery,
+  ArchiveImportPage,
+  ArchiveImportEntryListQuery,
+  ArchiveImportEntryPage,
+  ArchiveTaskBatchResult,
   AuditLogListQuery,
   AuditLogPage,
   ChangePasswordInput,
+  CAnalysisFindingListQuery,
+  CAnalysisFindingPage,
+  CAnalysisRun,
+  CAnalysisRunListQuery,
+  CAnalysisRunPage,
+  JavaAnalysisFindingListQuery,
+  JavaAnalysisFindingPage,
+  JavaAnalysisRun,
+  JavaAnalysisRunListQuery,
+  JavaAnalysisRunPage,
   CompletedUpload,
   CreatedTask,
+  CreateArchiveTaskBatchInput,
   CreateUploadInput,
   CreateTaskInput,
   CreateAdminUserInput,
   CurrentUser,
   CreateFileDecompileRequestInput,
+  DecompileProject,
+  DecompileProjectDeletionOperation,
+  DecompileProjectDeletionPreview,
+  ConfirmDecompileProjectDeletionInput,
+  DecompileProjectListQuery,
+  DecompileProjectPage,
   DecompileResultListQuery,
   DecompileResultPage,
   DecompileSourceChunk,
@@ -42,11 +65,43 @@ import type {
 } from '@/api/types'
 import type { ApiClient } from '@/api/contract'
 import {
+  ArchiveImportContractError,
+  parseArchiveImport,
+  parseArchiveImportPage,
+  parseArchiveImportEntryPage,
+  parseArchiveTaskBatchResult,
+} from '@/api/archiveImportContract'
+import {
+  CAnalysisContractError,
+  parseCAnalysisFindingPage,
+  parseCAnalysisRun,
+  parseCAnalysisRunPage,
+} from '@/api/cAnalysisContract'
+import {
+  JavaAnalysisContractError,
+  parseJavaAnalysisFindingPage,
+  parseJavaAnalysisRun,
+  parseJavaAnalysisRunPage,
+} from '@/api/javaAnalysisContract'
+import {
+  DecompileProjectContractError,
+  parseDecompileProject,
+  parseDecompileProjectDeletionOperation,
+  parseDecompileProjectDeletionPreview,
+  parseDecompileProjectPage,
+} from '@/api/decompileProjectContract'
+import {
   FileNodeContractError,
   parseFileNodeDetail,
   parseFileNodePage,
 } from '@/api/fileNodeContract'
 import { parseTaskDetail, parseTaskPage } from '@/api/taskContract'
+import {
+  parseCompletedUpload,
+  parseCreatedUploadSession,
+  parseUploadSession,
+  UploadIntakeContractError,
+} from '@/api/uploadIntakeContract'
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? '/api/v1').replace(/\/$/, '')
 const CSRF_COOKIE_NAME = 'binaryscan_csrf'
@@ -143,7 +198,11 @@ export function apiEndpoint(path: string): string {
   return `${API_BASE_URL}${path}`
 }
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+async function request<T>(
+  path: string,
+  init: RequestInit = {},
+  expectedSuccessStatus?: number,
+): Promise<T> {
   const headers = new Headers(init.headers)
   const method = (init.method ?? 'GET').toUpperCase()
   headers.set('Accept', 'application/json')
@@ -178,6 +237,24 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
         retryAfterSeconds: parseRetryAfterSeconds(
           response.headers.get('Retry-After'),
         ),
+      },
+    )
+  }
+
+  if (
+    expectedSuccessStatus !== undefined &&
+    response.status !== expectedSuccessStatus
+  ) {
+    throw new ApiError(
+      `服务端返回了无效状态（HTTP ${response.status}）`,
+      502,
+      {
+        code: 'INVALID_RESPONSE_STATUS',
+        message: '服务端响应状态不符合接口约定',
+        details: {
+          expected_status: expectedSuccessStatus,
+          actual_status: response.status,
+        },
       },
     )
   }
@@ -362,6 +439,230 @@ function buildDecompileResultQuery(query: DecompileResultListQuery): string {
   return value ? `?${value}` : ''
 }
 
+function buildDecompileProjectQuery(query: DecompileProjectListQuery): string {
+  const params = new URLSearchParams()
+  if (query.cursor) params.set('cursor', query.cursor)
+  if (query.page_size !== undefined) params.set('page_size', String(query.page_size))
+  const value = params.toString()
+  return value ? `?${value}` : ''
+}
+
+function invalidDecompileProjectResponse(error: unknown): never {
+  if (!(error instanceof DecompileProjectContractError)) throw error
+  throw new ApiError('反编译源码项目响应不符合接口契约', 502, {
+    code: 'INVALID_DECOMPILE_PROJECT_RESPONSE',
+  })
+}
+
+async function listDecompileProjects(
+  taskId: string,
+  query: DecompileProjectListQuery = {},
+): Promise<DecompileProjectPage> {
+  try {
+    const payload = await request<unknown>(
+      `/tasks/${encodeURIComponent(taskId)}/decompile-projects${buildDecompileProjectQuery(query)}`,
+    )
+    return parseDecompileProjectPage(payload)
+  } catch (error) {
+    return invalidDecompileProjectResponse(error)
+  }
+}
+
+async function getDecompileProject(
+  taskId: string,
+  projectId: string,
+): Promise<DecompileProject> {
+  try {
+    const payload = await request<unknown>(
+      `/tasks/${encodeURIComponent(taskId)}/decompile-projects/${encodeURIComponent(projectId)}`,
+    )
+    return parseDecompileProject(payload)
+  } catch (error) {
+    return invalidDecompileProjectResponse(error)
+  }
+}
+
+function invalidCAnalysisResponse(error: unknown): never {
+  if (!(error instanceof CAnalysisContractError)) throw error
+  throw new ApiError('C 源码检测响应不符合接口契约', 502, {
+    code: 'INVALID_C_ANALYSIS_RESPONSE',
+  })
+}
+
+function buildCAnalysisRunQuery(query: CAnalysisRunListQuery): string {
+  const params = new URLSearchParams()
+  if (query.project_id) params.set('project_id', query.project_id)
+  if (query.cursor) params.set('cursor', query.cursor)
+  if (query.page_size !== undefined) params.set('page_size', String(query.page_size))
+  const value = params.toString()
+  return value ? `?${value}` : ''
+}
+
+function buildCAnalysisFindingQuery(query: CAnalysisFindingListQuery): string {
+  const params = new URLSearchParams()
+  if (query.cursor) params.set('cursor', query.cursor)
+  if (query.page_size !== undefined) params.set('page_size', String(query.page_size))
+  if (query.cwe) params.set('cwe', query.cwe)
+  if (query.severity) params.set('severity', query.severity)
+  if (query.function) params.set('function', query.function)
+  const value = params.toString()
+  return value ? `?${value}` : ''
+}
+
+async function createCAnalysisRun(
+  taskId: string,
+  projectId: string,
+  idempotencyKey: string,
+): Promise<CAnalysisRun> {
+  try {
+    const payload = await request<unknown>(
+      `/tasks/${encodeURIComponent(taskId)}/decompile-projects/${encodeURIComponent(projectId)}/c-analysis-runs`,
+      {
+        method: 'POST',
+        headers: { 'Idempotency-Key': idempotencyKey },
+      },
+    )
+    return parseCAnalysisRun(payload)
+  } catch (error) {
+    return invalidCAnalysisResponse(error)
+  }
+}
+
+async function listCAnalysisRuns(
+  taskId: string,
+  query: CAnalysisRunListQuery = {},
+): Promise<CAnalysisRunPage> {
+  try {
+    const payload = await request<unknown>(
+      `/tasks/${encodeURIComponent(taskId)}/c-analysis-runs${buildCAnalysisRunQuery(query)}`,
+    )
+    return parseCAnalysisRunPage(payload)
+  } catch (error) {
+    return invalidCAnalysisResponse(error)
+  }
+}
+
+async function getCAnalysisRun(
+  taskId: string,
+  runId: string,
+): Promise<CAnalysisRun> {
+  try {
+    const payload = await request<unknown>(
+      `/tasks/${encodeURIComponent(taskId)}/c-analysis-runs/${encodeURIComponent(runId)}`,
+    )
+    return parseCAnalysisRun(payload)
+  } catch (error) {
+    return invalidCAnalysisResponse(error)
+  }
+}
+
+async function listCAnalysisFindings(
+  taskId: string,
+  runId: string,
+  query: CAnalysisFindingListQuery = {},
+): Promise<CAnalysisFindingPage> {
+  try {
+    const payload = await request<unknown>(
+      `/tasks/${encodeURIComponent(taskId)}/c-analysis-runs/${encodeURIComponent(runId)}/findings${buildCAnalysisFindingQuery(query)}`,
+    )
+    return parseCAnalysisFindingPage(payload)
+  } catch (error) {
+    return invalidCAnalysisResponse(error)
+  }
+}
+
+function invalidJavaAnalysisResponse(error: unknown): never {
+  if (!(error instanceof JavaAnalysisContractError)) throw error
+  throw new ApiError('Java 源码检测响应不符合接口契约', 502, {
+    code: 'INVALID_JAVA_ANALYSIS_RESPONSE',
+  })
+}
+
+function buildJavaAnalysisRunQuery(query: JavaAnalysisRunListQuery): string {
+  const params = new URLSearchParams()
+  if (query.project_id) params.set('project_id', query.project_id)
+  if (query.cursor) params.set('cursor', query.cursor)
+  if (query.page_size !== undefined) params.set('page_size', String(query.page_size))
+  const value = params.toString()
+  return value ? `?${value}` : ''
+}
+
+function buildJavaAnalysisFindingQuery(
+  query: JavaAnalysisFindingListQuery,
+): string {
+  const params = new URLSearchParams()
+  if (query.cursor) params.set('cursor', query.cursor)
+  if (query.page_size !== undefined) params.set('page_size', String(query.page_size))
+  if (query.cwe) params.set('cwe', query.cwe)
+  if (query.severity) params.set('severity', query.severity)
+  if (query.file) params.set('file', query.file)
+  if (query.callable) params.set('callable', query.callable)
+  const value = params.toString()
+  return value ? `?${value}` : ''
+}
+
+async function createJavaAnalysisRun(
+  taskId: string,
+  projectId: string,
+  idempotencyKey: string,
+): Promise<JavaAnalysisRun> {
+  try {
+    const payload = await request<unknown>(
+      `/tasks/${encodeURIComponent(taskId)}/decompile-projects/${encodeURIComponent(projectId)}/java-analysis-runs`,
+      {
+        method: 'POST',
+        headers: { 'Idempotency-Key': idempotencyKey },
+      },
+    )
+    return parseJavaAnalysisRun(payload)
+  } catch (error) {
+    return invalidJavaAnalysisResponse(error)
+  }
+}
+
+async function listJavaAnalysisRuns(
+  taskId: string,
+  query: JavaAnalysisRunListQuery = {},
+): Promise<JavaAnalysisRunPage> {
+  try {
+    const payload = await request<unknown>(
+      `/tasks/${encodeURIComponent(taskId)}/java-analysis-runs${buildJavaAnalysisRunQuery(query)}`,
+    )
+    return parseJavaAnalysisRunPage(payload)
+  } catch (error) {
+    return invalidJavaAnalysisResponse(error)
+  }
+}
+
+async function getJavaAnalysisRun(
+  taskId: string,
+  runId: string,
+): Promise<JavaAnalysisRun> {
+  try {
+    const payload = await request<unknown>(
+      `/tasks/${encodeURIComponent(taskId)}/java-analysis-runs/${encodeURIComponent(runId)}`,
+    )
+    return parseJavaAnalysisRun(payload)
+  } catch (error) {
+    return invalidJavaAnalysisResponse(error)
+  }
+}
+
+async function listJavaAnalysisFindings(
+  taskId: string,
+  runId: string,
+  query: JavaAnalysisFindingListQuery = {},
+): Promise<JavaAnalysisFindingPage> {
+  try {
+    const payload = await request<unknown>(
+      `/tasks/${encodeURIComponent(taskId)}/java-analysis-runs/${encodeURIComponent(runId)}/findings${buildJavaAnalysisFindingQuery(query)}`,
+    )
+    return parseJavaAnalysisFindingPage(payload)
+  } catch (error) {
+    return invalidJavaAnalysisResponse(error)
+  }
+}
+
 function buildDecompileSourceQuery(query: DecompileSourceQuery): string {
   const params = new URLSearchParams()
   if (query.offset !== undefined) params.set('offset', String(query.offset))
@@ -399,6 +700,145 @@ function buildCursorQuery(
   }
   const value = params.toString()
   return value ? `?${value}` : ''
+}
+
+function buildArchiveEntryQuery(query: ArchiveImportEntryListQuery): string {
+  const params = new URLSearchParams()
+  if (query.filter && query.filter !== 'all') params.set('filter', query.filter)
+  if (query.cursor) params.set('cursor', query.cursor)
+  if (query.page_size !== undefined) params.set('page_size', String(query.page_size))
+  const value = params.toString()
+  return value ? `?${value}` : ''
+}
+
+function buildArchiveImportQuery(query: ArchiveImportListQuery): string {
+  const params = new URLSearchParams()
+  if (query.cursor) params.set('cursor', query.cursor)
+  if (query.page_size !== undefined) params.set('page_size', String(query.page_size))
+  const value = params.toString()
+  return value ? `?${value}` : ''
+}
+
+function invalidUploadIntakeResponse(error: unknown): never {
+  if (!(error instanceof UploadIntakeContractError)) throw error
+  throw new ApiError('上传响应不符合接口契约', 502, {
+    code: 'INVALID_UPLOAD_RESPONSE',
+  })
+}
+
+function invalidArchiveImportResponse(error: unknown): never {
+  if (!(error instanceof ArchiveImportContractError)) throw error
+  throw new ApiError('归档导入响应不符合接口契约', 502, {
+    code: 'INVALID_ARCHIVE_IMPORT_RESPONSE',
+  })
+}
+
+async function createUpload(
+  input: CreateUploadInput,
+  idempotencyKey: string,
+): Promise<UploadSession> {
+  try {
+    return parseCreatedUploadSession(
+      await request<unknown>('/uploads', {
+        method: 'POST',
+        body: JSON.stringify(input),
+        headers: { 'Idempotency-Key': idempotencyKey },
+      }),
+      input.input_category,
+    )
+  } catch (error) {
+    return invalidUploadIntakeResponse(error)
+  }
+}
+
+async function getUpload(uploadId: string): Promise<UploadSession> {
+  try {
+    return parseUploadSession(
+      await request<unknown>(`/uploads/${encodeURIComponent(uploadId)}`),
+      uploadId,
+    )
+  } catch (error) {
+    return invalidUploadIntakeResponse(error)
+  }
+}
+
+async function completeUpload(uploadId: string): Promise<CompletedUpload> {
+  try {
+    return parseCompletedUpload(
+      await request<unknown>(
+        `/uploads/${encodeURIComponent(uploadId)}/complete`,
+        { method: 'POST' },
+      ),
+      uploadId,
+    )
+  } catch (error) {
+    return invalidUploadIntakeResponse(error)
+  }
+}
+
+async function listArchiveImports(
+  query: ArchiveImportListQuery = {},
+): Promise<ArchiveImportPage> {
+  try {
+    return parseArchiveImportPage(
+      await request<unknown>(`/archive-imports${buildArchiveImportQuery(query)}`),
+    )
+  } catch (error) {
+    return invalidArchiveImportResponse(error)
+  }
+}
+
+async function getArchiveImport(importId: string): Promise<ArchiveImport> {
+  try {
+    const parsed = parseArchiveImport(
+      await request<unknown>(
+        `/archive-imports/${encodeURIComponent(importId)}`,
+      ),
+    )
+    if (parsed.id !== importId) {
+      throw new ArchiveImportContractError('data.id')
+    }
+    return parsed
+  } catch (error) {
+    return invalidArchiveImportResponse(error)
+  }
+}
+
+async function listArchiveImportEntries(
+  importId: string,
+  query: ArchiveImportEntryListQuery = {},
+): Promise<ArchiveImportEntryPage> {
+  try {
+    return parseArchiveImportEntryPage(
+      await request<unknown>(
+        `/archive-imports/${encodeURIComponent(importId)}/entries${buildArchiveEntryQuery(query)}`,
+      ),
+    )
+  } catch (error) {
+    return invalidArchiveImportResponse(error)
+  }
+}
+
+async function createArchiveTaskBatch(
+  importId: string,
+  input: CreateArchiveTaskBatchInput,
+  idempotencyKey: string,
+): Promise<ArchiveTaskBatchResult> {
+  try {
+    return parseArchiveTaskBatchResult(
+      await request<unknown>(
+        `/archive-imports/${encodeURIComponent(importId)}/task-batches`,
+        {
+          method: 'POST',
+          body: JSON.stringify(input),
+          headers: { 'Idempotency-Key': idempotencyKey },
+        },
+      ),
+      input.entry_ids,
+    )
+  } catch (error) {
+    return invalidArchiveImportResponse(error)
+  }
 }
 
 async function changePassword(input: ChangePasswordInput): Promise<CurrentUser> {
@@ -472,6 +912,101 @@ export const httpApi: ApiClient = {
   getFileDecompileRequest: (taskId: string, jobId: string) =>
     request<FileDecompileRequest>(
       `/tasks/${encodeURIComponent(taskId)}/decompile-jobs/${encodeURIComponent(jobId)}`,
+    ),
+  listDecompileProjects,
+  getDecompileProject,
+  downloadDecompileProject: (taskId: string, projectId: string) =>
+    Promise.resolve(
+      sameOriginReportDownload(
+        `/tasks/${encodeURIComponent(taskId)}/decompile-projects/${encodeURIComponent(projectId)}.zip`,
+      ),
+    ),
+  deleteDecompileProject: (taskId: string, projectId: string) =>
+    request<void>(
+      `/tasks/${encodeURIComponent(taskId)}/decompile-projects/${encodeURIComponent(projectId)}`,
+      { method: 'DELETE' },
+    ),
+  previewDecompileProjectDeletion: async (
+    taskId: string,
+    projectId: string,
+  ): Promise<DecompileProjectDeletionPreview> => {
+    try {
+      const payload = await request<unknown>(
+        `/tasks/${encodeURIComponent(taskId)}/decompile-projects/${encodeURIComponent(projectId)}/deletion-preview`,
+        { method: 'POST' },
+      )
+      return parseDecompileProjectDeletionPreview(payload)
+    } catch (error) {
+      return invalidDecompileProjectResponse(error)
+    }
+  },
+  confirmDecompileProjectDeletion: async (
+    taskId: string,
+    projectId: string,
+    input: ConfirmDecompileProjectDeletionInput,
+  ): Promise<DecompileProjectDeletionOperation> => {
+    try {
+      const payload = await request<unknown>(
+        `/tasks/${encodeURIComponent(taskId)}/decompile-projects/${encodeURIComponent(projectId)}/deletion`,
+        { method: 'POST', body: JSON.stringify(input) },
+      )
+      return parseDecompileProjectDeletionOperation(payload)
+    } catch (error) {
+      return invalidDecompileProjectResponse(error)
+    }
+  },
+  getDecompileProjectDeletion: async (
+    taskId: string,
+    operationId: string,
+  ): Promise<DecompileProjectDeletionOperation> => {
+    try {
+      const payload = await request<unknown>(
+        `/tasks/${encodeURIComponent(taskId)}/decompile-project-deletions/${encodeURIComponent(operationId)}`,
+      )
+      return parseDecompileProjectDeletionOperation(payload)
+    } catch (error) {
+      return invalidDecompileProjectResponse(error)
+    }
+  },
+  createCAnalysisRun,
+  listCAnalysisRuns,
+  getCAnalysisRun,
+  listCAnalysisFindings,
+  cancelCAnalysisRun: async (taskId: string, runId: string) => {
+    try {
+      const payload = await request<unknown>(
+        `/tasks/${encodeURIComponent(taskId)}/c-analysis-runs/${encodeURIComponent(runId)}/cancel`,
+        { method: 'POST' },
+      )
+      return parseCAnalysisRun(payload)
+    } catch (error) {
+      return invalidCAnalysisResponse(error)
+    }
+  },
+  deleteCAnalysisRun: (taskId: string, runId: string) =>
+    request<void>(
+      `/tasks/${encodeURIComponent(taskId)}/c-analysis-runs/${encodeURIComponent(runId)}`,
+      { method: 'DELETE' },
+    ),
+  createJavaAnalysisRun,
+  listJavaAnalysisRuns,
+  getJavaAnalysisRun,
+  listJavaAnalysisFindings,
+  cancelJavaAnalysisRun: async (taskId: string, runId: string) => {
+    try {
+      const payload = await request<unknown>(
+        `/tasks/${encodeURIComponent(taskId)}/java-analysis-runs/${encodeURIComponent(runId)}/cancel`,
+        { method: 'POST' },
+      )
+      return parseJavaAnalysisRun(payload)
+    } catch (error) {
+      return invalidJavaAnalysisResponse(error)
+    }
+  },
+  deleteJavaAnalysisRun: (taskId: string, runId: string) =>
+    request<void>(
+      `/tasks/${encodeURIComponent(taskId)}/java-analysis-runs/${encodeURIComponent(runId)}`,
+      { method: 'DELETE' },
     ),
   createManualImageScanRequest: (
     taskId: string,
@@ -582,16 +1117,8 @@ export const httpApi: ApiClient = {
     ),
   listAuditLogs: (query: AuditLogListQuery = {}) =>
     request<AuditLogPage>(`/admin/audit-logs${buildCursorQuery(query)}`),
-  createUpload: (input: CreateUploadInput, idempotencyKey: string) =>
-    request<UploadSession>('/uploads', {
-      method: 'POST',
-      body: JSON.stringify(input),
-      headers: {
-        'Idempotency-Key': idempotencyKey,
-      },
-    }),
-  getUpload: (uploadId: string) =>
-    request<UploadSession>(`/uploads/${encodeURIComponent(uploadId)}`),
+  createUpload,
+  getUpload,
   uploadPart: (uploadId: string, input: UploadPartInput) =>
     request<void>(`/uploads/${encodeURIComponent(uploadId)}/parts/${input.part_number}`, {
       method: 'PUT',
@@ -602,14 +1129,15 @@ export const httpApi: ApiClient = {
         'X-Chunk-SHA256': input.sha256.toLowerCase(),
       },
     }),
-  completeUpload: (uploadId: string) =>
-    request<CompletedUpload>(`/uploads/${encodeURIComponent(uploadId)}/complete`, {
-      method: 'POST',
-    }),
+  completeUpload,
   deleteUpload: (uploadId: string) =>
     request<void>(`/uploads/${encodeURIComponent(uploadId)}`, {
       method: 'DELETE',
-    }),
+    }, 204),
+  listArchiveImports,
+  getArchiveImport,
+  listArchiveImportEntries,
+  createArchiveTaskBatch,
   createTask: (input: CreateTaskInput, idempotencyKey: string) =>
     request<CreatedTask>('/tasks', {
       method: 'POST',
@@ -658,6 +1186,44 @@ export const api: ApiClient = {
     ),
   getFileDecompileRequest: (taskId, jobId) =>
     activeApi.getFileDecompileRequest(taskId, jobId),
+  listDecompileProjects: (taskId, query) =>
+    activeApi.listDecompileProjects(taskId, query),
+  getDecompileProject: (taskId, projectId) =>
+    activeApi.getDecompileProject(taskId, projectId),
+  downloadDecompileProject: (taskId, projectId) =>
+    activeApi.downloadDecompileProject(taskId, projectId),
+  deleteDecompileProject: (taskId, projectId) =>
+    activeApi.deleteDecompileProject(taskId, projectId),
+  previewDecompileProjectDeletion: (taskId, projectId) =>
+    activeApi.previewDecompileProjectDeletion(taskId, projectId),
+  confirmDecompileProjectDeletion: (taskId, projectId, input) =>
+    activeApi.confirmDecompileProjectDeletion(taskId, projectId, input),
+  getDecompileProjectDeletion: (taskId, operationId) =>
+    activeApi.getDecompileProjectDeletion(taskId, operationId),
+  createCAnalysisRun: (taskId, projectId, idempotencyKey) =>
+    activeApi.createCAnalysisRun(taskId, projectId, idempotencyKey),
+  listCAnalysisRuns: (taskId, query) =>
+    activeApi.listCAnalysisRuns(taskId, query),
+  getCAnalysisRun: (taskId, runId) =>
+    activeApi.getCAnalysisRun(taskId, runId),
+  listCAnalysisFindings: (taskId, runId, query) =>
+    activeApi.listCAnalysisFindings(taskId, runId, query),
+  cancelCAnalysisRun: (taskId, runId) =>
+    activeApi.cancelCAnalysisRun(taskId, runId),
+  deleteCAnalysisRun: (taskId, runId) =>
+    activeApi.deleteCAnalysisRun(taskId, runId),
+  createJavaAnalysisRun: (taskId, projectId, idempotencyKey) =>
+    activeApi.createJavaAnalysisRun(taskId, projectId, idempotencyKey),
+  listJavaAnalysisRuns: (taskId, query) =>
+    activeApi.listJavaAnalysisRuns(taskId, query),
+  getJavaAnalysisRun: (taskId, runId) =>
+    activeApi.getJavaAnalysisRun(taskId, runId),
+  listJavaAnalysisFindings: (taskId, runId, query) =>
+    activeApi.listJavaAnalysisFindings(taskId, runId, query),
+  cancelJavaAnalysisRun: (taskId, runId) =>
+    activeApi.cancelJavaAnalysisRun(taskId, runId),
+  deleteJavaAnalysisRun: (taskId, runId) =>
+    activeApi.deleteJavaAnalysisRun(taskId, runId),
   createManualImageScanRequest: (taskId, fileId, idempotencyKey) =>
     activeApi.createManualImageScanRequest(
       taskId,
@@ -692,5 +1258,11 @@ export const api: ApiClient = {
   uploadPart: (uploadId, input) => activeApi.uploadPart(uploadId, input),
   completeUpload: (uploadId) => activeApi.completeUpload(uploadId),
   deleteUpload: (uploadId) => activeApi.deleteUpload(uploadId),
+  listArchiveImports: (query) => activeApi.listArchiveImports(query),
+  getArchiveImport: (importId) => activeApi.getArchiveImport(importId),
+  listArchiveImportEntries: (importId, query) =>
+    activeApi.listArchiveImportEntries(importId, query),
+  createArchiveTaskBatch: (importId, input, idempotencyKey) =>
+    activeApi.createArchiveTaskBatch(importId, input, idempotencyKey),
   createTask: (input, idempotencyKey) => activeApi.createTask(input, idempotencyKey),
 }

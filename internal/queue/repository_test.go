@@ -129,6 +129,20 @@ func TestClaimResourceRequirementsSeparateNativeFamily(t *testing.T) {
 	}
 }
 
+func TestJavaAnalysisUsesTheSingleGlobalHeavySlot(t *testing.T) {
+	requirements, err := claimResourceRequirements(claimRequest{
+		Kind: KindJavaAnalysis, HeavySlotLimit: 2,
+		TrivySlotLimit: 1, NativeSlotLimit: 1,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(requirements) != 1 || requirements[0].pool != resourcePoolGlobal ||
+		requirements[0].limit != 1 {
+		t.Fatalf("Java analysis resource requirements = %#v", requirements)
+	}
+}
+
 func TestConfigureResourceLimitsInitializesOnlyFreshDatabase(t *testing.T) {
 	t.Run("accepts current single-slot baseline", func(t *testing.T) {
 		db, mock, err := sqlmock.New()
@@ -281,6 +295,8 @@ func TestClaimUsesSkipLockedAndAdvancesBothFences(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"heavy_slots", "trivy_slots", "native_slots", "generation",
 		}).AddRow(2, 1, 1, 1))
+	mock.ExpectQuery(`(?s)SELECT EXISTS.*FROM archive_imports.*status = 'running'`).
+		WillReturnRows(sqlmock.NewRows([]string{"running"}).AddRow(false))
 	mock.ExpectQuery(`(?s)SELECT slot_number.*FROM job_resource_slots FORCE INDEX \(PRIMARY\).*pool = \?.*slot_number <= \?.*job_id IS NULL.*FOR UPDATE SKIP LOCKED`).
 		WithArgs(resourcePoolGlobal, 2).
 		WillReturnRows(sqlmock.NewRows([]string{"slot_number"}).AddRow(1))
@@ -372,6 +388,8 @@ func TestTrivyClaimRollsBackWhenDedicatedSlotIsUnavailable(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"heavy_slots", "trivy_slots", "native_slots", "generation",
 		}).AddRow(2, 1, 1, 1))
+	mock.ExpectQuery(`(?s)SELECT EXISTS.*FROM archive_imports.*status = 'running'`).
+		WillReturnRows(sqlmock.NewRows([]string{"running"}).AddRow(false))
 	mock.ExpectQuery(`(?s)SELECT slot_number.*pool = \?.*job_id IS NULL.*FOR UPDATE SKIP LOCKED`).
 		WithArgs(resourcePoolGlobal, 2).
 		WillReturnRows(sqlmock.NewRows([]string{"slot_number"}).AddRow(1))
@@ -482,6 +500,8 @@ func TestClaimNativeDecompileUsesGlobalAndNativeSlots(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"heavy_slots", "trivy_slots", "native_slots", "generation",
 		}).AddRow(2, 1, 1, 1))
+	mock.ExpectQuery(`(?s)SELECT EXISTS.*FROM archive_imports.*status = 'running'`).
+		WillReturnRows(sqlmock.NewRows([]string{"running"}).AddRow(false))
 	mock.ExpectQuery(`(?s)SELECT slot_number.*pool = \?.*job_id IS NULL.*FOR UPDATE SKIP LOCKED`).
 		WithArgs(resourcePoolGlobal, 2).
 		WillReturnRows(sqlmock.NewRows([]string{"slot_number"}).AddRow(1))
@@ -619,6 +639,30 @@ func TestStartDecompileRevalidatesRetentionBeforeJobMutation(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+}
+
+func TestStartCAnalysisTreatsConcurrentCancellationAsLeaseLoss(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := NewMySQLRepository(db)
+	lease := testLease()
+	lease.Kind = KindCAnalysis
+	mock.ExpectBegin()
+	mock.ExpectQuery(`(?s)SELECT 1.*FROM jobs job.*job.kind = 'c_analysis'.*FOR UPDATE`).
+		WithArgs(testJobID, testTaskID, testOwner, uint64(2)).
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectRollback()
+
+	err = repository.Start(context.Background(), lease)
+	if !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("Start() error = %v, want ErrLeaseLost", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestStartScanTransitionsJobAttemptAndTaskAtomically(t *testing.T) {
@@ -786,7 +830,7 @@ func TestWorkspaceLeaseActiveUsesExactFenceWithoutUnsafeEarlyPredicates(t *testi
 			// An exact fenced lease in an active state remains conservatively
 			// active even when lease_until looks stale or cancellation was
 			// requested. Neither event synchronously stops a running worker.
-			mock.ExpectQuery(`(?s)SELECT EXISTS.*FROM jobs job.*JOIN task_attempts attempt.*job\.task_attempt_id = \?.*job\.kind = \?.*job\.fencing_token = \?.*status IN \('leased', 'running', 'cancel_requested'\).*job\.kind IN \('decompile', 'image'\)\s+OR attempt\.fencing_token = \?`).
+			mock.ExpectQuery(`(?s)SELECT EXISTS.*FROM jobs job.*JOIN task_attempts attempt.*job\.task_attempt_id = \?.*job\.kind = \?.*job\.fencing_token = \?.*status IN \('leased', 'running', 'cancel_requested'\).*job\.kind IN \('decompile', 'image', 'c_analysis', 'java_analysis'\)\s+OR attempt\.fencing_token = \?`).
 				WithArgs(
 					testJobID, testTaskID, uint64(19),
 					KindScan, uint64(2), uint64(2),
@@ -1339,6 +1383,332 @@ func TestRecoverExpiredRequeuesBeforeMaximumAttempt(t *testing.T) {
 	}
 }
 
+func TestRecoverExpiredQuarantinesPoisonAndContinuesPage(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := NewMySQLRepository(db)
+	poisonID := "223e4567-e89b-42d3-a456-426614174000"
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`(?s)SELECT id, task_id, task_attempt_id, kind, attempt, max_attempts, fencing_token.*FOR UPDATE SKIP LOCKED`).
+		WithArgs(10).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "task_id", "task_attempt_id", "kind",
+			"attempt", "max_attempts", "fencing_token", "status",
+		}).AddRow(
+			poisonID, testTaskID, nil, "decompile", 1, 3, 2, "running",
+		).AddRow(
+			testJobID, testTaskID, nil, "image", 1, 3, 3, "running",
+		))
+	mock.ExpectExec(`SAVEPOINT recover_expired_job`).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`(?s)UPDATE jobs.*status = 'queued'.*lease_until <= UTC_TIMESTAMP`).
+		WithArgs(int64(0), poisonID, uint64(2)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(`(?s)SELECT payload.*FROM jobs.*FOR UPDATE`).
+		WithArgs(poisonID, uint64(2)).
+		WillReturnRows(sqlmock.NewRows([]string{"payload"}).AddRow([]byte(`{}`)))
+	mock.ExpectExec(`ROLLBACK TO SAVEPOINT recover_expired_job`).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`(?s)UPDATE jobs.*lease_recovery_inconsistent`).
+		WithArgs(poisonID, uint64(2)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`(?s)UPDATE job_resource_slots.*WHERE job_id = \?`).
+		WithArgs(poisonID, uint64(2)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`RELEASE SAVEPOINT recover_expired_job`).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`SAVEPOINT recover_expired_job`).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`(?s)UPDATE jobs.*status = 'queued'.*lease_until <= UTC_TIMESTAMP`).
+		WithArgs(int64(0), testJobID, uint64(3)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	expectResourceSlotRelease(mock, testJobID, 3, 2)
+	mock.ExpectExec(`RELEASE SAVEPOINT recover_expired_job`).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectCommit()
+
+	count, err := repository.RecoverExpired(
+		context.Background(), 10, 0, testSampleRetentionMicros,
+	)
+	if err != nil || count != 2 {
+		t.Fatalf("RecoverExpired() = (%d, %v), want (2, nil)", count, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRecoverExpiredCompletesPublishedCAnalysisJob(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := NewMySQLRepository(db)
+	retryMicros := int64(time.Second / time.Microsecond)
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`(?s)SELECT id, task_id, task_attempt_id, kind, attempt, max_attempts, fencing_token.*FOR UPDATE SKIP LOCKED`).
+		WithArgs(10).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "task_id", "task_attempt_id", "kind",
+			"attempt", "max_attempts", "fencing_token", "status",
+		}).AddRow(
+			testJobID, testTaskID, int64(19), "c_analysis",
+			1, 3, 2, "running",
+		))
+	mock.ExpectQuery(`(?s)SELECT analysis.status, analyzer.status,.*analysis.error_code.*FOR UPDATE`).
+		WithArgs(testTaskID, testJobID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"status", "analyzer_status", "error_code", "error_message",
+		}).AddRow("partial", "partial", nil, nil))
+	mock.ExpectExec(`(?s)UPDATE jobs.*SET status = \?.*kind = 'c_analysis'.*lease_until <= UTC_TIMESTAMP`).
+		WithArgs("succeeded", nil, nil, testJobID, testTaskID, uint64(2)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	expectResourceSlotRelease(mock, testJobID, 2, 1)
+	mock.ExpectCommit()
+
+	count, err := repository.RecoverExpired(
+		context.Background(), 10, retryMicros, testSampleRetentionMicros,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("RecoverExpired() count = %d, want 1", count)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRecoverExpiredCAnalysisHandlesLeaseLossBeforeProcessorBegin(t *testing.T) {
+	tests := []struct {
+		name          string
+		attempt       uint32
+		maxAttempts   uint32
+		retry         bool
+		initialStatus string
+		affected      int64
+		invalidates   bool
+	}{
+		{
+			name: "requeues running run", attempt: 1, maxAttempts: 3,
+			retry: true, initialStatus: "running", affected: 2, invalidates: true,
+		},
+		{
+			name:    "requeues queued run without snapshot mutation",
+			attempt: 1, maxAttempts: 3, retry: true,
+			initialStatus: "queued", affected: 0, invalidates: false,
+		},
+		{
+			name: "fails final attempt", attempt: 3, maxAttempts: 3,
+			initialStatus: "running", affected: 2, invalidates: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			repository := NewMySQLRepository(db)
+			retryMicros := int64(time.Second / time.Microsecond)
+
+			mock.ExpectBegin()
+			mock.ExpectQuery(`(?s)SELECT id, task_id, task_attempt_id, kind, attempt, max_attempts, fencing_token.*FOR UPDATE SKIP LOCKED`).
+				WithArgs(10).
+				WillReturnRows(sqlmock.NewRows([]string{
+					"id", "task_id", "task_attempt_id", "kind",
+					"attempt", "max_attempts", "fencing_token", "status",
+				}).AddRow(
+					testJobID, testTaskID, nil, "c_analysis",
+					test.attempt, test.maxAttempts, 2, "running",
+				))
+			mock.ExpectQuery(`(?s)SELECT analysis.status, analyzer.status,.*analysis.error_code.*FOR UPDATE`).
+				WithArgs(testTaskID, testJobID).
+				WillReturnRows(sqlmock.NewRows([]string{
+					"status", "analyzer_status", "error_code", "error_message",
+				}).AddRow(test.initialStatus, test.initialStatus, nil, nil))
+			if test.retry {
+				mock.ExpectExec(`(?s)UPDATE jobs.*status = 'queued'.*lease_until <= UTC_TIMESTAMP`).
+					WithArgs(retryMicros, testJobID, uint64(2)).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+			} else {
+				mock.ExpectExec(`(?s)UPDATE jobs.*status = 'failed'.*lease_until <= UTC_TIMESTAMP`).
+					WithArgs(testJobID, uint64(2)).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+			}
+			expectResourceSlotRelease(mock, testJobID, 2, 1)
+			status := "failed"
+			if test.retry {
+				status = "queued"
+			}
+			mock.ExpectExec(`(?s)UPDATE c_analysis_runs analysis.*SET analysis.status = '`+status+
+				`'.*analysis.status = analyzer.status.*analysis.status IN \('queued', 'running'\)`).
+				WithArgs(testTaskID, testJobID).
+				WillReturnResult(sqlmock.NewResult(0, test.affected))
+			if test.invalidates {
+				expectSourceAnalysisReportInvalidation(mock, testTaskID)
+			}
+			mock.ExpectCommit()
+
+			count, err := repository.RecoverExpired(
+				context.Background(), 10, retryMicros, testSampleRetentionMicros,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if count != 1 {
+				t.Fatalf("RecoverExpired() count = %d, want 1", count)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestRecoverExpiredCompletesPublishedJavaAnalysisJob(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository := NewMySQLRepository(db)
+	retryMicros := int64(time.Second / time.Microsecond)
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`(?s)SELECT id, task_id, task_attempt_id, kind, attempt, max_attempts, fencing_token.*FOR UPDATE SKIP LOCKED`).
+		WithArgs(10).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "task_id", "task_attempt_id", "kind",
+			"attempt", "max_attempts", "fencing_token", "status",
+		}).AddRow(
+			testJobID, testTaskID, int64(19), "java_analysis",
+			1, 3, 2, "running",
+		))
+	mock.ExpectQuery(`(?s)SELECT analysis.status, analyzer.status,.*analysis.error_code.*FROM java_analysis_runs.*FOR UPDATE`).
+		WithArgs(testTaskID, testJobID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"status", "analyzer_status", "error_code", "error_message",
+		}).AddRow("partial", "partial", nil, nil))
+	mock.ExpectExec(`(?s)UPDATE jobs.*SET status = \?.*kind = 'java_analysis'.*lease_until <= UTC_TIMESTAMP`).
+		WithArgs("succeeded", nil, nil, testJobID, testTaskID, uint64(2)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	expectResourceSlotRelease(mock, testJobID, 2, 1)
+	mock.ExpectCommit()
+
+	count, err := repository.RecoverExpired(
+		context.Background(), 10, retryMicros, testSampleRetentionMicros,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("RecoverExpired() count = %d, want 1", count)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRecoverExpiredJavaAnalysisResetsIdentityBeforeRetry(t *testing.T) {
+	tests := []struct {
+		name          string
+		attempt       uint32
+		maxAttempts   uint32
+		retry         bool
+		initialStatus string
+		affected      int64
+		invalidates   bool
+	}{
+		{
+			name: "requeues running run", attempt: 1, maxAttempts: 3,
+			retry: true, initialStatus: "running", affected: 2, invalidates: true,
+		},
+		{
+			name:    "requeues queued run without snapshot mutation",
+			attempt: 1, maxAttempts: 3, retry: true,
+			initialStatus: "queued", affected: 0, invalidates: false,
+		},
+		{
+			name: "fails final attempt", attempt: 3, maxAttempts: 3,
+			initialStatus: "running", affected: 2, invalidates: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			repository := NewMySQLRepository(db)
+			retryMicros := int64(time.Second / time.Microsecond)
+
+			mock.ExpectBegin()
+			mock.ExpectQuery(`(?s)SELECT id, task_id, task_attempt_id, kind, attempt, max_attempts, fencing_token.*FOR UPDATE SKIP LOCKED`).
+				WithArgs(10).
+				WillReturnRows(sqlmock.NewRows([]string{
+					"id", "task_id", "task_attempt_id", "kind",
+					"attempt", "max_attempts", "fencing_token", "status",
+				}).AddRow(
+					testJobID, testTaskID, nil, "java_analysis",
+					test.attempt, test.maxAttempts, 2, "running",
+				))
+			mock.ExpectQuery(`(?s)SELECT analysis.status, analyzer.status,.*analysis.error_code.*FROM java_analysis_runs.*FOR UPDATE`).
+				WithArgs(testTaskID, testJobID).
+				WillReturnRows(sqlmock.NewRows([]string{
+					"status", "analyzer_status", "error_code", "error_message",
+				}).AddRow(test.initialStatus, test.initialStatus, nil, nil))
+			if test.retry {
+				mock.ExpectExec(`(?s)UPDATE jobs.*status = 'queued'.*lease_until <= UTC_TIMESTAMP`).
+					WithArgs(retryMicros, testJobID, uint64(2)).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+			} else {
+				mock.ExpectExec(`(?s)UPDATE jobs.*status = 'failed'.*lease_until <= UTC_TIMESTAMP`).
+					WithArgs(testJobID, uint64(2)).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+			}
+			expectResourceSlotRelease(mock, testJobID, 2, 1)
+			status := "failed"
+			if test.retry {
+				status = "queued"
+			}
+			pattern := `(?s)UPDATE java_analysis_runs analysis.*SET analysis.status = '` + status
+			if test.retry {
+				pattern += `'.*analysis.bundle_sha256 = NULL.*analysis.analyzed_files = 0.*analysis.status = analyzer.status`
+			} else {
+				pattern += `'.*analysis.error_code = 'lease_expired'.*analysis.status = analyzer.status`
+			}
+			mock.ExpectExec(pattern).
+				WithArgs(testTaskID, testJobID).
+				WillReturnResult(sqlmock.NewResult(0, test.affected))
+			if test.invalidates {
+				expectSourceAnalysisReportInvalidation(mock, testTaskID)
+			}
+			mock.ExpectCommit()
+
+			count, err := repository.RecoverExpired(
+				context.Background(), 10, retryMicros, testSampleRetentionMicros,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if count != 1 {
+				t.Fatalf("RecoverExpired() count = %d, want 1", count)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestReleaseRecoveredNativeDecompileUsesPayloadFamily(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -1486,6 +1856,75 @@ func TestRecoverExpiredFinalizesRequestedCancellation(t *testing.T) {
 	}
 }
 
+func TestRecoverExpiredFinalizesSourceAnalysisCancellation(t *testing.T) {
+	tests := []struct {
+		name        string
+		kind        Kind
+		table       string
+		affected    int64
+		invalidates bool
+	}{
+		{
+			name: "C analysis mutation", kind: KindCAnalysis,
+			table: "c_analysis_runs", affected: 2, invalidates: true,
+		},
+		{
+			name: "Java analysis mutation", kind: KindJavaAnalysis,
+			table: "java_analysis_runs", affected: 2, invalidates: true,
+		},
+		{
+			name: "C analysis already terminal", kind: KindCAnalysis,
+			table: "c_analysis_runs", affected: 0, invalidates: false,
+		},
+		{
+			name: "Java analysis already terminal", kind: KindJavaAnalysis,
+			table: "java_analysis_runs", affected: 0, invalidates: false,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			repository := NewMySQLRepository(db)
+
+			mock.ExpectBegin()
+			mock.ExpectQuery(`(?s)SELECT id, task_id, task_attempt_id, kind, attempt, max_attempts, fencing_token.*cancel_requested.*FOR UPDATE SKIP LOCKED`).
+				WithArgs(10).
+				WillReturnRows(sqlmock.NewRows([]string{
+					"id", "task_id", "task_attempt_id", "kind",
+					"attempt", "max_attempts", "fencing_token", "status",
+				}).AddRow(
+					testJobID, testTaskID, int64(19), test.kind,
+					1, 3, 2, "cancel_requested",
+				))
+			mock.ExpectExec(`(?s)UPDATE jobs.*status = 'cancelled'.*status = 'cancel_requested'`).
+				WithArgs(testJobID, uint64(2)).
+				WillReturnResult(sqlmock.NewResult(0, 1))
+			expectResourceSlotRelease(mock, testJobID, 2, 1)
+			mock.ExpectExec(`(?s)UPDATE `+test.table+` analysis.*analyzer.status = 'cancelled'.*analysis.status IN \('queued', 'running', 'cancel_requested'\)`).
+				WithArgs(testTaskID, testJobID).
+				WillReturnResult(sqlmock.NewResult(0, test.affected))
+			if test.invalidates {
+				expectSourceAnalysisReportInvalidation(mock, testTaskID)
+			}
+			mock.ExpectCommit()
+
+			count, err := repository.RecoverExpired(
+				t.Context(), 10, 0, testSampleRetentionMicros,
+			)
+			if err != nil || count != 1 {
+				t.Fatalf("RecoverExpired() = (%d, %v)", count, err)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestRecoverCancelledJobLeavesDeletingTaskOwnedByRetention(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -1581,6 +2020,15 @@ func expectTaskEvent(
 ) {
 	mock.ExpectExec(`(?s)INSERT INTO task_events.*SELECT.*FROM tasks.*WHERE id = \?`).
 		WithArgs(eventType, message, testTaskID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+}
+
+func expectSourceAnalysisReportInvalidation(
+	mock sqlmock.Sqlmock,
+	taskID string,
+) {
+	mock.ExpectExec(`(?s)UPDATE reports.*snapshot_state = 'stale'.*WHERE task_id = \?`).
+		WithArgs(taskID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 }
 

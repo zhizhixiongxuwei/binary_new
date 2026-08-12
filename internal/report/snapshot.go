@@ -190,6 +190,36 @@ func (r *MySQLRepository) WriteJSONSnapshot(
 		if err := streamVulnerabilities(ctx, transaction, request.TaskID, stream); err != nil {
 			return err
 		}
+		cAnalysisRuns, dependencies, err := loadLatestCAnalysisRuns(
+			ctx, transaction, request.TaskID,
+		)
+		if err != nil {
+			return err
+		}
+		stream.field("cAnalysisRuns", cAnalysisRuns)
+		if stream.err != nil {
+			return fmt.Errorf("write report C-analysis runs: %w", stream.err)
+		}
+		if err := streamLatestCAnalysisFindings(
+			ctx, transaction, request.TaskID, stream,
+		); err != nil {
+			return err
+		}
+		javaAnalysisRuns, javaDependencies, err := loadLatestJavaAnalysisRuns(
+			ctx, transaction, request.TaskID,
+		)
+		if err != nil {
+			return err
+		}
+		stream.field("javaAnalysisRuns", javaAnalysisRuns)
+		if stream.err != nil {
+			return fmt.Errorf("write report Java-analysis runs: %w", stream.err)
+		}
+		if err := streamLatestJavaAnalysisFindings(
+			ctx, transaction, request.TaskID, stream,
+		); err != nil {
+			return err
+		}
 		if err := streamDatabaseBundles(ctx, transaction, request.TaskID, stream); err != nil {
 			return err
 		}
@@ -251,6 +281,8 @@ WHERE id = ? AND status = 'FAILED'
 			return err
 		}
 		stream.raw("}\n")
+		recordSnapshotDependencies(request, dependencies)
+		recordJavaSnapshotDependencies(request, javaDependencies)
 		return stream.err
 	})
 }

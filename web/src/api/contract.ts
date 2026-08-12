@@ -2,15 +2,38 @@ import type {
   AdminUser,
   AdminUserListQuery,
   AdminUserPage,
+  ArchiveImport,
+  ArchiveImportListQuery,
+  ArchiveImportPage,
+  ArchiveImportEntryListQuery,
+  ArchiveImportEntryPage,
+  ArchiveTaskBatchResult,
   AuditLogListQuery,
   AuditLogPage,
   ChangePasswordInput,
+  CAnalysisFindingListQuery,
+  CAnalysisFindingPage,
+  CAnalysisRun,
+  CAnalysisRunListQuery,
+  CAnalysisRunPage,
+  JavaAnalysisFindingListQuery,
+  JavaAnalysisFindingPage,
+  JavaAnalysisRun,
+  JavaAnalysisRunListQuery,
+  JavaAnalysisRunPage,
   CompletedUpload,
   CreatedTask,
+  CreateArchiveTaskBatchInput,
   CreateTaskInput,
   CreateUploadInput,
   CurrentUser,
   CreateFileDecompileRequestInput,
+  DecompileProject,
+  DecompileProjectDeletionOperation,
+  DecompileProjectDeletionPreview,
+  ConfirmDecompileProjectDeletionInput,
+  DecompileProjectListQuery,
+  DecompileProjectPage,
   DecompileResultListQuery,
   DecompileResultPage,
   DecompileSourceChunk,
@@ -74,6 +97,66 @@ export interface ApiClient {
     taskId: string,
     jobId: string,
   ): Promise<FileDecompileRequest>
+  listDecompileProjects(
+    taskId: string,
+    query?: DecompileProjectListQuery,
+  ): Promise<DecompileProjectPage>
+  getDecompileProject(
+    taskId: string,
+    projectId: string,
+  ): Promise<DecompileProject>
+  downloadDecompileProject(
+    taskId: string,
+    projectId: string,
+  ): Promise<ReportDownload>
+  deleteDecompileProject(taskId: string, projectId: string): Promise<void>
+  previewDecompileProjectDeletion(
+    taskId: string,
+    projectId: string,
+  ): Promise<DecompileProjectDeletionPreview>
+  confirmDecompileProjectDeletion(
+    taskId: string,
+    projectId: string,
+    input: ConfirmDecompileProjectDeletionInput,
+  ): Promise<DecompileProjectDeletionOperation>
+  getDecompileProjectDeletion(
+    taskId: string,
+    operationId: string,
+  ): Promise<DecompileProjectDeletionOperation>
+  createCAnalysisRun(
+    taskId: string,
+    projectId: string,
+    idempotencyKey: string,
+  ): Promise<CAnalysisRun>
+  listCAnalysisRuns(
+    taskId: string,
+    query?: CAnalysisRunListQuery,
+  ): Promise<CAnalysisRunPage>
+  getCAnalysisRun(taskId: string, runId: string): Promise<CAnalysisRun>
+  listCAnalysisFindings(
+    taskId: string,
+    runId: string,
+    query?: CAnalysisFindingListQuery,
+  ): Promise<CAnalysisFindingPage>
+  cancelCAnalysisRun(taskId: string, runId: string): Promise<CAnalysisRun>
+  deleteCAnalysisRun(taskId: string, runId: string): Promise<void>
+  createJavaAnalysisRun(
+    taskId: string,
+    projectId: string,
+    idempotencyKey: string,
+  ): Promise<JavaAnalysisRun>
+  listJavaAnalysisRuns(
+    taskId: string,
+    query?: JavaAnalysisRunListQuery,
+  ): Promise<JavaAnalysisRunPage>
+  getJavaAnalysisRun(taskId: string, runId: string): Promise<JavaAnalysisRun>
+  listJavaAnalysisFindings(
+    taskId: string,
+    runId: string,
+    query?: JavaAnalysisFindingListQuery,
+  ): Promise<JavaAnalysisFindingPage>
+  cancelJavaAnalysisRun(taskId: string, runId: string): Promise<JavaAnalysisRun>
+  deleteJavaAnalysisRun(taskId: string, runId: string): Promise<void>
   createManualImageScanRequest(
     taskId: string,
     fileId: string,
@@ -129,5 +212,16 @@ export interface ApiClient {
   uploadPart(uploadId: string, input: UploadPartInput): Promise<void>
   completeUpload(uploadId: string): Promise<CompletedUpload>
   deleteUpload(uploadId: string): Promise<void>
+  listArchiveImports(query?: ArchiveImportListQuery): Promise<ArchiveImportPage>
+  getArchiveImport(importId: string): Promise<ArchiveImport>
+  listArchiveImportEntries(
+    importId: string,
+    query?: ArchiveImportEntryListQuery,
+  ): Promise<ArchiveImportEntryPage>
+  createArchiveTaskBatch(
+    importId: string,
+    input: CreateArchiveTaskBatchInput,
+    idempotencyKey: string,
+  ): Promise<ArchiveTaskBatchResult>
   createTask(input: CreateTaskInput, idempotencyKey: string): Promise<CreatedTask>
 }

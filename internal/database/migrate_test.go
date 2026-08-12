@@ -19,8 +19,8 @@ func TestMigrationsAreEmbedded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(files) != 25 {
-		t.Fatalf("embedded migration count = %d, want 25: %v", len(files), files)
+	if len(files) != 33 {
+		t.Fatalf("embedded migration count = %d, want 33: %v", len(files), files)
 	}
 	if files[0] != "00001_initial.sql" {
 		t.Fatalf("first migration = %q, want 00001_initial.sql", files[0])
@@ -30,15 +30,129 @@ func TestMigrationsAreEmbedded(t *testing.T) {
 		files[8] != "00010_job_resource_slots.sql" ||
 		files[22] != "00024_worker_readiness.sql" ||
 		files[23] != "00026_bytecode_worker_readiness.sql" ||
-		files[24] != "00027_lower_performance_baseline.sql" {
+		files[24] != "00027_lower_performance_baseline.sql" ||
+		files[25] != "00028_decompile_source_projects.sql" ||
+		files[26] != "00029_c_analysis_domain.sql" ||
+		files[27] != "00030_report_c_analysis_snapshots.sql" ||
+		files[28] != "00031_source_project_cascade_deletion.sql" ||
+		files[29] != "00032_java_analysis_domain.sql" ||
+		files[30] != "00033_report_java_analysis_snapshots.sql" ||
+		files[31] != "00034_upload_intake_profiles.sql" ||
+		files[32] != "00035_archive_imports.sql" {
 		t.Fatalf("embedded migration order = %v", files)
 	}
 	version, err := LatestMigrationVersion()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if version != 27 {
-		t.Fatalf("latest migration version = %d, want 27", version)
+	if version != 35 {
+		t.Fatalf("latest migration version = %d, want 35", version)
+	}
+}
+
+func TestCAnalysisAndDeletionMigrationsPreserveFencedContracts(t *testing.T) {
+	tests := []struct {
+		name      string
+		fragments []string
+	}{
+		{
+			name: "00029_c_analysis_domain.sql",
+			fragments: []string{
+				"CREATE TABLE IF NOT EXISTS c_analysis_runs",
+				"uq_c_analysis_runs_active_project",
+				"CREATE TABLE IF NOT EXISTS c_analysis_findings",
+				"worker_kind = 'c_analysis'",
+			},
+		},
+		{
+			name: "00030_report_c_analysis_snapshots.sql",
+			fragments: []string{
+				"snapshot_state IN ('current', 'stale', 'staged')",
+				"uq_reports_current",
+				"CREATE TABLE IF NOT EXISTS report_c_analysis_runs",
+				"ON DELETE RESTRICT",
+			},
+		},
+		{
+			name: "00031_source_project_cascade_deletion.sql",
+			fragments: []string{
+				"CREATE TABLE IF NOT EXISTS source_project_deletion_tokens",
+				"token_hash CHAR(64)",
+				"CREATE TABLE IF NOT EXISTS source_project_deletion_operations",
+				"fencing_token BIGINT UNSIGNED",
+				"status IN ('pending', 'cancelling', 'deleting', 'complete', 'failed')",
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			raw, err := migrations.FS.ReadFile(test.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sections := strings.Split(string(raw), "-- +goose Down")
+			if len(sections) != 2 {
+				t.Fatalf("migration sections = %d, want 2", len(sections))
+			}
+			for _, fragment := range test.fragments {
+				if !strings.Contains(sections[0], fragment) {
+					t.Errorf("up migration lacks %q", fragment)
+				}
+			}
+			if !strings.Contains(sections[1], "DROP") {
+				t.Fatal("down migration has no DROP operation")
+			}
+		})
+	}
+	raw, err := migrations.FS.ReadFile("00030_report_c_analysis_snapshots.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sections := strings.Split(string(raw), "-- +goose Down")
+	if len(sections) != 2 ||
+		!strings.Contains(sections[1], "binaryscan_migration_30_rollback_guard") ||
+		strings.Index(sections[1], "binaryscan_migration_30_rollback_guard") >
+			strings.Index(sections[1], "DROP TABLE IF EXISTS report_c_analysis_runs") {
+		t.Fatal("report snapshot rollback must guard history before dropping dependencies")
+	}
+}
+
+func TestDecompileSourceProjectMigrationIsBoundedAndGuardsRollback(t *testing.T) {
+	raw, err := migrations.FS.ReadFile("00028_decompile_source_projects.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sections := strings.Split(string(raw), "-- +goose Down")
+	if len(sections) != 2 {
+		t.Fatalf("source project migration sections = %d, want 2", len(sections))
+	}
+	up, down := sections[0], sections[1]
+	for _, fragment := range []string{
+		"CREATE TABLE IF NOT EXISTS decompile_source_projects",
+		"layout_version IN ('project-v1', 'legacy-v1')",
+		"source_offset_bytes BIGINT UNSIGNED",
+		"chk_decompile_results_source_range",
+		"INSERT INTO decompile_source_projects",
+		"storage_deleted_at",
+		"WHEN run.analyzer_name = 'ghidra' THEN 'c'",
+		"WHEN run.status = 'partial' THEN 'partial'",
+		"COUNT(DISTINCT CASE",
+	} {
+		if !strings.Contains(up, fragment) {
+			t.Fatalf("source project up migration lacks %q", fragment)
+		}
+	}
+	for _, fragment := range []string{
+		"binaryscan_migration_28_rollback_guard",
+		"chk_no_project_v1_before_rollback",
+		"WHERE layout_version = 'project-v1'",
+		"DROP CHECK chk_decompile_results_source_range",
+		"DROP COLUMN source_offset_bytes",
+		"DROP TABLE IF EXISTS decompile_source_projects",
+	} {
+		if !strings.Contains(down, fragment) {
+			t.Fatalf("source project down migration lacks %q", fragment)
+		}
 	}
 }
 
@@ -224,6 +338,51 @@ func TestMySQLBytecodeCacheMigrationRoundTrip(t *testing.T) {
 	if err := Migrate(ctx, db); err != nil {
 		t.Fatalf("migrate dedicated database to latest: %v", err)
 	}
+	assertCAnalysisMigrationState(t, ctx, db)
+	guardConnection, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := guardConnection.ExecContext(ctx, "SET FOREIGN_KEY_CHECKS = 0"); err != nil {
+		guardConnection.Close()
+		t.Fatal(err)
+	}
+	_, insertErr := guardConnection.ExecContext(ctx, `
+INSERT INTO decompile_source_projects (
+    id, task_id, file_node_id, layout_version, source_kind, language,
+    engine_name, engine_version, status, root_storage_key,
+    source_file_count, symbol_count, source_size_bytes
+) VALUES (
+    '00000000-0000-4000-8000-000000000028',
+    '00000000-0000-4000-8000-000000000001',
+    1, 'project-v1', 'java', 'java', 'migration-test', '1', 'complete',
+    'source-projects/00000000-0000-4000-8000-000000000028', 1, 1, 1
+)`)
+	_, restoreForeignKeyErr := guardConnection.ExecContext(
+		ctx, "SET FOREIGN_KEY_CHECKS = 1",
+	)
+	closeGuardConnectionErr := guardConnection.Close()
+	if insertErr != nil {
+		t.Fatalf("insert rollback guard fixture: %v", insertErr)
+	}
+	if restoreForeignKeyErr != nil {
+		t.Fatalf("restore foreign key checks: %v", restoreForeignKeyErr)
+	}
+	if closeGuardConnectionErr != nil {
+		t.Fatalf("close rollback guard connection: %v", closeGuardConnectionErr)
+	}
+	guardErr := goose.DownToContext(ctx, db, ".", 27)
+	if guardErr == nil || !strings.Contains(
+		guardErr.Error(), "chk_no_project_v1_before_rollback",
+	) {
+		t.Fatalf("migration 28 rollback guard error = %v", guardErr)
+	}
+	assertMigrationVersion(t, ctx, db, 28)
+	if _, err := db.ExecContext(ctx, `
+DELETE FROM decompile_source_projects
+WHERE id = '00000000-0000-4000-8000-000000000028'`); err != nil {
+		t.Fatalf("delete rollback guard fixture: %v", err)
+	}
 	restoreLatest := true
 	t.Cleanup(func() {
 		defer db.Close()
@@ -256,6 +415,88 @@ func TestMySQLBytecodeCacheMigrationRoundTrip(t *testing.T) {
 	restoreLatest = false
 }
 
+func assertCAnalysisMigrationState(t *testing.T, ctx context.Context, db *sql.DB) {
+	t.Helper()
+	var generationExpression, extra string
+	if err := db.QueryRowContext(ctx, `
+SELECT generation_expression, extra
+FROM information_schema.columns
+WHERE table_schema = DATABASE()
+  AND table_name = 'c_analysis_runs'
+  AND column_name = 'active_source_project_id'`).Scan(
+		&generationExpression, &extra,
+	); err != nil {
+		t.Fatalf("inspect C-analysis active-project fence: %v", err)
+	}
+	if !strings.Contains(generationExpression, "source_project_id") ||
+		!strings.Contains(strings.ToUpper(extra), "VIRTUAL GENERATED") {
+		t.Fatalf(
+			"C-analysis active-project fence = expression %q, extra %q",
+			generationExpression, extra,
+		)
+	}
+	var uniqueIndexCount, foreignKeyCount, deletionColumnCount, deletionCheckCount int
+	if err := db.QueryRowContext(ctx, `
+SELECT COUNT(DISTINCT index_name)
+FROM information_schema.statistics
+WHERE table_schema = DATABASE()
+  AND table_name = 'c_analysis_runs'
+  AND index_name = 'uq_c_analysis_runs_active_project'
+  AND non_unique = 0`).Scan(&uniqueIndexCount); err != nil {
+		t.Fatalf("inspect C-analysis active-project index: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, `
+SELECT COUNT(DISTINCT constraint_name)
+FROM information_schema.referential_constraints
+WHERE constraint_schema = DATABASE()
+  AND table_name = 'c_analysis_runs'
+  AND constraint_name IN (
+      'fk_c_analysis_runs_analyzer', 'fk_c_analysis_runs_task',
+      'fk_c_analysis_runs_project', 'fk_c_analysis_runs_job',
+      'fk_c_analysis_runs_creator'
+  )`).Scan(&foreignKeyCount); err != nil {
+		t.Fatalf("inspect C-analysis foreign keys: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM information_schema.columns
+WHERE table_schema = DATABASE()
+  AND table_name = 'c_analysis_runs'
+  AND column_name = 'deletion_started_at'
+  AND is_nullable = 'YES'`).Scan(&deletionColumnCount); err != nil {
+		t.Fatalf("inspect C-analysis deletion tombstone: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM information_schema.table_constraints
+WHERE constraint_schema = DATABASE()
+  AND table_name = 'c_analysis_runs'
+  AND constraint_name = 'chk_c_analysis_runs_deletion'
+  AND constraint_type = 'CHECK'`).Scan(&deletionCheckCount); err != nil {
+		t.Fatalf("inspect C-analysis deletion constraint: %v", err)
+	}
+	if uniqueIndexCount != 1 || foreignKeyCount != 5 ||
+		deletionColumnCount != 1 || deletionCheckCount != 1 {
+		t.Fatalf(
+			"C-analysis structure = unique fence:%d foreign keys:%d deletion:%d/%d; want 1/5/1/1",
+			uniqueIndexCount, foreignKeyCount, deletionColumnCount, deletionCheckCount,
+		)
+	}
+}
+
+func assertMigrationVersion(
+	t *testing.T,
+	ctx context.Context,
+	db *sql.DB,
+	wantVersion int64,
+) {
+	t.Helper()
+	version, err := goose.GetDBVersionContext(ctx, db)
+	if err != nil || version != wantVersion {
+		t.Fatalf("migration version = %d, %v; want %d", version, err, wantVersion)
+	}
+}
+
 func assertBytecodeCacheMigrationState(
 	t *testing.T,
 	ctx context.Context,
@@ -265,10 +506,7 @@ func assertBytecodeCacheMigrationState(
 	wantIndex int,
 ) {
 	t.Helper()
-	version, err := goose.GetDBVersionContext(ctx, db)
-	if err != nil || version != wantVersion {
-		t.Fatalf("migration version = %d, %v; want %d", version, err, wantVersion)
-	}
+	assertMigrationVersion(t, ctx, db, wantVersion)
 	var columnCount, indexCount int
 	if err := db.QueryRowContext(ctx, `
 SELECT COUNT(*)

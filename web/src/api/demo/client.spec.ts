@@ -244,6 +244,7 @@ describe('standalone demo API', () => {
         filename: 'local-sample.exe',
         size: 4,
         content_type: 'application/octet-stream',
+        input_category: 'binary',
       },
       'demo-upload-create',
     )
@@ -259,6 +260,9 @@ describe('standalone demo API', () => {
     await expect(demoApi.completeUpload(upload.id)).resolves.toMatchObject({
       status: 'completed',
       size_bytes: 4,
+      task_id: expect.stringMatching(
+        /^90000000-0000-4000-8000-\d{12}$/,
+      ),
     })
 
     const created = await demoApi.createTask(
@@ -284,6 +288,7 @@ describe('standalone demo API', () => {
       filename: 'idempotent.bin',
       size: 4,
       content_type: 'application/octet-stream',
+      input_category: 'binary' as const,
     }
     const created = await demoApi.createUpload(input, 'stable-upload-key')
     await demoApi.uploadPart(created.id, {
@@ -477,6 +482,7 @@ describe('standalone demo API', () => {
         filename: 'cancel-me.tar',
         size: 12,
         content_type: 'application/x-tar',
+        input_category: 'archive',
       },
       'demo-upload-cancel',
     )
@@ -486,6 +492,26 @@ describe('standalone demo API', () => {
       status: 404,
       code: 'UPLOAD_NOT_FOUND',
     })
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('keeps Java analysis deterministic and read-only in demo mode', async () => {
+    const fetchMock = vi.fn(() => {
+      throw new Error('demo Java analysis must not call fetch')
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const demoApi = createDemoApiClient({ delayMs: 0 })
+
+    await expect(
+      demoApi.listJavaAnalysisRuns(DEMO_TASK_IDS.apk),
+    ).resolves.toEqual({ items: [] })
+    await expect(
+      demoApi.createJavaAnalysisRun(
+        DEMO_TASK_IDS.apk,
+        '123e4567-e89b-42d3-a456-426614174003',
+        'demo-java-analysis',
+      ),
+    ).rejects.toMatchObject({ status: 501, code: 'DEMO_READ_ONLY' })
     expect(fetchMock).not.toHaveBeenCalled()
   })
 

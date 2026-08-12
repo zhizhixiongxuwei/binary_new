@@ -38,8 +38,8 @@ func TestMySQLRepositoryCreateAtomicallyRetainsBlobAndQueuesScan(t *testing.T) {
 	mock.ExpectQuery(`(?s)SELECT upload\.created_by.*FOR UPDATE`).
 		WithArgs(testUploadID).
 		WillReturnRows(sqlmock.NewRows(
-			[]string{"created_by", "status", "blob_id", "state"},
-		).AddRow(uint64(42), "completed", int64(9), "available"))
+			[]string{"created_by", "status", "blob_id", "state", "input_category", "validation_status"},
+		).AddRow(uint64(42), "completed", int64(9), "available", "binary", "valid"))
 	mock.ExpectQuery(`(?s)FROM tasks t.*WHERE t\.upload_id = \?`).
 		WithArgs(testUploadID).
 		WillReturnError(sql.ErrNoRows)
@@ -102,8 +102,8 @@ func TestMySQLRepositoryCreateReturnsExistingWithoutSecondBlobReference(t *testi
 	mock.ExpectQuery(`(?s)SELECT upload\.created_by.*FOR UPDATE`).
 		WithArgs(testUploadID).
 		WillReturnRows(sqlmock.NewRows(
-			[]string{"created_by", "status", "blob_id", "state"},
-		).AddRow(uint64(42), "completed", int64(9), "deleting"))
+			[]string{"created_by", "status", "blob_id", "state", "input_category", "validation_status"},
+		).AddRow(uint64(42), "completed", int64(9), "deleting", nil, nil))
 	mock.ExpectQuery(`(?s)FROM tasks t.*WHERE t\.upload_id = \?`).
 		WithArgs(testUploadID).
 		WillReturnRows(taskRow(now, expires, "oci", 10_000))
@@ -168,8 +168,8 @@ func TestMySQLRepositoryCreateChecksOwnershipAndCompletion(t *testing.T) {
 			mock.ExpectQuery(`(?s)SELECT upload\.created_by.*FOR UPDATE`).
 				WithArgs(testUploadID).
 				WillReturnRows(sqlmock.NewRows(
-					[]string{"created_by", "status", "blob_id", "state"},
-				).AddRow(test.owner, test.status, test.blobID, test.blobState))
+					[]string{"created_by", "status", "blob_id", "state", "input_category", "validation_status"},
+				).AddRow(test.owner, test.status, test.blobID, test.blobState, "binary", "valid"))
 			if test.status == "completed" &&
 				(test.administrator || test.owner == uint64(42)) {
 				mock.ExpectQuery(`(?s)FROM tasks t.*WHERE t\.upload_id = \?`).
@@ -185,6 +185,49 @@ func TestMySQLRepositoryCreateChecksOwnershipAndCompletion(t *testing.T) {
 			}
 			if err := mock.ExpectationsWereMet(); err != nil {
 				t.Fatalf("unmet SQL expectations: %v", err)
+			}
+		})
+	}
+}
+
+func TestMySQLRepositoryCreateRejectsHistoricalOrArchiveUpload(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		inputCategory    any
+		validationStatus any
+	}{
+		{name: "historical upload", inputCategory: nil, validationStatus: nil},
+		{name: "outer archive", inputCategory: "archive", validationStatus: "valid"},
+		{name: "mismatched binary", inputCategory: "binary", validationStatus: "mismatch"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			database, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			repository := NewMySQLRepository(database)
+			mock.ExpectBegin()
+			mock.ExpectQuery(`(?s)SELECT id, upload_id, name.*idempotency_key = \?.*FOR UPDATE`).
+				WithArgs(uint64(42), "new-task").
+				WillReturnError(sql.ErrNoRows)
+			mock.ExpectQuery(`(?s)SELECT upload\.created_by.*FOR UPDATE`).
+				WithArgs(testUploadID).
+				WillReturnRows(sqlmock.NewRows([]string{
+					"created_by", "status", "blob_id", "state", "input_category", "validation_status",
+				}).AddRow(uint64(42), "completed", int64(9), "available", test.inputCategory, test.validationStatus))
+			mock.ExpectQuery(`(?s)FROM tasks t.*WHERE t\.upload_id = \?`).
+				WithArgs(testUploadID).
+				WillReturnError(sql.ErrNoRows)
+			mock.ExpectRollback()
+			_, _, err = repository.Create(context.Background(), CreateRecord{
+				UserID: 42, UploadID: testUploadID, IdempotencyKey: "new-task",
+			})
+			if !errors.Is(err, ErrUploadNotEligible) {
+				t.Fatalf("Create() error = %v, want ErrUploadNotEligible", err)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
 			}
 		})
 	}
@@ -325,8 +368,8 @@ func TestMySQLRepositoryCreateResolvesDuplicateInNewTransaction(t *testing.T) {
 	mock.ExpectQuery(`(?s)SELECT upload\.created_by.*FOR UPDATE`).
 		WithArgs(testUploadID).
 		WillReturnRows(sqlmock.NewRows(
-			[]string{"created_by", "status", "blob_id", "state"},
-		).AddRow(uint64(42), "completed", int64(9), "available"))
+			[]string{"created_by", "status", "blob_id", "state", "input_category", "validation_status"},
+		).AddRow(uint64(42), "completed", int64(9), "available", "binary", "valid"))
 	mock.ExpectQuery(`(?s)FROM tasks t.*WHERE t\.upload_id = \?`).
 		WithArgs(testUploadID).
 		WillReturnError(sql.ErrNoRows)

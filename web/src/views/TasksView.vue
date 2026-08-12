@@ -3,9 +3,11 @@ import { Plus } from 'lucide-vue-next'
 
 import PageHeader from '@/components/common/PageHeader.vue'
 import TaskListPanel from '@/components/tasks/TaskListPanel.vue'
+import { useTaskCreationLauncher } from '@/composables/useTaskCreationLauncher'
 import { useSessionStore } from '@/stores/session'
 
 const session = useSessionStore()
+const { launchTaskCreation } = useTaskCreationLauncher()
 </script>
 
 <template>
@@ -16,7 +18,7 @@ const session = useSessionStore()
           v-if="session.user?.role !== 'reader'"
           type="primary"
           :icon="Plus"
-          @click="$router.push({ name: 'task-create' })"
+          @click="launchTaskCreation"
         >
           新建任务
         </el-button>

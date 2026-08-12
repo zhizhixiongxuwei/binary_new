@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -30,11 +31,6 @@ func TestClaimExpiredTaskSamplePersistsRecoverableFence(t *testing.T) {
 	mock.ExpectExec(`(?s)INSERT INTO task_sample_retention_operations.*'cleaning'.*DATE_ADD\(UTC_TIMESTAMP\(6\), INTERVAL \? MICROSECOND\)`).
 		WithArgs("task-id", "retention-owner", int64(60_000_000)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectQuery(`(?s)SELECT id, storage_key, content_sha256, size_bytes.*FROM decompile_results.*storage_key IS NOT NULL`).
-		WithArgs("task-id").
-		WillReturnRows(sqlmock.NewRows(
-			[]string{"id", "storage_key", "content_sha256", "size_bytes"},
-		))
 	expectSystemAudit(
 		mock, "retention.task_sample_cleanup_started", "task", "task-id",
 	)
@@ -50,6 +46,59 @@ func TestClaimExpiredTaskSamplePersistsRecoverableFence(t *testing.T) {
 		claim.LeaseOwner != "retention-owner" ||
 		!claim.LeaseUntil.Equal(now.Add(time.Minute)) {
 		t.Fatalf("claim = %#v, claimed=%v", claim, claimed)
+	}
+}
+
+func TestCompleteExpiredTaskSamplePreservesDecompileSources(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	claim := TaskSampleClaim{
+		TaskID: "task-id", LeaseOwner: "retention-owner",
+		FencingToken: 3, Attempt: 2,
+	}
+	const blobID uint64 = 42
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`(?s)SELECT t[.]blob_id.*FROM tasks t.*FOR UPDATE`).
+		WithArgs(claim.TaskID).
+		WillReturnRows(sqlmock.NewRows([]string{"blob_id"}).AddRow(blobID))
+	mock.ExpectQuery(`(?s)SELECT status.*task_sample_retention_operations.*FOR UPDATE`).
+		WithArgs(claim.TaskID, claim.FencingToken, claim.LeaseOwner).
+		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("cleaning"))
+	mock.ExpectExec(`(?s)UPDATE jobs.*kind = 'decompile'.*status = 'queued'`).
+		WithArgs(claim.TaskID).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	expectNoDerivedBlobReferences(mock, claim.TaskID)
+	expectBlobReferenceRelease(mock, blobID, 1, "deleting")
+	mock.ExpectExec(`(?s)UPDATE tasks.*sample_deleted_at = UTC_TIMESTAMP`).
+		WithArgs(claim.TaskID, blobID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`(?s)INSERT INTO task_events.*SELECT.*FROM tasks`).
+		WithArgs(
+			"task.sample_deleted", "Task sample retention expired.", claim.TaskID,
+		).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(`(?s)UPDATE task_sample_retention_operations.*status = 'completed'`).
+		WithArgs(claim.TaskID, claim.FencingToken, claim.LeaseOwner).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	expectSystemAudit(
+		mock, "retention.task_sample_deleted", "task", claim.TaskID,
+	)
+	mock.ExpectCommit()
+
+	completed, err := NewMySQLRepository(db).CompleteExpiredTaskSample(
+		context.Background(), claim,
+	)
+	if err != nil || !completed {
+		t.Fatalf("CompleteExpiredTaskSample() = (%v, %v)", completed, err)
+	}
+	// An unexpected UPDATE decompile_results would fail sqlmock. This protects
+	// the independently retained source-project contract.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -136,7 +185,7 @@ func TestExpireUploadReleasesSharedReferenceAndClearsBlob(t *testing.T) {
 
 	expectUploadLock(mock, "upload-id")
 	mock.ExpectBegin()
-	mock.ExpectQuery(`(?s)SELECT u\.blob_id.*FROM uploads u.*u\.id = \?.*expires_at <= UTC_TIMESTAMP.*FOR UPDATE SKIP LOCKED`).
+	mock.ExpectQuery(`(?s)SELECT u\.blob_id.*FROM uploads u.*u\.id = \?.*expires_at <= UTC_TIMESTAMP.*upload_intake_profiles intake.*candidate_blob.*source_kind = 'direct'.*validation_status = 'valid'.*input_category IN \('binary', 'container'\).*NOT EXISTS \(.*FROM tasks claimed_task.*WHERE claimed_task\.upload_id = u\.id.*upload_intake_profiles archive_intake.*input_category = 'archive'.*archive_blob\.state = 'available'.*archive_import_id IS NULL.*archive_imports active_import.*active_import\.status IN \('queued', 'running'\).*archive_import_entries pending_entry.*derived_intake\.source_kind = 'archive_entry'.*pending_entry\.status IN \('eligible', 'failed'\).*FOR UPDATE SKIP LOCKED`).
 		WithArgs("upload-id").
 		WillReturnRows(sqlmock.NewRows([]string{"blob_id"}).AddRow(42))
 	expectBlobReferenceRelease(mock, 42, 2, "available")
@@ -422,6 +471,7 @@ func TestFinalizeDeletingBlobMarksDeletedOnlyAfterCallbackSucceeds(t *testing.T)
 		StorageKey: "blobs/sha256/aa/" + testSHA256,
 	}
 
+	expectDeletingBlobFenceStart(mock, blob)
 	mock.ExpectBegin()
 	expectDeletingBlobLock(mock, blob)
 	called := false
@@ -429,6 +479,7 @@ func TestFinalizeDeletingBlobMarksDeletedOnlyAfterCallbackSucceeds(t *testing.T)
 		WithArgs(blob.ID, blob.SHA256, blob.SizeBytes, blob.StorageKey).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
+	expectDeletingBlobFenceEnd(mock, blob)
 
 	changed, err := repository.FinalizeDeletingBlob(
 		context.Background(),
@@ -462,9 +513,11 @@ func TestFinalizeDeletingBlobFailureKeepsDatabaseDeleting(t *testing.T) {
 	}
 	sentinel := errors.New("filesystem unavailable")
 
+	expectDeletingBlobFenceStart(mock, blob)
 	mock.ExpectBegin()
 	expectDeletingBlobLock(mock, blob)
 	mock.ExpectRollback()
+	expectDeletingBlobFenceEnd(mock, blob)
 	changed, err := repository.FinalizeDeletingBlob(
 		context.Background(),
 		blob.ID,
@@ -496,7 +549,7 @@ func TestCandidateQueriesAreBoundedAndProtectActiveStates(t *testing.T) {
 		t.Fatalf("ListExpiredTaskIDs() = (%v, %v)", tasks, err)
 	}
 
-	mock.ExpectQuery(`(?s)SELECT u\.id.*expires_at <= UTC_TIMESTAMP.*status <> 'expired'.*blob_id IS NOT NULL.*upload_parts.*ORDER BY.*LIMIT \?`).
+	mock.ExpectQuery(`(?s)SELECT u\.id.*expires_at <= UTC_TIMESTAMP.*status <> 'expired'.*blob_id IS NOT NULL.*upload_parts.*upload_intake_profiles intake.*candidate_blob.*source_kind = 'direct'.*validation_status = 'valid'.*input_category IN \('binary', 'container'\).*detected_category = intake\.input_category.*candidate_blob\.state = 'available'.*NOT EXISTS \(.*FROM tasks claimed_task.*WHERE claimed_task\.upload_id = u\.id.*upload_intake_profiles archive_intake.*input_category = 'archive'.*archive_blob\.state = 'available'.*archive_import_id IS NULL.*archive_imports active_import.*active_import\.status IN \('queued', 'running'\).*archive_import_entries pending_entry.*derived_intake\.source_kind = 'archive_entry'.*pending_entry\.status IN \('eligible', 'failed'\).*ORDER BY.*LIMIT \?`).
 		WithArgs(5).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("upload-a"))
 	uploads, err := repository.ListExpiredUploadIDs(context.Background(), 5)
@@ -513,6 +566,43 @@ func TestCandidateQueriesAreBoundedAndProtectActiveStates(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestExpiredUploadPredicateProtectsUnrecoveredIntakeWork(t *testing.T) {
+	required := []string{
+		"u.status = 'completed'",
+		"intake.source_kind = 'direct'",
+		"intake.validation_status = 'valid'",
+		"intake.input_category IN ('binary', 'container')",
+		"intake.detected_category = intake.input_category",
+		"candidate_blob.state = 'available'",
+		"FROM tasks claimed_task",
+		"WHERE claimed_task.upload_id = u.id",
+		"FROM upload_intake_profiles archive_intake",
+		"archive_intake.input_category = 'archive'",
+		"archive_intake.detected_category = 'archive'",
+		"archive_intake.archive_import_id IS NULL",
+		"archive_blob.state = 'available'",
+		"FROM archive_imports active_import",
+		"active_import.upload_id = u.id",
+		"active_import.status IN ('queued', 'running')",
+		"FROM archive_import_entries pending_entry",
+		"derived_intake.source_kind = 'archive_entry'",
+		"pending_entry.status IN ('eligible', 'failed')",
+		"FROM upload_intake_profiles derived_provenance",
+		"pending_provenance.status IN ('eligible', 'failed')",
+		"pending_provenance.derived_upload_id IS NULL",
+		"pending_provenance.sha256 = u.actual_sha256",
+		"pending_provenance.blob_id = u.blob_id",
+	}
+	for _, fragment := range required {
+		if !strings.Contains(expiredUploadPredicate, fragment) {
+			t.Fatalf("expiredUploadPredicate does not contain %q", fragment)
+		}
+	}
+	if strings.Contains(expiredUploadPredicate, "claimed_task.status") {
+		t.Fatal("soft-deleted tasks must count as durable claims for upload retention")
 	}
 }
 
@@ -620,6 +710,21 @@ func expectDeletingBlobLock(mock sqlmock.Sqlmock, blob Blob) {
 		WillReturnRows(sqlmock.NewRows(
 			[]string{"id", "sha256", "size_bytes", "storage_key"},
 		).AddRow(blob.ID, blob.SHA256, blob.SizeBytes, blob.StorageKey))
+}
+
+func expectDeletingBlobFenceStart(mock sqlmock.Sqlmock, blob Blob) {
+	mock.ExpectQuery(`(?s)SELECT sha256.*FROM blobs.*WHERE id = \?`).
+		WithArgs(blob.ID).
+		WillReturnRows(sqlmock.NewRows([]string{"sha256"}).AddRow(blob.SHA256))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT GET_LOCK(?, ?)")).
+		WithArgs("binaryscan_blob_sha256_"+blob.SHA256[:40], 30).
+		WillReturnRows(sqlmock.NewRows([]string{"acquired"}).AddRow(1))
+}
+
+func expectDeletingBlobFenceEnd(mock sqlmock.Sqlmock, blob Blob) {
+	mock.ExpectExec(regexp.QuoteMeta("SELECT RELEASE_LOCK(?)")).
+		WithArgs("binaryscan_blob_sha256_" + blob.SHA256[:40]).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 }
 
 func expectUploadLock(mock sqlmock.Sqlmock, uploadID string) {

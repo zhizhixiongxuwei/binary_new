@@ -11,7 +11,8 @@ import (
 )
 
 const reportColumns = `
-SELECT id, task_id, format, schema_version, status, sha256, size_bytes,
+SELECT id, task_id, format, schema_version, status, snapshot_state,
+       generation, sha256, size_bytes,
        error_code, error_message, created_at, completed_at
 FROM reports`
 
@@ -49,17 +50,28 @@ LIMIT 1`, taskID).Scan(&sampleRelation)
 
 	rows, err := r.db.QueryContext(ctx, reportColumns+`
 WHERE task_id = ? AND schema_version = ? AND deleted_at IS NULL
-ORDER BY created_at ASC, id ASC`, taskID, SchemaVersion)
+  AND (
+      (snapshot_state = 'current' AND status = 'complete') OR
+      (snapshot_state = 'staged' AND status IN ('queued', 'generating'))
+  )
+ORDER BY format ASC,
+         CASE WHEN snapshot_state = 'current' THEN 0 ELSE 1 END ASC,
+         generation DESC, id DESC`, taskID, SchemaVersion)
 	if err != nil {
 		return List{}, fmt.Errorf("list task reports: %w", err)
 	}
 	defer rows.Close()
 	items := make([]Report, 0, 2)
+	seenFormats := make(map[Format]struct{}, 2)
 	for rows.Next() {
 		item, err := scanReport(rows)
 		if err != nil {
 			return List{}, fmt.Errorf("scan task report: %w", err)
 		}
+		if _, seen := seenFormats[item.Format]; seen {
+			continue
+		}
+		seenFormats[item.Format] = struct{}{}
 		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {
@@ -94,6 +106,7 @@ func (r *MySQLRepository) Claim(
 
 	var taskStatus string
 	var activeRetention uint8
+	var activeEvidenceDeletion uint8
 	err = transaction.QueryRowContext(ctx, `
 SELECT t.status,
        EXISTS (
@@ -102,17 +115,37 @@ SELECT t.status,
       WHERE operation.task_id = t.id
         AND operation.status = 'cleaning'
         AND operation.lease_until > UTC_TIMESTAMP(6)
+       ),
+       (
+         EXISTS (
+           SELECT 1
+           FROM source_project_deletion_operations operation
+           WHERE operation.task_id = t.id
+             AND operation.active_project_id IS NOT NULL
+         ) OR
+         EXISTS (
+           SELECT 1
+           FROM c_analysis_runs run
+           WHERE run.task_id = t.id AND run.deletion_started_at IS NOT NULL
+         ) OR
+         EXISTS (
+           SELECT 1
+           FROM java_analysis_runs run
+           WHERE run.task_id = t.id AND run.deletion_started_at IS NOT NULL
+         )
        )
 FROM tasks t
 WHERE t.id = ? AND t.deleted_at IS NULL
-FOR UPDATE`, claim.TaskID).Scan(&taskStatus, &activeRetention)
+FOR UPDATE`, claim.TaskID).Scan(
+		&taskStatus, &activeRetention, &activeEvidenceDeletion,
+	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Report{}, false, ErrTaskNotFound
 	}
 	if err != nil {
 		return Report{}, false, fmt.Errorf("lock report task: %w", err)
 	}
-	if activeRetention != 0 {
+	if activeRetention != 0 || activeEvidenceDeletion != 0 {
 		return Report{}, false, ErrGenerationInProgress
 	}
 	if !reportableTaskStatus(taskStatus) {
@@ -123,38 +156,58 @@ FOR UPDATE`, claim.TaskID).Scan(&taskStatus, &activeRetention)
 		ctx, transaction, claim.TaskID, claim.Format, claim.SchemaVersion, true,
 	)
 	switch {
-	case err == nil && existing.Status == "complete":
+	case err == nil && existing.Status == "complete" &&
+		existing.SnapshotState == "current":
 		finished = true
 		if err := transaction.Commit(); err != nil {
 			return Report{}, false, fmt.Errorf("commit report replay: %w", err)
 		}
 		return existing, false, nil
-	case err == nil && (existing.Status == "generating" || existing.Status == "queued"):
-		return Report{}, false, ErrGenerationInProgress
-	case err == nil && existing.Status == "failed":
-		result, err = restartFailedReport(
-			ctx, transaction, existing, claim.LeaseOwner, leaseMicros,
-		)
-		if err != nil {
-			return Report{}, false, err
-		}
 	case err == nil:
 		return Report{}, false, ErrReportConflict
 	case !errors.Is(err, sql.ErrNoRows):
 		return Report{}, false, fmt.Errorf("find existing report: %w", err)
 	default:
+		var active uint8
+		if err := transaction.QueryRowContext(ctx, `
+SELECT EXISTS (
+    SELECT 1
+    FROM reports
+    WHERE task_id = ? AND format = ? AND schema_version = ?
+      AND snapshot_state = 'staged'
+      AND status IN ('queued', 'generating')
+      AND deleted_at IS NULL
+)`, claim.TaskID, string(claim.Format), claim.SchemaVersion).Scan(&active); err != nil {
+			return Report{}, false, fmt.Errorf("find staged report replacement: %w", err)
+		}
+		if active != 0 {
+			return Report{}, false, ErrGenerationInProgress
+		}
+		var generation uint64
+		if err := transaction.QueryRowContext(ctx, `
+SELECT COALESCE(MAX(generation), 0) + 1
+FROM reports
+WHERE task_id = ? AND format = ? AND schema_version = ?`,
+			claim.TaskID, string(claim.Format), claim.SchemaVersion,
+		).Scan(&generation); err != nil {
+			return Report{}, false, fmt.Errorf("allocate report generation: %w", err)
+		}
+		if generation == 0 {
+			return Report{}, false, errors.New("report generation sequence is exhausted")
+		}
 		_, err = transaction.ExecContext(ctx, `
 INSERT INTO reports (
-    id, task_id, format, schema_version, status,
+    id, task_id, format, schema_version, status, snapshot_state, generation,
     generation_fence, generation_owner, generation_lease_until,
     generation_heartbeat_at, created_at
-) VALUES (?, ?, ?, ?, 'generating', 1, ?,
+) VALUES (?, ?, ?, ?, 'generating', 'staged', ?, 1, ?,
           DATE_ADD(UTC_TIMESTAMP(6), INTERVAL ? MICROSECOND),
           UTC_TIMESTAMP(6), ?)`,
 			claim.ReportID,
 			claim.TaskID,
 			string(claim.Format),
 			claim.SchemaVersion,
+			generation,
 			claim.LeaseOwner,
 			leaseMicros,
 			claim.CreatedAt,
@@ -168,6 +221,7 @@ INSERT INTO reports (
 		result = Report{
 			ID: claim.ReportID, TaskID: claim.TaskID, Format: claim.Format,
 			SchemaVersion: claim.SchemaVersion, Status: "generating",
+			SnapshotState: "staged", Generation: generation,
 			CreatedAt: claim.CreatedAt, GenerationOwner: claim.LeaseOwner,
 			GenerationFence: 1,
 		}
@@ -178,60 +232,6 @@ INSERT INTO reports (
 		return Report{}, false, fmt.Errorf("commit report claim: %w", err)
 	}
 	return result, true, nil
-}
-
-func restartFailedReport(
-	ctx context.Context,
-	transaction *sql.Tx,
-	existing Report,
-	leaseOwner string,
-	leaseMicros int64,
-) (Report, error) {
-	result, err := transaction.ExecContext(ctx, `
-UPDATE reports
-SET status = 'generating',
-    generation_fence = generation_fence + 1,
-    generation_owner = ?,
-    generation_lease_until =
-        DATE_ADD(UTC_TIMESTAMP(6), INTERVAL ? MICROSECOND),
-    generation_heartbeat_at = UTC_TIMESTAMP(6),
-    storage_key = NULL,
-    sha256 = NULL,
-    size_bytes = NULL,
-    error_code = NULL,
-    error_message = NULL,
-    completed_at = NULL,
-    deleted_at = NULL
-WHERE task_id = ? AND id = ? AND status = 'failed'`,
-		leaseOwner, leaseMicros, existing.TaskID, existing.ID,
-	)
-	if err != nil {
-		return Report{}, fmt.Errorf("restart failed report: %w", err)
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return Report{}, fmt.Errorf("inspect restarted report: %w", err)
-	}
-	if affected != 1 {
-		return Report{}, ErrGenerationInProgress
-	}
-	var fence uint64
-	if err := transaction.QueryRowContext(ctx, `
-SELECT generation_fence
-FROM reports
-WHERE task_id = ? AND id = ?
-LIMIT 1`, existing.TaskID, existing.ID).Scan(&fence); err != nil {
-		return Report{}, fmt.Errorf("read restarted report fence: %w", err)
-	}
-	existing.Status = "generating"
-	existing.GenerationOwner = leaseOwner
-	existing.GenerationFence = fence
-	existing.SHA256 = nil
-	existing.SizeBytes = nil
-	existing.ErrorCode = nil
-	existing.ErrorMessage = nil
-	existing.CompletedAt = nil
-	return existing, nil
 }
 
 func (r *MySQLRepository) Renew(
@@ -255,6 +255,7 @@ SET report.generation_lease_until =
 WHERE report.task_id = ?
   AND report.id = ?
   AND report.status = 'generating'
+  AND report.snapshot_state = 'staged'
   AND report.generation_owner = ?
   AND report.generation_fence = ?
   AND task.deleted_at IS NULL
@@ -280,8 +281,9 @@ func (r *MySQLRepository) AuthorizePublish(
 ) error {
 	var taskStatus string
 	var reportStatus string
+	var snapshotState string
 	err := r.db.QueryRowContext(ctx, `
-SELECT task.status, report.status
+SELECT task.status, report.status, report.snapshot_state
 FROM tasks task
 JOIN reports report ON report.task_id = task.id
 WHERE task.id = ?
@@ -292,7 +294,7 @@ WHERE task.id = ?
   AND report.generation_fence = ?
   AND report.generation_lease_until > UTC_TIMESTAMP(6)
 LIMIT 1`, taskID, reportID, leaseOwner, fence).Scan(
-		&taskStatus, &reportStatus,
+		&taskStatus, &reportStatus, &snapshotState,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrReportConflict
@@ -303,7 +305,7 @@ LIMIT 1`, taskID, reportID, leaseOwner, fence).Scan(
 	if !reportableTaskStatus(taskStatus) {
 		return ErrTaskNotTerminal
 	}
-	if reportStatus != "generating" {
+	if reportStatus != "generating" || snapshotState != "staged" {
 		return ErrReportConflict
 	}
 	return nil
@@ -340,10 +342,53 @@ FOR UPDATE`, taskID).Scan(&taskStatus)
 	if !reportableTaskStatus(taskStatus) {
 		return Report{}, ErrTaskNotTerminal
 	}
+	var reportFormat string
+	var schemaVersion string
+	var generation uint64
+	var reportStatus string
+	var snapshotState string
+	err = tx.QueryRowContext(ctx, `
+SELECT format, schema_version, generation, status, snapshot_state
+FROM reports
+WHERE task_id = ? AND id = ? AND deleted_at IS NULL
+  AND generation_owner = ? AND generation_fence = ?
+  AND generation_lease_until > UTC_TIMESTAMP(6)
+FOR UPDATE`, taskID, reportID, leaseOwner, fence).Scan(
+		&reportFormat, &schemaVersion, &generation, &reportStatus, &snapshotState,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Report{}, ErrReportConflict
+	}
+	if err != nil {
+		return Report{}, fmt.Errorf("lock staged report replacement: %w", err)
+	}
+	if reportStatus != "generating" || snapshotState != "staged" ||
+		generation == 0 {
+		return Report{}, ErrReportConflict
+	}
+	if err := insertCAnalysisDependencies(
+		ctx, tx, taskID, reportID, generation, artifact.Dependencies,
+	); err != nil {
+		return Report{}, err
+	}
+	if err := insertJavaAnalysisDependencies(
+		ctx, tx, taskID, reportID, generation, artifact.JavaDependencies,
+	); err != nil {
+		return Report{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE reports
+SET snapshot_state = 'stale'
+WHERE task_id = ? AND format = ? AND schema_version = ?
+  AND snapshot_state = 'current' AND status = 'complete'
+  AND deleted_at IS NULL`, taskID, reportFormat, schemaVersion); err != nil {
+		return Report{}, fmt.Errorf("stale previous report snapshot: %w", err)
+	}
 
 	result, err := tx.ExecContext(ctx, `
 UPDATE reports
 SET status = 'complete',
+    snapshot_state = 'current',
     storage_key = ?,
     sha256 = ?,
     size_bytes = ?,
@@ -354,6 +399,7 @@ SET status = 'complete',
     generation_heartbeat_at = NULL,
     completed_at = ?
 WHERE task_id = ? AND id = ? AND status = 'generating'
+  AND snapshot_state = 'staged'
   AND generation_owner = ?
   AND generation_fence = ?
   AND generation_lease_until > UTC_TIMESTAMP(6)`,
@@ -386,6 +432,124 @@ WHERE task_id = ? AND id = ? AND status = 'generating'
 	return value, nil
 }
 
+func insertCAnalysisDependencies(
+	ctx context.Context,
+	tx *sql.Tx,
+	taskID string,
+	reportID string,
+	generation uint64,
+	dependencies []CAnalysisDependency,
+) error {
+	seenRuns := make(map[string]struct{}, len(dependencies))
+	seenProjects := make(map[string]struct{}, len(dependencies))
+	for _, dependency := range dependencies {
+		if !uuidPattern.MatchString(dependency.RunID) ||
+			!uuidPattern.MatchString(dependency.ProjectID) ||
+			!sha256Pattern.MatchString(dependency.SourceSHA256) ||
+			dependency.CompletedAt.IsZero() {
+			return errors.New("report C-analysis dependency is invalid")
+		}
+		if _, exists := seenRuns[dependency.RunID]; exists {
+			return errors.New("report C-analysis run dependency is duplicated")
+		}
+		if _, exists := seenProjects[dependency.ProjectID]; exists {
+			return errors.New("report C-analysis project dependency is duplicated")
+		}
+		seenRuns[dependency.RunID] = struct{}{}
+		seenProjects[dependency.ProjectID] = struct{}{}
+		result, err := tx.ExecContext(ctx, `
+INSERT INTO report_c_analysis_runs (
+    report_id, task_id, run_id, project_id, report_generation,
+    run_completed_at, source_sha256
+)
+SELECT ?, run.task_id, run.id, run.source_project_id, ?,
+       run.completed_at, run.source_sha256
+FROM c_analysis_runs run
+JOIN decompile_source_projects project
+  ON project.task_id = run.task_id AND project.id = run.source_project_id
+WHERE run.task_id = ? AND run.id = ? AND run.source_project_id = ?
+  AND run.status IN ('succeeded', 'partial')
+  AND run.deletion_started_at IS NULL
+  AND run.completed_at = ? AND run.source_sha256 = ?
+  AND project.deleted_at IS NULL AND project.storage_deleted_at IS NULL`,
+			reportID, generation, taskID, dependency.RunID,
+			dependency.ProjectID, dependency.CompletedAt,
+			dependency.SourceSHA256,
+		)
+		if err != nil {
+			return fmt.Errorf("insert report C-analysis dependency: %w", err)
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("inspect report C-analysis dependency: %w", err)
+		}
+		if affected != 1 {
+			return ErrReportConflict
+		}
+	}
+	return nil
+}
+
+func insertJavaAnalysisDependencies(
+	ctx context.Context,
+	tx *sql.Tx,
+	taskID string,
+	reportID string,
+	generation uint64,
+	dependencies []JavaAnalysisDependency,
+) error {
+	seenRuns := make(map[string]struct{}, len(dependencies))
+	seenProjects := make(map[string]struct{}, len(dependencies))
+	for _, dependency := range dependencies {
+		if !uuidPattern.MatchString(dependency.RunID) ||
+			!uuidPattern.MatchString(dependency.ProjectID) ||
+			!sha256Pattern.MatchString(dependency.SourceManifestSHA256) ||
+			!sha256Pattern.MatchString(dependency.InputSHA256) ||
+			dependency.CompletedAt.IsZero() {
+			return errors.New("report Java-analysis dependency is invalid")
+		}
+		if _, exists := seenRuns[dependency.RunID]; exists {
+			return errors.New("report Java-analysis run dependency is duplicated")
+		}
+		if _, exists := seenProjects[dependency.ProjectID]; exists {
+			return errors.New("report Java-analysis project dependency is duplicated")
+		}
+		seenRuns[dependency.RunID] = struct{}{}
+		seenProjects[dependency.ProjectID] = struct{}{}
+		result, err := tx.ExecContext(ctx, `
+INSERT INTO report_java_analysis_runs (
+    report_id, task_id, run_id, project_id, report_generation,
+    run_completed_at, source_manifest_sha256, input_sha256
+)
+SELECT ?, run.task_id, run.id, run.source_project_id, ?,
+       run.completed_at, run.source_manifest_sha256, run.input_sha256
+FROM java_analysis_runs run
+JOIN decompile_source_projects project
+  ON project.task_id = run.task_id AND project.id = run.source_project_id
+WHERE run.task_id = ? AND run.id = ? AND run.source_project_id = ?
+  AND run.status IN ('succeeded', 'partial')
+  AND run.deletion_started_at IS NULL
+  AND run.completed_at = ?
+  AND run.source_manifest_sha256 = ? AND run.input_sha256 = ?
+  AND project.deleted_at IS NULL AND project.storage_deleted_at IS NULL`,
+			reportID, generation, taskID, dependency.RunID,
+			dependency.ProjectID, dependency.CompletedAt,
+			dependency.SourceManifestSHA256, dependency.InputSHA256,
+		)
+		if err != nil {
+			return fmt.Errorf("insert report Java-analysis dependency: %w", err)
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("inspect report Java-analysis dependency: %w", err)
+		}
+		if affected != 1 {
+			return ErrReportConflict
+		}
+	}
+	return nil
+}
+
 func (r *MySQLRepository) Fail(
 	ctx context.Context,
 	taskID string,
@@ -399,6 +563,7 @@ func (r *MySQLRepository) Fail(
 	result, err := r.db.ExecContext(ctx, `
 UPDATE reports
 SET status = 'failed',
+	    snapshot_state = 'stale',
     storage_key = NULL,
     sha256 = NULL,
     size_bytes = NULL,
@@ -409,6 +574,7 @@ SET status = 'failed',
     generation_heartbeat_at = NULL,
     completed_at = ?
 WHERE task_id = ? AND id = ? AND status = 'generating'
+	  AND snapshot_state = 'staged'
   AND generation_owner = ?
   AND generation_fence = ?`,
 		errorCode, errorMessage, completedAt, taskID, reportID,
@@ -423,6 +589,67 @@ WHERE task_id = ? AND id = ? AND status = 'generating'
 	}
 	if affected != 1 {
 		return ErrReportConflict
+	}
+	return nil
+}
+
+type SQLExecutor interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+// InvalidateTaskCAnalysisReports atomically stales visible report snapshots and
+// fences staged replacements. C-analysis publication should call this with its
+// transaction before committing new terminal results, so an older snapshot can
+// never become current after those results are visible.
+func InvalidateTaskCAnalysisReports(
+	ctx context.Context,
+	executor SQLExecutor,
+	taskID string,
+) error {
+	return InvalidateTaskSourceAnalysisReports(ctx, executor, taskID)
+}
+
+// InvalidateTaskSourceAnalysisReports atomically stales every visible report
+// snapshot and fences staged replacements before a C or Java analysis result
+// becomes visible.
+func InvalidateTaskSourceAnalysisReports(
+	ctx context.Context,
+	executor SQLExecutor,
+	taskID string,
+) error {
+	if executor == nil || !uuidPattern.MatchString(taskID) {
+		return errors.New("report invalidation input is invalid")
+	}
+	_, err := executor.ExecContext(ctx, `
+UPDATE reports
+SET generation_fence = CASE
+        WHEN status = 'generating' THEN generation_fence + 1
+        ELSE generation_fence
+    END,
+    generation_owner = CASE WHEN status = 'generating' THEN NULL ELSE generation_owner END,
+    generation_lease_until = CASE WHEN status = 'generating' THEN NULL ELSE generation_lease_until END,
+	    generation_heartbeat_at = CASE WHEN status = 'generating' THEN NULL ELSE generation_heartbeat_at END,
+	    error_code = CASE
+	        WHEN status IN ('queued', 'generating') THEN 'report_snapshot_changed'
+	        ELSE error_code
+	    END,
+	    error_message = CASE
+	        WHEN status IN ('queued', 'generating') THEN 'Report inputs changed during generation.'
+	        ELSE error_message
+	    END,
+	    completed_at = CASE
+	        WHEN status IN ('queued', 'generating') THEN UTC_TIMESTAMP(6)
+	        ELSE completed_at
+	    END,
+	    status = CASE WHEN status IN ('queued', 'generating') THEN 'failed' ELSE status END,
+	    snapshot_state = 'stale'
+WHERE task_id = ? AND deleted_at IS NULL
+  AND (
+      (snapshot_state = 'current' AND status = 'complete') OR
+	      (snapshot_state = 'staged' AND status IN ('queued', 'generating'))
+  )`, taskID)
+	if err != nil {
+		return fmt.Errorf("invalidate reports for source-analysis publication: %w", err)
 	}
 	return nil
 }
@@ -444,6 +671,8 @@ FROM reports report
 JOIN tasks task ON task.id = report.task_id
 WHERE report.task_id = ?
   AND report.id = ?
+  AND report.status = 'complete'
+  AND report.snapshot_state = 'current'
   AND report.deleted_at IS NULL
   AND task.deleted_at IS NULL
 LIMIT 1`, taskID, reportID).Scan(
@@ -495,6 +724,7 @@ func queryReportByIdentity(
 		ctx,
 		reportColumns+`
 WHERE task_id = ? AND format = ? AND schema_version = ?
+  AND snapshot_state = 'current' AND deleted_at IS NULL
 LIMIT 1`+suffix,
 		taskID,
 		string(format),
@@ -532,6 +762,8 @@ func scanReport(scanner rowScanner) (Report, error) {
 		&format,
 		&value.SchemaVersion,
 		&value.Status,
+		&value.SnapshotState,
+		&value.Generation,
 		&digest,
 		&size,
 		&errorCode,

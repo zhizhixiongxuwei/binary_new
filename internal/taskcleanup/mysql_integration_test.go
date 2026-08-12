@@ -1,4 +1,4 @@
-package taskcleanup
+package taskcleanup_test
 
 import (
 	"context"
@@ -15,6 +15,7 @@ import (
 
 	reportstore "binaryscan/internal/report"
 	taskstore "binaryscan/internal/task"
+	"binaryscan/internal/taskcleanup"
 
 	"github.com/go-sql-driver/mysql"
 )
@@ -76,14 +77,14 @@ func TestMySQLTaskDeletionCleanupIntegration(t *testing.T) {
 	t.Cleanup(func() {
 		cleanupTaskCleanupFixture(t, db, repositoryRoot, fixture)
 	})
-	deleter, err := NewRepositoryFileDeleter(repositoryRoot)
+	deleter, err := taskcleanup.NewRepositoryFileDeleter(repositoryRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sweeper, err := NewSweeper(
-		NewMySQLRepository(db),
+	sweeper, err := taskcleanup.NewSweeper(
+		taskcleanup.NewMySQLRepository(db),
 		deleter,
-		Config{
+		taskcleanup.Config{
 			LeaseOwner:    "task-deletion/integration",
 			LeaseDuration: time.Minute,
 		},
@@ -128,7 +129,7 @@ WHERE barrier.task_id = ? AND barrier.id = ? AND queued.id = ?`,
 		)
 	}
 	blocked, err := sweeper.Sweep(ctx, 10)
-	if err != nil || blocked != (Report{}) {
+	if err != nil || blocked != (taskcleanup.Report{}) {
 		t.Fatalf("barrier Sweep() = (%+v, %v)", blocked, err)
 	}
 	if _, err := db.ExecContext(ctx, `
@@ -155,7 +156,7 @@ WHERE task_id = ? AND id = ?`,
 	assertTaskCleanupFinalState(t, ctx, db, repositoryRoot, fixture)
 
 	second, err := sweeper.Sweep(ctx, 10)
-	if err != nil || second != (Report{}) {
+	if err != nil || second != (taskcleanup.Report{}) {
 		t.Fatalf("replayed Sweep() = (%+v, %v)", second, err)
 	}
 	assertTaskCleanupFinalState(t, ctx, db, repositoryRoot, fixture)
@@ -331,9 +332,10 @@ VALUES (?, ?, ?)`, fixture.taskID, nestedNodeID, fixture.nestedBlobID); err != n
 	}
 	if _, err := db.ExecContext(ctx, `
 INSERT INTO reports (
-    id, task_id, format, schema_version, status, storage_key, sha256,
+    id, task_id, format, schema_version, status, snapshot_state,
+    storage_key, sha256,
     size_bytes, completed_at
-) VALUES (?, ?, 'json', '1.0.0', 'complete', ?, ?, ?, UTC_TIMESTAMP(6))`,
+) VALUES (?, ?, 'json', '1.0.0', 'complete', 'current', ?, ?, ?, UTC_TIMESTAMP(6))`,
 		fixture.reportID, fixture.taskID, reportKey, cleanupSHA(reportContent),
 		len(reportContent),
 	); err != nil {
@@ -612,4 +614,20 @@ func cleanupUUID(t *testing.T) string {
 	encoded := hex.EncodeToString(raw[:])
 	return encoded[0:8] + "-" + encoded[8:12] + "-" +
 		encoded[12:16] + "-" + encoded[16:20] + "-" + encoded[20:32]
+}
+
+func writeCleanupFile(t *testing.T, root, key string, content []byte) {
+	t.Helper()
+	full := filepath.Join(root, key)
+	if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(full, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func cleanupSHA(content []byte) string {
+	digest := sha256.Sum256(content)
+	return hex.EncodeToString(digest[:])
 }

@@ -26,6 +26,7 @@ watch(
 
 defineExpose({
   refresh: results.refresh,
+  openResult: results.openResult,
 })
 </script>
 

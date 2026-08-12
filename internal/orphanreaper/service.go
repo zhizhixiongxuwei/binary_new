@@ -28,6 +28,20 @@ type Repository interface {
 	) (BlobReferenceResult, error)
 	BlobReferenced(context.Context, BlobCandidate) (bool, error)
 	UploadReferenced(context.Context, UploadCandidate) (bool, error)
+	ListPendingSourceProjects(
+		context.Context, int,
+	) ([]PendingSourceProject, error)
+	CleanupPendingSourceProject(
+		context.Context,
+		PendingSourceProject,
+		func(context.Context, SourceProjectCleanupTarget) error,
+	) (bool, error)
+	SourceProjectReferenced(context.Context, SourceProjectCandidate) (bool, error)
+	DeleteOrphanSourceProject(
+		context.Context,
+		SourceProjectCandidate,
+		func(context.Context) error,
+	) (bool, error)
 	StoredFileReferenced(context.Context, StoredFileCandidate) (bool, error)
 	DeleteOrphanBlob(
 		context.Context,
@@ -157,6 +171,35 @@ func (s *Sweeper) Sweep(ctx context.Context, limit int) (Report, error) {
 			report.CorrectedBlobReferences++
 		}
 	}
+	pendingProjects, err := s.repository.ListPendingSourceProjects(ctx, limit)
+	if err != nil {
+		return report, errors.Join(
+			fmt.Errorf("list pending source project cleanup: %w", err),
+			errors.Join(itemErrors...),
+		)
+	}
+	for _, candidate := range pendingProjects {
+		if err := ctx.Err(); err != nil {
+			return report, errors.Join(err, errors.Join(itemErrors...))
+		}
+		report.PendingSourceProjects++
+		if s.dryRun {
+			continue
+		}
+		completed, cleanupErr := s.repository.CleanupPendingSourceProject(
+			ctx, candidate, s.deleteSourceProjectTarget,
+		)
+		if cleanupErr != nil {
+			report.addDiagnostic("source-project", candidate.ID, cleanupErr)
+			itemErrors = append(itemErrors, cleanupErr)
+			continue
+		}
+		if completed {
+			report.CompletedSourceProjects++
+		} else {
+			report.RecheckProtected++
+		}
+	}
 	blobs, blobDeferred, blobDiagnostics, err := s.inventory.nextBlobs(ctx, limit, cutoff)
 	report.DeferredYoungBlobs += blobDeferred
 	for _, diagnostic := range blobDiagnostics {
@@ -170,6 +213,15 @@ func (s *Sweeper) Sweep(ctx context.Context, limit int) (Report, error) {
 	)
 	report.DeferredYoungUpload += uploadDeferred
 	for _, diagnostic := range uploadDiagnostics {
+		report.addDiagnostic(diagnostic.Kind, diagnostic.Name, diagnostic.Err)
+	}
+	if err != nil {
+		return report, err
+	}
+	sourceProjects, sourceProjectDeferred, sourceProjectDiagnostics, err :=
+		s.inventory.nextSourceProjects(ctx, limit, cutoff)
+	report.DeferredYoungSourceProject += sourceProjectDeferred
+	for _, diagnostic := range sourceProjectDiagnostics {
 		report.addDiagnostic(diagnostic.Kind, diagnostic.Name, diagnostic.Err)
 	}
 	if err != nil {
@@ -271,6 +323,50 @@ func (s *Sweeper) Sweep(ctx context.Context, limit int) (Report, error) {
 		}
 	}
 
+	for _, candidate := range sourceProjects {
+		if err := ctx.Err(); err != nil {
+			return report, errors.Join(err, errors.Join(itemErrors...))
+		}
+		report.SourceProjectDirsScanned++
+		referenced, err := s.repository.SourceProjectReferenced(ctx, candidate)
+		if err != nil {
+			report.addDiagnostic("source-project", candidate.ID, err)
+			itemErrors = append(itemErrors, err)
+			continue
+		}
+		if referenced {
+			report.ReferencedSourceProjects++
+			continue
+		}
+		report.OrphanSourceProjects++
+		if s.dryRun {
+			continue
+		}
+		removed, err := s.repository.DeleteOrphanSourceProject(
+			ctx,
+			candidate,
+			func(deleteCtx context.Context) error {
+				if err := s.inventory.revalidateSourceProject(candidate); err != nil {
+					return err
+				}
+				return s.storedDeleter.DeleteScope(deleteCtx, taskcleanup.Scope{
+					Kind:   taskcleanup.FileSourceProject,
+					TaskID: candidate.ID, RecordID: candidate.ID,
+				})
+			},
+		)
+		if err != nil {
+			report.addDiagnostic("source-project", candidate.ID, err)
+			itemErrors = append(itemErrors, err)
+			continue
+		}
+		if removed {
+			report.RemovedSourceProjects++
+		} else {
+			report.RecheckProtected++
+		}
+	}
+
 	for _, candidate := range storedFiles {
 		if err := ctx.Err(); err != nil {
 			return report, errors.Join(err, errors.Join(itemErrors...))
@@ -288,6 +384,33 @@ func (s *Sweeper) Sweep(ctx context.Context, limit int) (Report, error) {
 		}
 		report.OrphanStoredFiles++
 		if s.dryRun {
+			continue
+		}
+		if candidate.Kind == StoredFileReportStaging {
+			removed, deleteErr := s.repository.DeleteOrphanStoredFile(
+				ctx,
+				candidate,
+				func(deleteCtx context.Context) error {
+					deleted, err := s.inventory.deleteReportStaging(deleteCtx, candidate)
+					if err != nil {
+						return err
+					}
+					if !deleted {
+						return errors.New("report staging orphan disappeared before deletion")
+					}
+					return nil
+				},
+			)
+			if deleteErr != nil {
+				report.addDiagnostic(string(candidate.Kind), candidate.StorageKey, deleteErr)
+				itemErrors = append(itemErrors, deleteErr)
+				continue
+			}
+			if removed {
+				report.RemovedStoredFiles++
+			} else {
+				report.RecheckProtected++
+			}
 			continue
 		}
 		descriptor, err := storedFileDescriptor(candidate)
@@ -322,6 +445,38 @@ func (s *Sweeper) Sweep(ctx context.Context, limit int) (Report, error) {
 		}
 	}
 	return report, errors.Join(itemErrors...)
+}
+
+func (s *Sweeper) deleteSourceProjectTarget(
+	ctx context.Context,
+	target SourceProjectCleanupTarget,
+) error {
+	if !canonicalObjectID.MatchString(target.ProjectID) ||
+		!canonicalObjectID.MatchString(target.TaskID) {
+		return errors.New("source project cleanup target is invalid")
+	}
+	switch target.LayoutVersion {
+	case "project-v1":
+		return s.storedDeleter.DeleteScope(ctx, taskcleanup.Scope{
+			Kind:   taskcleanup.FileSourceProject,
+			TaskID: target.TaskID, RecordID: target.ProjectID,
+		})
+	case "legacy-v1":
+		for _, resultID := range target.LegacyResultIDs {
+			if !canonicalObjectID.MatchString(resultID) {
+				return errors.New("legacy source project cleanup target is invalid")
+			}
+			if err := s.storedDeleter.DeleteScope(ctx, taskcleanup.Scope{
+				Kind:   taskcleanup.FileDecompile,
+				TaskID: target.TaskID, RecordID: resultID,
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		return errors.New("source project cleanup layout is invalid")
+	}
 }
 
 func storedFileDescriptor(

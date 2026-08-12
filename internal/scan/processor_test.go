@@ -382,6 +382,79 @@ func TestProcessorExtractsIndexesAndPublishesArchiveTree(t *testing.T) {
 	}
 }
 
+func TestProcessorReservesSandboxCapacityForExternalArchives(t *testing.T) {
+	repositoryRoot := t.TempDir()
+	content := []byte("small frozen archive")
+	sample := writeSample(t, repositoryRoot, "archive.7z", content)
+	sample.Limits = extract.Limits{
+		MaxExpandedBytes: 10 << 30,
+		MaxEntryBytes:    2 << 30,
+		MaxNodes:         100,
+		MaxDepth:         6,
+		MaxRatio:         50,
+	}
+	processor, err := NewProcessor(
+		processorRepository(sample, nil),
+		successProgress(),
+		detectorStub{detect: func(io.ReaderAt, int64) (filetype.Result, error) {
+			return filetype.Result{
+				Format: "7z", MIMEType: "application/x-7z-compressed",
+				Metadata: map[string]any{},
+			}, nil
+		}},
+		repositoryRoot,
+		t.TempDir(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reserved := false
+	released := false
+	processor.reserveArchive = func(
+		_ context.Context,
+		sourceBytes, expandedBytes int64,
+	) (func(), error) {
+		if sourceBytes != int64(len(content)) ||
+			expandedBytes != int64(len(content))*50 {
+			t.Fatalf("capacity reservation = (%d, %d)", sourceBytes, expandedBytes)
+		}
+		reserved = true
+		return func() { released = true }, nil
+	}
+	processor.newExtractor = func(Detector, extract.Limits) extractionEngine {
+		return extractionEngineStub{
+			supports: func(format string) bool { return format == "7z" },
+			extract: func(
+				context.Context, *os.File, string, string,
+			) (extract.Result, error) {
+				if !reserved || released {
+					t.Fatal("sandbox capacity was not held during extraction")
+				}
+				return extract.Result{}, nil
+			},
+		}
+	}
+	finish, err := processor.Process(context.Background(), scanLease())
+	if err != nil || finish.Outcome != queue.OutcomeSucceeded {
+		t.Fatalf("Process() = %+v/%v", finish, err)
+	}
+	if !released {
+		t.Fatal("sandbox capacity reservation was not released")
+	}
+}
+
+func TestArchiveExpandedCapacityUsesRatioBoundForSmallInputs(t *testing.T) {
+	limits := extract.Limits{MaxExpandedBytes: 10 << 30, MaxRatio: 50}
+	expanded, err := archiveExpandedCapacity(4<<10, limits)
+	if err != nil || expanded != 200<<10 {
+		t.Fatalf("archiveExpandedCapacity() = %d/%v", expanded, err)
+	}
+	expanded, err = archiveExpandedCapacity(2<<30, limits)
+	if err != nil || expanded != 10<<30 {
+		t.Fatalf("capped archiveExpandedCapacity() = %d/%v", expanded, err)
+	}
+}
+
 func TestProcessorEnqueuesOnlyContainerImageArchivesAfterTreePublication(
 	t *testing.T,
 ) {

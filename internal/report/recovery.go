@@ -66,6 +66,7 @@ FOR UPDATE SKIP LOCKED`, limit)
 		result, err := tx.ExecContext(ctx, `
 UPDATE reports
 SET status = 'failed',
+	    snapshot_state = 'stale',
     generation_fence = generation_fence + 1,
     generation_owner = NULL,
     generation_lease_until = NULL,
@@ -79,6 +80,7 @@ SET status = 'failed',
 WHERE id = ?
   AND task_id = ?
   AND status = 'generating'
+	  AND snapshot_state = 'staged'
   AND generation_fence = ?
   AND generation_lease_until <= UTC_TIMESTAMP(6)`,
 			value.id, value.taskID, value.fence,
