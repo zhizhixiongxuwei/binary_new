@@ -346,7 +346,11 @@ func (s *Service) Source(
 		return SourceChunk{}, fmt.Errorf("%w: %v", ErrSourceUnavailable, err)
 	}
 	defer file.Close()
-	if uint64(info.Size()) != descriptor.SizeBytes {
+	storageSize := descriptor.SizeBytes
+	if descriptor.SourceRangeKnown {
+		storageSize = descriptor.StorageSizeBytes
+	}
+	if info.Size() < 0 || uint64(info.Size()) != storageSize {
 		return SourceChunk{}, fmt.Errorf(
 			"%w: stored size does not match metadata",
 			ErrSourceUnavailable,
@@ -355,31 +359,27 @@ func (s *Service) Source(
 	if query.Offset > descriptor.SizeBytes {
 		return SourceChunk{}, ErrInvalidInput
 	}
-	if err := verifySourceSHA256(ctx, file, descriptor.SHA256); err != nil {
-		return SourceChunk{}, err
-	}
-
 	remaining := descriptor.SizeBytes - query.Offset
 	readSize := uint64(query.Limit)
 	if readSize > remaining {
 		readSize = remaining
 	}
-	content := make([]byte, int(readSize))
-	if len(content) > 0 {
-		read, readErr := file.ReadAt(content, int64(query.Offset))
-		if readErr != nil && !errors.Is(readErr, io.EOF) {
-			return SourceChunk{}, fmt.Errorf(
-				"%w: read stored source: %v",
-				ErrSourceUnavailable,
-				readErr,
-			)
-		}
-		if read != len(content) {
-			return SourceChunk{}, fmt.Errorf(
-				"%w: stored source ended before its declared size",
-				ErrSourceUnavailable,
-			)
-		}
+	capture := sourceChunkCapture{
+		start: query.Offset, end: query.Offset + readSize,
+		content: make([]byte, 0, int(readSize)),
+	}
+	if err := copyVerifiedSourceSection(
+		ctx, &capture, file, info, descriptor.SourceOffsetBytes,
+		descriptor.SizeBytes, descriptor.SHA256,
+	); err != nil {
+		return SourceChunk{}, err
+	}
+	content := capture.content
+	if uint64(len(content)) != readSize {
+		return SourceChunk{}, fmt.Errorf(
+			"%w: stored source ended before its declared size",
+			ErrSourceUnavailable,
+		)
 	}
 	if err := ctx.Err(); err != nil {
 		return SourceChunk{}, err
@@ -403,6 +403,100 @@ func (s *Service) Source(
 		chunk.NextOffset = &next
 	}
 	return chunk, nil
+}
+
+type sourceChunkCapture struct {
+	start    uint64
+	end      uint64
+	position uint64
+	content  []byte
+}
+
+func (capture *sourceChunkCapture) Write(value []byte) (int, error) {
+	start := capture.position
+	end := start + uint64(len(value))
+	if start < capture.end && end > capture.start {
+		copyStart := capture.start
+		if copyStart < start {
+			copyStart = start
+		}
+		copyEnd := capture.end
+		if copyEnd > end {
+			copyEnd = end
+		}
+		capture.content = append(
+			capture.content,
+			value[copyStart-start:copyEnd-start]...,
+		)
+	}
+	capture.position = end
+	return len(value), nil
+}
+
+func copyVerifiedSourceSection(
+	ctx context.Context,
+	target io.Writer,
+	file *os.File,
+	openedInfo os.FileInfo,
+	offset uint64,
+	length uint64,
+	expected string,
+) error {
+	if offset > math.MaxInt64 || length > math.MaxInt64 ||
+		offset > uint64(math.MaxInt64)-length {
+		return ErrSourceUnavailable
+	}
+	if _, err := file.Seek(int64(offset), io.SeekStart); err != nil {
+		return fmt.Errorf("%w: seek stored source: %v", ErrSourceUnavailable, err)
+	}
+	hasher := sha256.New()
+	buffer := make([]byte, 256<<10)
+	remaining := length
+	for remaining > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		readSize := uint64(len(buffer))
+		if readSize > remaining {
+			readSize = remaining
+		}
+		read, readErr := file.Read(buffer[:readSize])
+		if read > 0 {
+			written, writeErr := target.Write(buffer[:read])
+			if writeErr != nil {
+				return fmt.Errorf("write verified source content: %w", writeErr)
+			}
+			if written != read {
+				return io.ErrShortWrite
+			}
+			_, _ = hasher.Write(buffer[:read])
+			remaining -= uint64(read)
+		}
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return fmt.Errorf("%w: read stored source: %v", ErrSourceUnavailable, readErr)
+		}
+		if read == 0 || (errors.Is(readErr, io.EOF) && remaining > 0) {
+			return fmt.Errorf(
+				"%w: stored source ended before its declared size",
+				ErrSourceUnavailable,
+			)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	currentInfo, err := file.Stat()
+	if err != nil || !os.SameFile(openedInfo, currentInfo) ||
+		currentInfo.Size() != openedInfo.Size() {
+		return fmt.Errorf("%w: stored source identity changed", ErrSourceUnavailable)
+	}
+	if hex.EncodeToString(hasher.Sum(nil)) != expected {
+		return fmt.Errorf(
+			"%w: stored source digest does not match metadata",
+			ErrSourceUnavailable,
+		)
+	}
+	return nil
 }
 
 func verifySourceSHA256(
@@ -450,6 +544,61 @@ func verifySourceSHA256(
 	}
 }
 
+func verifySourceSectionSHA256(
+	ctx context.Context,
+	file *os.File,
+	offset uint64,
+	length uint64,
+	expected string,
+) error {
+	if offset > math.MaxInt64 || length > math.MaxInt64 ||
+		offset > uint64(math.MaxInt64)-length {
+		return ErrSourceUnavailable
+	}
+	hasher := sha256.New()
+	buffer := make([]byte, 256<<10)
+	readOffset := offset
+	remaining := length
+	for remaining > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		readSize := uint64(len(buffer))
+		if readSize > remaining {
+			readSize = remaining
+		}
+		read, readErr := file.ReadAt(buffer[:readSize], int64(readOffset))
+		if read > 0 {
+			_, _ = hasher.Write(buffer[:read])
+			readOffset += uint64(read)
+			remaining -= uint64(read)
+		}
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return fmt.Errorf(
+				"%w: hash stored source range: %v",
+				ErrSourceUnavailable,
+				readErr,
+			)
+		}
+		if read == 0 || (errors.Is(readErr, io.EOF) && remaining > 0) {
+			return fmt.Errorf(
+				"%w: stored source range ended before its declared size",
+				ErrSourceUnavailable,
+			)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if hex.EncodeToString(hasher.Sum(nil)) != expected {
+		return fmt.Errorf(
+			"%w: stored source digest does not match metadata",
+			ErrSourceUnavailable,
+		)
+	}
+	return nil
+}
+
 func validUTF8Chunk(content []byte, reachesEnd bool) ([]byte, error) {
 	if utf8.Valid(content) {
 		return content, nil
@@ -486,6 +635,20 @@ func validateSourceDescriptor(
 		descriptor.SizeBytes > math.MaxInt64 {
 		return ErrSourceUnavailable
 	}
+	if descriptor.SourceRangeKnown {
+		if !descriptor.StorageSizeKnown ||
+			descriptor.SourceLengthBytes == 0 ||
+			descriptor.SourceLengthBytes != descriptor.SizeBytes ||
+			descriptor.StorageSizeBytes > math.MaxInt64 ||
+			descriptor.SourceOffsetBytes > descriptor.StorageSizeBytes ||
+			descriptor.SourceLengthBytes >
+				descriptor.StorageSizeBytes-descriptor.SourceOffsetBytes {
+			return ErrSourceUnavailable
+		}
+	} else if descriptor.SourceOffsetBytes != 0 ||
+		descriptor.SourceLengthBytes != 0 || descriptor.StorageSizeKnown {
+		return ErrSourceUnavailable
+	}
 	switch descriptor.Status {
 	case "complete", "partial", "bytecode_only":
 		return nil
@@ -517,6 +680,13 @@ func openRepositoryFile(
 		return nil, nil, fmt.Errorf("open repository root: %w", err)
 	}
 	defer root.Close()
+	openedRootInfo, err := root.Stat(".")
+	if err != nil {
+		return nil, nil, fmt.Errorf("inspect opened repository root: %w", err)
+	}
+	if !openedRootInfo.IsDir() || !os.SameFile(rootInfo, openedRootInfo) {
+		return nil, nil, errors.New("repository root changed while opening")
+	}
 
 	components := strings.Split(storageKey, "/")
 	current := ""

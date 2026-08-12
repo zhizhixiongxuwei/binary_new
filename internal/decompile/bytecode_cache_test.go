@@ -72,6 +72,14 @@ func TestBytecodeProcessorReusesVerifiedCacheIntoPrivateResult(t *testing.T) {
 	)); statErr != nil {
 		t.Fatalf("source cache was moved or removed: %v", statErr)
 	}
+	manifest, manifestErr := os.ReadFile(filepath.Join(
+		repositoryRoot,
+		filepath.FromSlash(repository.publishedProject.ManifestStorageKey),
+	))
+	if manifestErr != nil || !json.Valid(manifest) ||
+		repository.publishedProject.SourceFileCount != 1 {
+		t.Fatalf("cache-hit source project = %#v, manifest error = %v", repository.publishedProject, manifestErr)
+	}
 }
 
 func TestBytecodeProcessorReplaysPublishedBytecodeOnlyOutcome(t *testing.T) {
@@ -234,7 +242,9 @@ func TestBytecodeProcessorPreservesUnknownCacheCommitForRetry(t *testing.T) {
 		candidate.Results[0].SymbolKey,
 	)
 	privatePath := filepath.Join(
-		repositoryRoot, "decompile", resultID, "source.java",
+		repositoryRoot, sourceProjectRoot(
+			"623e4567-e89b-42d3-a456-426614174006",
+		), "src", "main", "java", resultID+".java",
 	)
 	if stored, readErr := os.ReadFile(privatePath); readErr != nil ||
 		string(stored) != "public class Cached {}\n" {
@@ -261,7 +271,7 @@ func TestMaterializeBytecodeCacheSupportsConcurrentPrivateHits(t *testing.T) {
 		wait.Add(1)
 		go func(index int, runID string) {
 			defer wait.Done()
-			values, _, err := processor.materializeBytecodeCache(
+			_, values, _, err := processor.materializeBytecodeCache(
 				context.Background(), runID, candidate, defaultJobLimits,
 			)
 			results[index], errorsByIndex[index] = values, err
@@ -350,7 +360,7 @@ func TestMaterializeBytecodeCacheRejectsUnsafeSources(t *testing.T) {
 			processor := &BytecodeProcessor{config: BytecodeProcessorConfig{
 				RepositoryRoot: repositoryRoot,
 			}}
-			_, cleanup, err := processor.materializeBytecodeCache(
+			_, _, cleanup, err := processor.materializeBytecodeCache(
 				context.Background(),
 				"623e4567-e89b-42d3-a456-426614174006",
 				candidate, defaultJobLimits,

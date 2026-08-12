@@ -269,7 +269,7 @@ func (r *MySQLRepository) PublishBytecodeRun(
 	); err != nil {
 		return err
 	}
-	results, cleanup, err := publish(ctx)
+	project, results, cleanup, err := publish(ctx)
 	if err != nil {
 		return fmt.Errorf("publish bytecode result files: %w", err)
 	}
@@ -278,7 +278,8 @@ func (r *MySQLRepository) PublishBytecodeRun(
 		cleanupPublished = cleanup
 	}
 	if len(results) == 0 || len(results) > payload.Limits.MaxArtifacts ||
-		!validBytecodePublicationStatus(resultStatus, results) {
+		!validBytecodePublicationStatus(resultStatus, results) ||
+		!validOptionalPublishedSourceProject(runID, project, results) {
 		return ErrRequestConflict
 	}
 	var totalSize uint64
@@ -310,6 +311,15 @@ INSERT INTO decompile_results (
 			sizeBytes, []byte(value.Diagnostics),
 		); err != nil {
 			return fmt.Errorf("insert bytecode decompile result: %w", err)
+		}
+	}
+	if project.ID != "" {
+		if err := insertPublishedSourceProject(
+			ctx, tx, lease.TaskID, nodeID, lease.JobID,
+			identity.EngineName, identity.EngineVersion,
+			string(resultStatus), project,
+		); err != nil {
+			return fmt.Errorf("insert bytecode source project: %w", err)
 		}
 	}
 	runStatus := "succeeded"
@@ -563,7 +573,7 @@ func validBytecodePublishedResult(
 		}
 	}
 	if value.Status == "complete" || value.Status == "bytecode_only" {
-		expectedPrefix := path.Join("decompile", value.ID) + "/"
+		expectedPrefix := sourceProjectRoot(runID) + "/"
 		return strings.HasPrefix(value.StorageKey, expectedPrefix) &&
 			path.Clean(value.StorageKey) == value.StorageKey &&
 			!strings.Contains(value.StorageKey, `\`) &&

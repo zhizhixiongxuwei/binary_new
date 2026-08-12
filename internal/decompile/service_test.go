@@ -17,14 +17,45 @@ import (
 )
 
 type repositoryStub struct {
-	enqueue       func(context.Context, CreateRecord) (Request, bool, error)
-	getRequest    func(context.Context, RequestQuery) (Request, error)
-	list          func(context.Context, ListQuery) (Page, error)
-	getSource     func(context.Context, SourceQuery) (SourceDescriptor, error)
-	enqueueCalled bool
-	requestCalled bool
-	listCalled    bool
-	sourceCalled  bool
+	enqueue         func(context.Context, CreateRecord) (Request, bool, error)
+	getRequest      func(context.Context, RequestQuery) (Request, error)
+	list            func(context.Context, ListQuery) (Page, error)
+	getSource       func(context.Context, SourceQuery) (SourceDescriptor, error)
+	archiveSnapshot func(context.Context, string, int) (sourceArchiveSnapshot, error)
+	enqueueCalled   bool
+	requestCalled   bool
+	listCalled      bool
+	sourceCalled    bool
+	archiveCalls    int
+}
+
+func (s *repositoryStub) ListSourceArchiveSnapshot(
+	ctx context.Context,
+	taskID string,
+	limit int,
+) (sourceArchiveSnapshot, error) {
+	s.archiveCalls++
+	if s.archiveSnapshot != nil {
+		return s.archiveSnapshot(ctx, taskID, limit)
+	}
+	page, err := s.List(ctx, ListQuery{TaskID: taskID, PageSize: limit})
+	if err != nil {
+		return sourceArchiveSnapshot{}, err
+	}
+	snapshot := sourceArchiveSnapshot{HasMore: page.HasMore}
+	for _, result := range page.Items {
+		item := sourceArchiveSnapshotItem{Result: result}
+		if resultSupportsSource(result.Status) {
+			item.Descriptor, err = s.GetSource(ctx, SourceQuery{
+				TaskID: taskID, ResultID: result.ID,
+			})
+			if err != nil {
+				return sourceArchiveSnapshot{}, err
+			}
+		}
+		snapshot.Items = append(snapshot.Items, item)
+	}
+	return snapshot, nil
 }
 
 func (s *repositoryStub) GetRequest(
@@ -467,6 +498,100 @@ func TestServiceReadsBoundedSourceChunks(t *testing.T) {
 	}
 	if end.Content != "" || !end.Complete || end.NextOffset != nil {
 		t.Fatalf("end Source() = %#v", end)
+	}
+}
+
+func TestServiceReadsFunctionFromCanonicalSourceRange(t *testing.T) {
+	root := t.TempDir()
+	const (
+		prefix   = "/* project header */\n"
+		function = "int verify(void) { return 1; }\n"
+		suffix   = "\n/* next function */\n"
+	)
+	canonical := prefix + function + suffix
+	if err := os.WriteFile(
+		filepath.Join(root, "decompiled.c"), []byte(canonical), 0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	repository := &repositoryStub{
+		getSource: func(
+			_ context.Context,
+			_ SourceQuery,
+		) (SourceDescriptor, error) {
+			return SourceDescriptor{
+				ResultID: testResultID, Status: "complete",
+				StorageKey: "decompiled.c", SHA256: sourceSHA256(function),
+				SizeBytes: uint64(len(function)), SizeKnown: true,
+				StorageSizeBytes: uint64(len(canonical)), StorageSizeKnown: true,
+				SourceOffsetBytes: uint64(len(prefix)),
+				SourceLengthBytes: uint64(len(function)), SourceRangeKnown: true,
+			}, nil
+		},
+	}
+	service, err := NewService(repository, Config{RepositoryRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := service.Source(context.Background(), SourceQuery{
+		TaskID: testTaskID, ResultID: testResultID, Limit: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Content != "int " || first.NextOffset == nil ||
+		*first.NextOffset != 4 || first.SizeBytes != uint64(len(function)) {
+		t.Fatalf("first ranged Source() = %#v", first)
+	}
+	rest, err := service.Source(context.Background(), SourceQuery{
+		TaskID: testTaskID, ResultID: testResultID, Offset: 4, Limit: 128,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Content+rest.Content != function || !rest.Complete {
+		t.Fatalf("ranged Source() content = %q + %q", first.Content, rest.Content)
+	}
+}
+
+func TestServiceRejectsTamperedCanonicalSourceRange(t *testing.T) {
+	root := t.TempDir()
+	const (
+		prefix   = "header\n"
+		original = "return true;"
+		tampered = "return  nil;"
+	)
+	canonical := prefix + tampered
+	if err := os.WriteFile(
+		filepath.Join(root, "decompiled.c"), []byte(canonical), 0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	repository := &repositoryStub{
+		getSource: func(
+			_ context.Context,
+			_ SourceQuery,
+		) (SourceDescriptor, error) {
+			return SourceDescriptor{
+				ResultID: testResultID, Status: "complete",
+				StorageKey: "decompiled.c", SHA256: sourceSHA256(original),
+				SizeBytes: uint64(len(original)), SizeKnown: true,
+				StorageSizeBytes: uint64(len(canonical)), StorageSizeKnown: true,
+				SourceOffsetBytes: uint64(len(prefix)),
+				SourceLengthBytes: uint64(len(original)), SourceRangeKnown: true,
+			}, nil
+		},
+	}
+	service, err := NewService(repository, Config{RepositoryRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := service.Source(context.Background(), SourceQuery{
+		TaskID: testTaskID, ResultID: testResultID, Limit: 32,
+	}); !errors.Is(err, ErrSourceUnavailable) {
+		t.Fatalf("Source() error = %v, want ErrSourceUnavailable", err)
 	}
 }
 

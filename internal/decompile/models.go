@@ -171,12 +171,17 @@ type SourceArchive struct {
 }
 
 type SourceDescriptor struct {
-	ResultID   string
-	Status     string
-	StorageKey string
-	SHA256     string
-	SizeBytes  uint64
-	SizeKnown  bool
+	ResultID          string
+	Status            string
+	StorageKey        string
+	SHA256            string
+	SizeBytes         uint64
+	SizeKnown         bool
+	StorageSizeBytes  uint64
+	StorageSizeKnown  bool
+	SourceOffsetBytes uint64
+	SourceLengthBytes uint64
+	SourceRangeKnown  bool
 }
 
 type SourceChunk struct {

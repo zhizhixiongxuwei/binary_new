@@ -44,9 +44,12 @@ type Request struct {
 	InputSHA256        string `json:"input_sha256,omitempty"`
 	InputSizeBytes     int64  `json:"input_size_bytes,omitempty"`
 	OutputName         string `json:"output_name,omitempty"`
+	OutputDevice       uint64 `json:"output_device,omitempty"`
+	OutputInode        uint64 `json:"output_inode,omitempty"`
 	MaxEntries         int    `json:"max_entries,omitempty"`
 	MaxEntryBytes      int64  `json:"max_entry_bytes,omitempty"`
 	MaxExpandedBytes   int64  `json:"max_expanded_bytes,omitempty"`
+	MinimumFreeBytes   int64  `json:"minimum_free_bytes,omitempty"`
 	MaxDurationSeconds int64  `json:"max_duration_seconds,omitempty"`
 }
 
@@ -71,24 +74,30 @@ func (request Request) validate() error {
 		if request.Engine != "" || request.Format != "" ||
 			request.InputName != "" || request.InputSHA256 != "" ||
 			request.InputSizeBytes != 0 || request.OutputName != "" ||
+			request.OutputDevice != 0 || request.OutputInode != 0 ||
 			request.MaxEntries != 0 || request.MaxEntryBytes != 0 ||
-			request.MaxExpandedBytes != 0 || request.MaxDurationSeconds != 0 {
+			request.MaxExpandedBytes != 0 || request.MinimumFreeBytes != 0 ||
+			request.MaxDurationSeconds != 0 {
 			return errors.New("archive sandbox ping contains unexpected fields")
 		}
 		return nil
 	case OperationIdentify:
 		if request.Engine != EngineLibmagic || request.Format != "" ||
-			request.OutputName != "" || request.MaxEntries != 0 ||
-			request.MaxEntryBytes != 0 || request.MaxExpandedBytes != 0 {
+			request.OutputName != "" || request.OutputDevice != 0 ||
+			request.OutputInode != 0 || request.MaxEntries != 0 ||
+			request.MaxEntryBytes != 0 || request.MaxExpandedBytes != 0 ||
+			request.MinimumFreeBytes != 0 {
 			return errors.New("archive sandbox identify request is invalid")
 		}
 	case OperationExtract:
 		validEngine := request.Engine == EngineSevenZip && request.Format == "7z" ||
 			request.Engine == EngineLibarchive && request.Format == "cab"
 		if !validEngine || request.OutputName != request.RequestID ||
+			request.OutputDevice == 0 || request.OutputInode == 0 ||
 			request.MaxEntries < 1 || request.MaxEntries > 100_000 ||
 			request.MaxEntryBytes < 1 || request.MaxEntryBytes > 10<<30 ||
-			request.MaxExpandedBytes < 1 || request.MaxExpandedBytes > 50<<30 {
+			request.MaxExpandedBytes < 1 || request.MaxExpandedBytes > 50<<30 ||
+			request.MinimumFreeBytes < 1 || request.MinimumFreeBytes > 50<<30 {
 			return errors.New("archive sandbox extraction request is invalid")
 		}
 	default:

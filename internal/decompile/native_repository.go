@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path"
 
 	"binaryscan/internal/queue"
 )
@@ -279,7 +280,7 @@ FOR UPDATE`,
 	if err != nil {
 		return fmt.Errorf("validate native result publication lease: %w", err)
 	}
-	results, cleanup, err := publish(ctx)
+	project, results, cleanup, err := publish(ctx)
 	if err != nil {
 		return fmt.Errorf("publish native result files: %w", err)
 	}
@@ -287,7 +288,9 @@ FOR UPDATE`,
 	if cleanup != nil {
 		cleanupPublished = cleanup
 	}
-	if len(results) == 0 || len(results) > payload.Limits.MaxArtifacts {
+	if len(results) == 0 || len(results) > payload.Limits.MaxArtifacts ||
+		!validPublishedSourceProject(runID, project, len(results)) ||
+		project.SourceSizeBytes > uint64(payload.Limits.MaxOutputBytes) {
 		return ErrRequestConflict
 	}
 	var totalSize uint64
@@ -307,18 +310,27 @@ INSERT INTO decompile_results (
     id, task_id, file_node_id, analyzer_run_id, cache_key,
     symbol_key, language, engine_name, engine_version, status,
     storage_key, content_sha256, size_bytes, diagnostics_json,
+	 source_offset_bytes, source_length_bytes,
+	 source_start_line, source_end_line,
     completed_at
 ) VALUES (
     ?, ?, ?, ?, ?, ?, 'c', 'ghidra', ?, 'complete',
-    ?, ?, ?, ?, UTC_TIMESTAMP(6)
+	?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(6)
 )`,
 			value.ID, lease.TaskID, nodeID, runID,
 			cache, value.SymbolKey, engineVersion,
 			value.StorageKey, value.SHA256, value.SizeBytes,
-			[]byte(value.Diagnostics),
+			[]byte(value.Diagnostics), value.SourceOffsetBytes,
+			value.SourceLengthBytes, value.SourceStartLine, value.SourceEndLine,
 		); err != nil {
 			return fmt.Errorf("insert native decompile result: %w", err)
 		}
+	}
+	if err := insertPublishedSourceProject(
+		ctx, tx, lease.TaskID, nodeID, lease.JobID, "ghidra",
+		engineVersion, completeness, project,
+	); err != nil {
+		return fmt.Errorf("insert native source project: %w", err)
 	}
 	result, err := tx.ExecContext(ctx, `
 UPDATE analyzer_runs
@@ -482,9 +494,10 @@ func validNativePublishedResult(
 	return uuidPattern.MatchString(value.ID) &&
 		value.ID == nativeResultID(runID, value.SymbolKey) &&
 		value.SymbolKey != "" && len(value.SymbolKey) <= 512 &&
-		value.StorageKey == "decompile/"+value.ID+"/source.c" &&
+		value.StorageKey == path.Join(sourceProjectRoot(runID), "src", "decompiled.c") &&
 		sha256Pattern.MatchString(value.SHA256) &&
-		value.SizeBytes > 0 && len(value.Diagnostics) > 0 &&
+		value.SizeBytes > 0 && value.SourceLengthBytes == value.SizeBytes &&
+		value.SourceStartLine > 0 && value.SourceEndLine >= value.SourceStartLine &&
 		json.Valid(value.Diagnostics)
 }
 

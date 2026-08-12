@@ -58,6 +58,7 @@ type fakeBytecodeRunRepository struct {
 	publishCalls      int
 	failCalls         int
 	published         []BytecodePublishedResult
+	publishedProject  PublishedSourceProject
 	identity          BytecodeRunIdentity
 	cacheCandidate    BytecodeCacheCandidate
 	cacheFound        bool
@@ -85,10 +86,12 @@ func (repository *fakeBytecodeRunRepository) PublishBytecodeCacheHit(
 	_ string,
 	_ BytecodeRunIdentity,
 	_ BytecodeCacheCandidate,
+	project PublishedSourceProject,
 	values []BytecodePublishedResult,
 ) error {
 	repository.cachePublishCalls++
 	if repository.cachePublishErr == nil {
+		repository.publishedProject = project
 		repository.published = values
 	}
 	return repository.cachePublishErr
@@ -123,7 +126,7 @@ func (repository *fakeBytecodeRunRepository) PublishBytecodeRun(
 	if repository.publishErr != nil && !repository.invokeThenFail {
 		return repository.publishErr
 	}
-	values, cleanup, err := publish(ctx)
+	project, values, cleanup, err := publish(ctx)
 	if err != nil {
 		return err
 	}
@@ -133,6 +136,7 @@ func (repository *fakeBytecodeRunRepository) PublishBytecodeRun(
 		}
 		return repository.publishErr
 	}
+	repository.publishedProject = project
 	repository.published = values
 	return nil
 }
@@ -258,6 +262,14 @@ func TestBytecodeProcessorPublishesVerifiedClassSource(t *testing.T) {
 		!sha256Pattern.MatchString(repository.identity.CacheParametersSHA) {
 		t.Fatalf("run identity = %#v", repository.identity)
 	}
+	manifest, err := os.ReadFile(filepath.Join(
+		repositoryRoot,
+		filepath.FromSlash(repository.publishedProject.ManifestStorageKey),
+	))
+	if err != nil || !json.Valid(manifest) ||
+		repository.publishedProject.SourceFileCount != 1 {
+		t.Fatalf("published source project = %#v, manifest error = %v", repository.publishedProject, err)
+	}
 	activity := processor.activity.(*bytecodeActivityStub)
 	phases := make([]string, 0, len(activity.inputs))
 	for _, input := range activity.inputs {
@@ -329,7 +341,7 @@ func TestBytecodeProcessorPublishesReadableBytecodeFallback(t *testing.T) {
 	}
 	value := repository.published[0]
 	if value.Status != "bytecode_only" || value.Language != "java-bytecode" ||
-		!strings.HasSuffix(value.StorageKey, "/bytecode.json") || value.SizeBytes == 0 {
+		!strings.HasSuffix(value.StorageKey, ".json") || value.SizeBytes == 0 {
 		t.Fatalf("fallback result = %#v", value)
 	}
 	stored, readErr := os.ReadFile(filepath.Join(
@@ -398,7 +410,7 @@ func TestBytecodeProcessorCleansPublishedAttemptAfterStaleFence(t *testing.T) {
 	if !errors.Is(err, ErrRequestConflict) || repository.failCalls != 1 {
 		t.Fatalf("Process() error=%v fail calls=%d", err, repository.failCalls)
 	}
-	entries, readErr := os.ReadDir(filepath.Join(repositoryRoot, "decompile"))
+	entries, readErr := os.ReadDir(filepath.Join(repositoryRoot, sourceProjectRootName))
 	if readErr != nil || len(entries) != 0 {
 		t.Fatalf("stale publication left entries=%v err=%v", entries, readErr)
 	}
@@ -543,6 +555,97 @@ func newTestBytecodeProcessor(
 		return "623e4567-e89b-42d3-a456-426614174006", nil
 	}
 	return processor
+}
+
+func TestSafeBytecodeProjectRelativePathBoundsCleanupDepth(t *testing.T) {
+	minimumArchiveEntryBudget := defaultJobLimits.MaxArtifacts*
+		maxBytecodeProjectPathComponents + 4
+	if maxSourceProjectArchiveEntries < minimumArchiveEntryBudget {
+		t.Fatalf(
+			"archive entry budget %d cannot export publisher maximum %d",
+			maxSourceProjectArchiveEntries, minimumArchiveEntryBudget,
+		)
+	}
+	withinLimit := strings.Repeat("pkg/", maxBytecodeProjectPathComponents-1) + "Type.java"
+	if got := safeBytecodeProjectRelativePath(withinLimit); got == "" {
+		t.Fatal("path at component limit was rejected")
+	}
+	tooDeep := strings.Repeat("pkg/", maxBytecodeProjectPathComponents) + "Type.java"
+	if got := safeBytecodeProjectRelativePath(tooDeep); got != "" {
+		t.Fatalf("over-deep project path = %q, want fallback signal", got)
+	}
+
+	logicalPath, err := bytecodeProjectPath(bytecode.ClassIndex{
+		BinaryName: strings.Repeat("pkg.", maxBytecodeProjectPathComponents) + "Type",
+		SourceFile: "sources/" + tooDeep, Language: "java",
+		Status: bytecode.ClassSource,
+	}, nil, testResultID, map[string]struct{}{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "src/main/java/" + testResultID + ".java"
+	if logicalPath != want {
+		t.Fatalf("over-deep project path = %q, want %q", logicalPath, want)
+	}
+	tooLong := strings.Repeat("a", maxBytecodeProjectPathComponentBytes+1) + ".java"
+	if got := safeBytecodeProjectRelativePath(tooLong); got != "" {
+		t.Fatalf("overlong project filename = %q, want fallback signal", got)
+	}
+
+	nearLimit := strings.Repeat(strings.Repeat("p", 117)+"/", 8) + "Type.java"
+	used := map[string]struct{}{}
+	first, err := bytecodeProjectPath(bytecode.ClassIndex{
+		BinaryName: "first.Type", SourceFile: "sources/" + nearLimit,
+		Language: "java", Status: bytecode.ClassSource,
+	}, nil, testResultID, used)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := bytecodeProjectPath(bytecode.ClassIndex{
+		BinaryName: "second.Type", SourceFile: "sources/" + nearLimit,
+		Language: "java", Status: bytecode.ClassSource,
+	}, nil, testJobID, used)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) > maxBytecodeProjectRelativePathBytes ||
+		first == "src/main/java/"+testResultID+".java" ||
+		second != "src/main/java/"+testJobID+".java" {
+		t.Fatalf("near-limit collision paths = %q / %q", first, second)
+	}
+	samePrefixID := "223e4567-e89b-42d3-a456-426614174099"
+	used = map[string]struct{}{}
+	for _, resultID := range []string{testResultID, samePrefixID} {
+		logicalPath, err := bytecodeProjectPath(bytecode.ClassIndex{
+			BinaryName: strings.Repeat("x", maxBytecodeProjectPathComponentBytes+1),
+			Language:   "java", Status: bytecode.ClassSource,
+		}, nil, resultID, used)
+		if err != nil {
+			t.Fatalf("full-ID fallback for %s failed: %v", resultID, err)
+		}
+		if logicalPath != "src/main/java/"+resultID+".java" {
+			t.Fatalf("full-ID fallback path = %q", logicalPath)
+		}
+	}
+	used = map[string]struct{}{}
+	upper, err := bytecodeProjectPath(bytecode.ClassIndex{
+		BinaryName: "pkg.Foo", SourceFile: "sources/pkg/Foo.java",
+		Language: "java", Status: bytecode.ClassSource,
+	}, nil, testResultID, used)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lower, err := bytecodeProjectPath(bytecode.ClassIndex{
+		BinaryName: "pkg.foo", SourceFile: "sources/pkg/foo.java",
+		Language: "java", Status: bytecode.ClassSource,
+	}, nil, samePrefixID, used)
+	if err != nil || strings.EqualFold(upper, lower) ||
+		!strings.Contains(lower, samePrefixID) {
+		t.Fatalf("case-only collision paths = %q / %q, error = %v", upper, lower, err)
+	}
+	if got := safeBytecodeProjectRelativePath("pkg/CON.java"); got != "pkg/_CON.java" {
+		t.Fatalf("Windows-reserved project path = %q", got)
+	}
 }
 
 func bytecodeProcessingFixture(

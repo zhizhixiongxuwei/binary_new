@@ -780,6 +780,132 @@ func (r *MySQLRepository) List(
 	return page, nil
 }
 
+func (r *MySQLRepository) ListSourceArchiveSnapshot(
+	ctx context.Context,
+	taskID string,
+	limit int,
+) (sourceArchiveSnapshot, error) {
+	if err := ctx.Err(); err != nil {
+		return sourceArchiveSnapshot{}, err
+	}
+	if !uuidPattern.MatchString(taskID) || limit < 1 || limit > maxSourceArchiveResults {
+		return sourceArchiveSnapshot{}, ErrInvalidInput
+	}
+	transaction, err := r.db.BeginTx(ctx, &sql.TxOptions{
+		Isolation: sql.LevelRepeatableRead,
+		ReadOnly:  true,
+	})
+	if err != nil {
+		return sourceArchiveSnapshot{}, fmt.Errorf(
+			"begin decompile source archive snapshot: %w", err,
+		)
+	}
+	defer transaction.Rollback()
+	if err := requireTask(ctx, transaction, taskID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return sourceArchiveSnapshot{}, ErrTaskNotFound
+		}
+		return sourceArchiveSnapshot{}, fmt.Errorf(
+			"find decompile source archive task: %w", err,
+		)
+	}
+	rows, err := transaction.QueryContext(ctx, `
+	SELECT result.id, result.file_node_id, result.symbol_key,
+	       result.language, result.engine_name, result.engine_version,
+	       result.status, result.size_bytes, result.diagnostics_json,
+	       result.created_at, result.completed_at,
+	       result.storage_key, result.content_sha256,
+	       result.source_offset_bytes, result.source_length_bytes,
+	       project.canonical_storage_key, project.canonical_size_bytes
+	FROM decompile_results result
+	LEFT JOIN decompile_source_projects project
+	  ON project.task_id = result.task_id
+	 AND project.id = result.analyzer_run_id
+	 AND project.deleted_at IS NULL
+	WHERE result.task_id = ? AND result.deleted_at IS NULL
+	ORDER BY result.created_at ASC, result.id ASC
+	LIMIT ?`, taskID, limit+1)
+	if err != nil {
+		return sourceArchiveSnapshot{}, fmt.Errorf(
+			"list decompile source archive snapshot: %w", err,
+		)
+	}
+	items := make([]sourceArchiveSnapshotItem, 0, limit+1)
+	for rows.Next() {
+		var (
+			value               Result
+			fileNodeID          uint64
+			sizeBytes           sql.Null[uint64]
+			diagnostics         []byte
+			completedAt         sql.NullTime
+			storageKey          sql.NullString
+			contentSHA256       sql.NullString
+			sourceOffsetBytes   sql.Null[uint64]
+			sourceLengthBytes   sql.Null[uint64]
+			canonicalStorageKey sql.NullString
+			canonicalSizeBytes  sql.Null[uint64]
+		)
+		if err := rows.Scan(
+			&value.ID, &fileNodeID, &value.SymbolKey, &value.Language,
+			&value.EngineName, &value.EngineVersion, &value.Status,
+			&sizeBytes, &diagnostics, &value.CreatedAt, &completedAt,
+			&storageKey, &contentSHA256,
+			&sourceOffsetBytes, &sourceLengthBytes,
+			&canonicalStorageKey, &canonicalSizeBytes,
+		); err != nil {
+			_ = rows.Close()
+			return sourceArchiveSnapshot{}, fmt.Errorf(
+				"scan decompile source archive snapshot: %w", err,
+			)
+		}
+		value, err = finishScannedResult(
+			value, fileNodeID, sizeBytes, diagnostics, completedAt,
+			storageKey, contentSHA256,
+		)
+		if err != nil {
+			_ = rows.Close()
+			return sourceArchiveSnapshot{}, fmt.Errorf(
+				"validate decompile source archive result: %w", err,
+			)
+		}
+		descriptor, err := sourceDescriptorFromMetadata(
+			value.ID, value.Status, storageKey, contentSHA256, sizeBytes,
+			sourceOffsetBytes, sourceLengthBytes,
+			canonicalStorageKey, canonicalSizeBytes,
+		)
+		if err != nil {
+			_ = rows.Close()
+			return sourceArchiveSnapshot{}, fmt.Errorf(
+				"validate decompile source archive metadata: %w", err,
+			)
+		}
+		items = append(items, sourceArchiveSnapshotItem{
+			Result: value, Descriptor: descriptor,
+		})
+	}
+	if err := rows.Close(); err != nil {
+		return sourceArchiveSnapshot{}, fmt.Errorf(
+			"close decompile source archive rows: %w", err,
+		)
+	}
+	if err := rows.Err(); err != nil {
+		return sourceArchiveSnapshot{}, fmt.Errorf(
+			"iterate decompile source archive rows: %w", err,
+		)
+	}
+	snapshot := sourceArchiveSnapshot{Items: items}
+	if len(snapshot.Items) > limit {
+		snapshot.HasMore = true
+		snapshot.Items = snapshot.Items[:limit]
+	}
+	if err := transaction.Commit(); err != nil {
+		return sourceArchiveSnapshot{}, fmt.Errorf(
+			"commit decompile source archive snapshot: %w", err,
+		)
+	}
+	return snapshot, nil
+}
+
 func (r *MySQLRepository) GetSource(
 	ctx context.Context,
 	query SourceQuery,
@@ -804,20 +930,37 @@ func (r *MySQLRepository) GetSource(
 		}
 		return SourceDescriptor{}, fmt.Errorf("find decompile source task: %w", err)
 	}
-	var descriptor SourceDescriptor
+	var resultID string
+	var status string
 	var storageKey sql.NullString
 	var sha256 sql.NullString
 	var sizeBytes sql.Null[uint64]
+	var sourceOffsetBytes sql.Null[uint64]
+	var sourceLengthBytes sql.Null[uint64]
+	var canonicalStorageKey sql.NullString
+	var canonicalSizeBytes sql.Null[uint64]
 	err = transaction.QueryRowContext(ctx, `
-SELECT id, status, storage_key, content_sha256, size_bytes
-FROM decompile_results
-WHERE task_id = ? AND id = ? AND deleted_at IS NULL
-LIMIT 1`, query.TaskID, query.ResultID).Scan(
-		&descriptor.ResultID,
-		&descriptor.Status,
+	SELECT result.id, result.status, result.storage_key,
+	       result.content_sha256, result.size_bytes,
+	       result.source_offset_bytes, result.source_length_bytes,
+	       project.canonical_storage_key, project.canonical_size_bytes
+	FROM decompile_results result
+	LEFT JOIN decompile_source_projects project
+	  ON project.task_id = result.task_id
+	 AND project.id = result.analyzer_run_id
+	 AND project.deleted_at IS NULL
+	WHERE result.task_id = ? AND result.id = ?
+	  AND result.deleted_at IS NULL
+	LIMIT 1`, query.TaskID, query.ResultID).Scan(
+		&resultID,
+		&status,
 		&storageKey,
 		&sha256,
 		&sizeBytes,
+		&sourceOffsetBytes,
+		&sourceLengthBytes,
+		&canonicalStorageKey,
+		&canonicalSizeBytes,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return SourceDescriptor{}, ErrResultNotFound
@@ -825,6 +968,34 @@ LIMIT 1`, query.TaskID, query.ResultID).Scan(
 	if err != nil {
 		return SourceDescriptor{}, fmt.Errorf("read decompile source metadata: %w", err)
 	}
+	descriptor, err := sourceDescriptorFromMetadata(
+		resultID, status, storageKey, sha256, sizeBytes,
+		sourceOffsetBytes, sourceLengthBytes,
+		canonicalStorageKey, canonicalSizeBytes,
+	)
+	if err != nil {
+		return SourceDescriptor{}, fmt.Errorf("read decompile source metadata: %w", err)
+	}
+	if err := transaction.Commit(); err != nil {
+		return SourceDescriptor{}, fmt.Errorf(
+			"commit decompile source snapshot: %w", err,
+		)
+	}
+	return descriptor, nil
+}
+
+func sourceDescriptorFromMetadata(
+	resultID string,
+	status string,
+	storageKey sql.NullString,
+	sha256 sql.NullString,
+	sizeBytes sql.Null[uint64],
+	sourceOffsetBytes sql.Null[uint64],
+	sourceLengthBytes sql.Null[uint64],
+	canonicalStorageKey sql.NullString,
+	canonicalSizeBytes sql.Null[uint64],
+) (SourceDescriptor, error) {
+	descriptor := SourceDescriptor{ResultID: resultID, Status: status}
 	if storageKey.Valid {
 		descriptor.StorageKey = storageKey.String
 	}
@@ -835,10 +1006,19 @@ LIMIT 1`, query.TaskID, query.ResultID).Scan(
 		descriptor.SizeBytes = sizeBytes.V
 		descriptor.SizeKnown = true
 	}
-	if err := transaction.Commit(); err != nil {
-		return SourceDescriptor{}, fmt.Errorf(
-			"commit decompile source snapshot: %w", err,
-		)
+	if sourceOffsetBytes.Valid != sourceLengthBytes.Valid {
+		return SourceDescriptor{}, errors.New("incomplete source range")
+	}
+	if sourceOffsetBytes.Valid {
+		descriptor.SourceOffsetBytes = sourceOffsetBytes.V
+		descriptor.SourceLengthBytes = sourceLengthBytes.V
+		descriptor.SourceRangeKnown = true
+		if canonicalStorageKey.Valid && storageKey.Valid &&
+			canonicalStorageKey.String == storageKey.String &&
+			canonicalSizeBytes.Valid {
+			descriptor.StorageSizeBytes = canonicalSizeBytes.V
+			descriptor.StorageSizeKnown = true
+		}
 	}
 	return descriptor, nil
 }
@@ -889,6 +1069,21 @@ func scanResult(scanner rowScanner) (Result, error) {
 	); err != nil {
 		return Result{}, err
 	}
+	return finishScannedResult(
+		value, fileNodeID, sizeBytes, diagnostics, completedAt,
+		storageKey, contentSHA256,
+	)
+}
+
+func finishScannedResult(
+	value Result,
+	fileNodeID uint64,
+	sizeBytes sql.Null[uint64],
+	diagnostics []byte,
+	completedAt sql.NullTime,
+	storageKey sql.NullString,
+	contentSHA256 sql.NullString,
+) (Result, error) {
 	if fileNodeID == 0 {
 		return Result{}, errors.New(
 			"decompile result file node ID is outside accepted bounds",

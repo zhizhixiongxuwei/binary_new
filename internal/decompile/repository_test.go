@@ -477,6 +477,62 @@ func TestMySQLRepositoryListsResultsWithStableCursor(t *testing.T) {
 	}
 }
 
+func TestMySQLRepositoryListsSourceArchiveInOneRepeatableReadSnapshot(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	repository := NewMySQLRepository(database)
+	createdAt := time.Date(2026, 8, 10, 1, 2, 3, 0, time.UTC)
+	storageKey := "source-projects/223e4567-e89b-42d3-a456-426614174002/src/decompiled.c"
+	hash := strings.Repeat("a", 64)
+
+	mock.ExpectBegin()
+	expectTaskExists(mock, testTaskID)
+	mock.ExpectQuery(`(?s)SELECT result.id, result.file_node_id, result.symbol_key.*LEFT JOIN decompile_source_projects project.*ORDER BY result.created_at ASC, result.id ASC.*LIMIT \?`).
+		WithArgs(testTaskID, 3).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "file_node_id", "symbol_key", "language", "engine_name",
+			"engine_version", "status", "size_bytes", "diagnostics_json",
+			"created_at", "completed_at", "storage_key", "content_sha256",
+			"source_offset_bytes", "source_length_bytes",
+			"canonical_storage_key", "canonical_size_bytes",
+		}).
+			AddRow(
+				testResultID, uint64(42), "FUN_140001000", "c", "ghidra",
+				"12.1.2", "complete", uint64(64),
+				[]byte(`{"symbol_kind":"function","display_name":"main"}`),
+				createdAt, createdAt, storageKey, hash,
+				uint64(128), uint64(64), storageKey, uint64(4096),
+			).
+			AddRow(
+				nextResultID, uint64(42), "failed", "c", "ghidra",
+				"12.1.2", "failed", nil, nil,
+				createdAt.Add(time.Second), createdAt.Add(time.Second),
+				nil, nil, nil, nil, nil, nil,
+			))
+	mock.ExpectCommit()
+
+	snapshot, err := repository.ListSourceArchiveSnapshot(
+		context.Background(), testTaskID, 2,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.HasMore || len(snapshot.Items) != 2 ||
+		snapshot.Items[0].Result.DisplayName != "main" ||
+		!snapshot.Items[0].Descriptor.SourceRangeKnown ||
+		snapshot.Items[0].Descriptor.SourceOffsetBytes != 128 ||
+		!snapshot.Items[0].Descriptor.StorageSizeKnown ||
+		snapshot.Items[0].Descriptor.StorageSizeBytes != 4096 {
+		t.Fatalf("source archive snapshot = %#v", snapshot)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestMySQLRepositoryListCursorIncludesTimeAndIDTieBreaker(t *testing.T) {
 	database, mock, err := sqlmock.New()
 	if err != nil {
@@ -591,7 +647,7 @@ func TestMySQLRepositorySourceDistinguishesMissingResult(t *testing.T) {
 
 	mock.ExpectBegin()
 	expectTaskExists(mock, testTaskID)
-	mock.ExpectQuery(`(?s)SELECT id, status, storage_key.*FROM decompile_results.*task_id = \?.*id = \?`).
+	mock.ExpectQuery(`(?s)SELECT result.id, result.status, result.storage_key.*FROM decompile_results result.*result.task_id = \?.*result.id = \?`).
 		WithArgs(testTaskID, testResultID).
 		WillReturnError(sql.ErrNoRows)
 	mock.ExpectRollback()
@@ -618,14 +674,17 @@ func TestMySQLRepositoryReadsSourceDescriptor(t *testing.T) {
 
 	mock.ExpectBegin()
 	expectTaskExists(mock, testTaskID)
-	mock.ExpectQuery(`(?s)SELECT id, status, storage_key.*FROM decompile_results.*LIMIT 1`).
+	mock.ExpectQuery(`(?s)SELECT result.id, result.status, result.storage_key.*FROM decompile_results result.*LIMIT 1`).
 		WithArgs(testTaskID, testResultID).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "status", "storage_key", "content_sha256", "size_bytes",
+			"source_offset_bytes", "source_length_bytes",
+			"canonical_storage_key", "canonical_size_bytes",
 		}).AddRow(
 			testResultID, "complete",
 			"decompile/223e4567-e89b-42d3-a456-426614174002/source.c",
 			hash, uint64(4096),
+			nil, nil, nil, nil,
 		))
 	mock.ExpectCommit()
 
@@ -637,6 +696,46 @@ func TestMySQLRepositoryReadsSourceDescriptor(t *testing.T) {
 	}
 	if value.ResultID != testResultID || value.Status != "complete" ||
 		!value.SizeKnown || value.SizeBytes != 4096 || value.SHA256 != hash {
+		t.Fatalf("GetSource() = %#v", value)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMySQLRepositoryReadsCanonicalSourceRangeDescriptor(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	repository := NewMySQLRepository(database)
+	hash := strings.Repeat("a", 64)
+	storageKey := "source-projects/223e4567-e89b-42d3-a456-426614174002/src/decompiled.c"
+
+	mock.ExpectBegin()
+	expectTaskExists(mock, testTaskID)
+	mock.ExpectQuery(`(?s)SELECT result.id, result.status, result.storage_key.*FROM decompile_results result.*LIMIT 1`).
+		WithArgs(testTaskID, testResultID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "status", "storage_key", "content_sha256", "size_bytes",
+			"source_offset_bytes", "source_length_bytes",
+			"canonical_storage_key", "canonical_size_bytes",
+		}).AddRow(
+			testResultID, "complete", storageKey, hash, uint64(512),
+			uint64(1024), uint64(512), storageKey, uint64(8192),
+		))
+	mock.ExpectCommit()
+
+	value, err := repository.GetSource(context.Background(), SourceQuery{
+		TaskID: testTaskID, ResultID: testResultID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !value.SourceRangeKnown || value.SourceOffsetBytes != 1024 ||
+		value.SourceLengthBytes != 512 || !value.StorageSizeKnown ||
+		value.StorageSizeBytes != 8192 || value.StorageKey != storageKey {
 		t.Fatalf("GetSource() = %#v", value)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {

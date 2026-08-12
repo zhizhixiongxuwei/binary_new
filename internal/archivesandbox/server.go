@@ -10,8 +10,8 @@ import (
 	"io/fs"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,10 +25,9 @@ import (
 const (
 	defaultServerGrace       = 10 * time.Second
 	defaultMonitorInterval   = 25 * time.Millisecond
-	defaultReleaseTimeout    = 30 * time.Second
+	defaultReleaseTimeout    = 20*time.Minute + time.Minute
 	defaultDiagnosticBytes   = int64(1 << 20)
 	maxServerDiagnosticBytes = int64(16 << 20)
-	containmentExitCode      = 75
 )
 
 type ServerConfig struct {
@@ -45,13 +44,11 @@ type ServerConfig struct {
 	SevenZipExecutable   string
 	SevenZipVersion      string
 
-	MaxConcurrent             int
-	TerminationGrace          time.Duration
-	MonitorInterval           time.Duration
-	ReleaseTimeout            time.Duration
-	MaxDiagnosticBytes        int64
-	ResetOnContainmentFailure bool
-	Exit                      func(int)
+	MaxConcurrent      int
+	TerminationGrace   time.Duration
+	MonitorInterval    time.Duration
+	ReleaseTimeout     time.Duration
+	MaxDiagnosticBytes int64
 }
 
 type executableIdentity struct {
@@ -71,6 +68,12 @@ type Server struct {
 	libarchive executableIdentity
 	sevenZip   executableIdentity
 	semaphore  chan struct{}
+
+	// Tests exercise shell fixtures on Linux. Production construction never
+	// sets this unexported escape hatch and therefore always uses the hardened
+	// launcher implemented in launcher_linux.go.
+	rawToolExecutionForTests bool
+	freeSpaceCheck           func(*os.File, int64) error
 }
 
 func NewServer(config ServerConfig) (*Server, error) {
@@ -96,14 +99,11 @@ func NewServer(config ServerConfig) (*Server, error) {
 	if config.MaxDiagnosticBytes == 0 {
 		config.MaxDiagnosticBytes = defaultDiagnosticBytes
 	}
-	if config.Exit == nil {
-		config.Exit = os.Exit
-	}
 	if config.MaxConcurrent < 1 || config.MaxConcurrent > 4 ||
 		config.TerminationGrace <= 0 || config.TerminationGrace > time.Minute ||
 		config.MonitorInterval < time.Millisecond ||
 		config.MonitorInterval > time.Second ||
-		config.ReleaseTimeout <= 0 || config.ReleaseTimeout > 5*time.Minute ||
+		config.ReleaseTimeout <= 0 || config.ReleaseTimeout > 24*time.Hour ||
 		config.MaxDiagnosticBytes <= 0 ||
 		config.MaxDiagnosticBytes > maxServerDiagnosticBytes {
 		return nil, errors.New("archive sandbox server limits are invalid")
@@ -168,13 +168,22 @@ func NewServer(config ServerConfig) (*Server, error) {
 		cleanup()
 		return nil, fmt.Errorf("validate 7zz: %w", err)
 	}
+	for name, root := range map[string]*os.Root{
+		"input": inputRoot, "output": outputRoot, "run": runRoot,
+	} {
+		if err := clearSandboxRoot(root); err != nil {
+			cleanup()
+			return nil, fmt.Errorf("clear stale archive sandbox %s root: %w", name, err)
+		}
+	}
 	return &Server{
 		config:    config,
 		inputRoot: inputRoot, inputInfo: inputInfo,
 		outputRoot: outputRoot, outputInfo: outputInfo,
 		runRoot: runRoot, runInfo: runInfo,
 		libmagic: libmagic, libarchive: libarchive, sevenZip: sevenZip,
-		semaphore: make(chan struct{}, config.MaxConcurrent),
+		semaphore:      make(chan struct{}, config.MaxConcurrent),
+		freeSpaceCheck: ensureFilesystemMinimumFree,
 	}, nil
 }
 
@@ -261,12 +270,11 @@ func (server *Server) handle(parent context.Context, connection *net.UnixConn) {
 		EngineVersion: "archive-sandbox-v1",
 	}
 	var outputName string
-	forced := false
+	var outputInfo os.FileInfo
 	switch request.Operation {
 	case OperationPing:
 	case OperationIdentify:
-		mime, operationForced, err := server.identify(requestContext, request)
-		forced = operationForced
+		mime, _, err := server.identify(requestContext, request)
 		if err != nil {
 			response = failedResponse(request, "libmagic_failed", err)
 		} else {
@@ -275,12 +283,12 @@ func (server *Server) handle(parent context.Context, connection *net.UnixConn) {
 		}
 	case OperationExtract:
 		outputName = request.OutputName
-		operationForced, err := server.extract(requestContext, request)
-		forced = operationForced
+		_, createdOutput, err := server.extract(requestContext, request)
 		if err != nil {
 			response = failedResponse(request, "archive_extraction_failed", err)
 			outputName = ""
 		} else {
+			outputInfo = createdOutput
 			response.OutputName = request.OutputName
 			if request.Engine == EngineSevenZip {
 				response.EngineVersion = server.config.SevenZipVersion
@@ -290,19 +298,19 @@ func (server *Server) handle(parent context.Context, connection *net.UnixConn) {
 		}
 	}
 	if outputName != "" {
-		defer server.removeOutput(outputName)
+		defer server.removeOutput(outputName, outputInfo)
 	}
-	_ = writeFrame(connection, response)
-	_ = connection.SetReadDeadline(time.Now().Add(server.config.ReleaseTimeout))
+	if err := writeFrame(connection, response); err != nil {
+		return
+	}
+	// A successful extraction output is leased by this connection. The client
+	// closes it on cancellation/timeout and ACKs only after its descriptor-bound
+	// consumer has finished, so a short fixed timer must not delete a multi-GiB
+	// output underneath a legitimate reader.
+	_ = connection.SetReadDeadline(time.Time{})
 	select {
 	case <-acknowledged:
-	case <-time.After(server.config.ReleaseTimeout):
-	}
-	if forced && server.config.ResetOnContainmentFailure {
-		go func() {
-			time.Sleep(25 * time.Millisecond)
-			server.config.Exit(containmentExitCode)
-		}()
+	case <-requestContext.Done():
 	}
 }
 
@@ -310,21 +318,21 @@ func (server *Server) identify(
 	ctx context.Context,
 	request Request,
 ) (string, bool, error) {
-	input, err := server.openVerifiedInput(ctx, request)
-	if err != nil {
-		return "", false, err
-	}
-	defer input.Close()
 	if err := server.acquire(ctx); err != nil {
 		return "", false, err
 	}
 	defer server.release()
-	runPath, cleanup, err := server.createRunDirectory(request.RequestID)
+	run, err := server.createRunDirectory(request.RequestID)
 	if err != nil {
 		return "", false, err
 	}
-	defer cleanup()
-	result := server.runTool(ctx, request, input, runPath, "")
+	defer run.Close()
+	input, err := server.openVerifiedInput(ctx, request, run)
+	if err != nil {
+		return "", false, err
+	}
+	defer input.Close()
+	result := server.runTool(ctx, request, input, run, "", nil, nil, nil)
 	if result.err != nil {
 		return "", result.forced, result.err
 	}
@@ -338,43 +346,122 @@ func (server *Server) identify(
 func (server *Server) extract(
 	ctx context.Context,
 	request Request,
-) (bool, error) {
-	input, err := server.openVerifiedInput(ctx, request)
-	if err != nil {
-		return false, err
-	}
-	defer input.Close()
+) (bool, os.FileInfo, error) {
 	if err := server.acquire(ctx); err != nil {
-		return false, err
+		return false, nil, err
 	}
 	defer server.release()
 	if err := server.validateRoots(); err != nil {
-		return false, err
+		return false, nil, err
 	}
-	if err := server.outputRoot.Mkdir(request.OutputName, 0o750); err != nil {
-		return false, fmt.Errorf("create archive sandbox output: %w", err)
+	outputInfo, err := server.outputRoot.Lstat(request.OutputName)
+	if err != nil || !realDirectory(outputInfo) ||
+		fileDevice(outputInfo) != request.OutputDevice ||
+		fileInode(outputInfo) != request.OutputInode {
+		server.removeOutput(request.OutputName, outputInfo)
+		return false, nil, errors.New("archive sandbox output identity is invalid")
 	}
-	defer func() {
-		if ctx.Err() != nil {
-			server.removeOutput(request.OutputName)
+	if outputInfo.Mode().Perm() != 0o750 {
+		if err := server.outputRoot.Chmod(request.OutputName, 0o750); err != nil {
+			server.removeOutput(request.OutputName, outputInfo)
+			return false, nil, fmt.Errorf("normalize archive sandbox output permissions: %w", err)
 		}
-	}()
-	outputPath := filepath.Join(server.config.OutputRoot, request.OutputName)
-	runPath, cleanup, err := server.createRunDirectory(request.RequestID)
+		outputInfo, err = server.outputRoot.Lstat(request.OutputName)
+		if err != nil || !realDirectory(outputInfo) || outputInfo.Mode().Perm() != 0o750 {
+			server.removeOutput(request.OutputName, outputInfo)
+			return false, nil, errors.New("archive sandbox output permissions are invalid")
+		}
+	}
+	outputRoot, err := server.outputRoot.OpenRoot(request.OutputName)
 	if err != nil {
-		return false, err
+		server.removeOutput(request.OutputName, outputInfo)
+		return false, nil, fmt.Errorf("open archive sandbox output: %w", err)
 	}
-	defer cleanup()
-	result := server.runTool(ctx, request, input, runPath, outputPath)
+	outputOpened, err := outputRoot.Stat(".")
+	if err != nil || !os.SameFile(outputInfo, outputOpened) {
+		_ = outputRoot.Close()
+		server.removeOutput(request.OutputName, outputInfo)
+		return false, nil, errors.New("archive sandbox output changed while opening")
+	}
+	entries, err := fs.ReadDir(outputRoot.FS(), ".")
+	if err != nil || len(entries) != 0 {
+		_ = outputRoot.Close()
+		server.removeOutput(request.OutputName, outputInfo)
+		return false, nil, errors.New("archive sandbox output was not empty")
+	}
+	outputDirectory, err := outputRoot.Open(".")
+	if err != nil {
+		_ = outputRoot.Close()
+		server.removeOutput(request.OutputName, outputInfo)
+		return false, nil, fmt.Errorf("bind archive sandbox output: %w", err)
+	}
+	cleanupOutput := func(remove bool) error {
+		var cleanupErr error
+		if remove {
+			cleanupErr = clearSandboxRoot(outputRoot)
+		}
+		cleanupErr = errors.Join(cleanupErr, outputDirectory.Close(), outputRoot.Close())
+		if remove {
+			server.removeOutput(request.OutputName, outputInfo)
+		}
+		return cleanupErr
+	}
+	run, err := server.createRunDirectory(request.RequestID)
+	if err != nil {
+		_ = cleanupOutput(true)
+		return false, nil, err
+	}
+	defer run.Close()
+	input, err := server.openVerifiedInput(ctx, request, run)
+	if err != nil {
+		_ = cleanupOutput(true)
+		return false, nil, err
+	}
+	defer input.Close()
+	manifest, err := server.preflightArchive(ctx, request, input, run)
+	if err != nil {
+		_ = cleanupOutput(true)
+		return false, nil, err
+	}
+	result := server.runTool(
+		ctx, request, input, run,
+		filepath.Join(server.config.OutputRoot, request.OutputName),
+		outputRoot, outputInfo, outputDirectory,
+	)
 	if result.err != nil {
-		server.removeOutput(request.OutputName)
-		return result.forced, result.err
+		_ = cleanupOutput(true)
+		return result.forced, nil, result.err
 	}
-	if err := inspectOutput(outputPath, request, true); err != nil {
-		server.removeOutput(request.OutputName)
-		return false, err
+	if err := server.freeSpaceCheck(
+		outputDirectory, request.MinimumFreeBytes,
+	); err != nil {
+		_ = cleanupOutput(true)
+		return false, nil, err
 	}
-	return result.forced, nil
+	if err := inspectOutputRoot(outputRoot, outputInfo, request, true); err != nil {
+		_ = cleanupOutput(true)
+		return false, nil, err
+	}
+	if manifest != nil {
+		if err := validatePreflightOutput(outputRoot, manifest); err != nil {
+			_ = cleanupOutput(true)
+			return false, nil, err
+		}
+	}
+	if err := server.validateRoots(); err != nil {
+		_ = cleanupOutput(true)
+		return true, nil, err
+	}
+	current, err := server.outputRoot.Lstat(request.OutputName)
+	if err != nil || !os.SameFile(outputInfo, current) {
+		_ = cleanupOutput(true)
+		return true, nil, errors.New("archive sandbox output was replaced")
+	}
+	if err := cleanupOutput(false); err != nil {
+		server.removeOutput(request.OutputName, outputInfo)
+		return false, nil, err
+	}
+	return result.forced, outputInfo, nil
 }
 
 type toolResult struct {
@@ -383,17 +470,224 @@ type toolResult struct {
 	err    error
 }
 
+type preflightEntry struct {
+	path      string
+	size      int64
+	directory bool
+}
+
+func (server *Server) preflightArchive(
+	ctx context.Context,
+	request Request,
+	input *os.File,
+	run *sandboxRunDirectory,
+) ([]preflightEntry, error) {
+	if request.Operation != OperationExtract || input == nil || run == nil {
+		return nil, errors.New("archive sandbox preflight request is invalid")
+	}
+	if server.rawToolExecutionForTests {
+		return nil, nil
+	}
+	if _, err := input.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("rewind archive input for preflight: %w", err)
+	}
+	preflightRequest := request
+	preflightRequest.Engine = EngineSevenZip
+	identity := server.sevenZip
+	arguments := []string{"l", "-slt", "-ba", "--", run.inputPath()}
+	result := server.runToolCommand(
+		ctx, preflightRequest, identity, arguments, input, run,
+		nil, nil, nil, preflightListingBytes(request),
+	)
+	if result.err != nil {
+		return nil, fmt.Errorf("archive sandbox preflight listing failed: %w", result.err)
+	}
+	entries, err := parseSevenZipListing(result.stdout, request)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := input.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("rewind archive input after preflight: %w", err)
+	}
+	return entries, nil
+}
+
+func parseSevenZipListing(listing string, request Request) ([]preflightEntry, error) {
+	if !utf8.ValidString(listing) || strings.ContainsRune(listing, '\x00') {
+		return nil, errors.New("archive sandbox preflight listing is invalid")
+	}
+	if strings.TrimSpace(listing) == "" {
+		return []preflightEntry{}, nil
+	}
+	if strings.Contains(strings.ReplaceAll(listing, "\r\n", ""), "\r") {
+		return nil, errors.New("archive sandbox preflight listing contains a bare carriage return")
+	}
+	normalized := strings.ReplaceAll(listing, "\r\n", "\n")
+	normalized = strings.TrimRight(normalized, "\n")
+	blocks := strings.Split(normalized, "\n\n")
+	entries := make([]preflightEntry, 0, len(blocks))
+	seenPaths := make(map[string]struct{}, len(blocks))
+	var total int64
+	for _, block := range blocks {
+		if strings.TrimSpace(block) == "" {
+			continue
+		}
+		fields := make(map[string]string)
+		for _, line := range strings.Split(block, "\n") {
+			if line == "" {
+				return nil, errors.New("archive sandbox preflight listing is ambiguous")
+			}
+			key, value, found := strings.Cut(line, " = ")
+			if !found || key == "" {
+				return nil, errors.New("archive sandbox preflight listing is ambiguous")
+			}
+			switch key {
+			case "Path", "Size", "Packed Size", "Modified", "Attributes",
+				"CRC", "Encrypted", "Method", "Block":
+			default:
+				return nil, fmt.Errorf("archive sandbox preflight listing field %q is unsupported", key)
+			}
+			if _, duplicate := fields[key]; duplicate {
+				return nil, errors.New("archive sandbox preflight listing contains duplicate fields")
+			}
+			fields[key] = value
+		}
+		pathValue, pathOK := fields["Path"]
+		sizeValue, sizeOK := fields["Size"]
+		attributes, attributesOK := fields["Attributes"]
+		encrypted, hasEncrypted := fields["Encrypted"]
+		if !pathOK || !sizeOK || !attributesOK ||
+			(hasEncrypted && encrypted != "-") ||
+			request.Format == "7z" && (!hasEncrypted || encrypted != "-") ||
+			!validRelativeOutputPath(filepath.FromSlash(pathValue)) {
+			return nil, errors.New("archive sandbox preflight member metadata is unsafe")
+		}
+		if strings.Contains(attributes, "l") || strings.Contains(attributes, "L") ||
+			strings.Contains(attributes, "r") && !strings.Contains(attributes, "-") {
+			return nil, errors.New("archive sandbox preflight contains a link or special member")
+		}
+		directory := strings.Contains(attributes, "D")
+		size, err := strconv.ParseInt(sizeValue, 10, 64)
+		if err != nil || size < 0 || directory && size != 0 ||
+			!directory && size > request.MaxEntryBytes {
+			return nil, errors.New("archive sandbox preflight member size is invalid")
+		}
+		canonical := filepath.ToSlash(filepath.Clean(filepath.FromSlash(pathValue)))
+		if canonical != pathValue {
+			return nil, errors.New("archive sandbox preflight member path is not canonical")
+		}
+		if _, duplicate := seenPaths[canonical]; duplicate {
+			return nil, errors.New("archive sandbox preflight contains duplicate member paths")
+		}
+		seenPaths[canonical] = struct{}{}
+		if len(entries) >= request.MaxEntries || size > request.MaxExpandedBytes-total {
+			return nil, errors.New("archive sandbox preflight limits exceeded")
+		}
+		total += size
+		entries = append(entries, preflightEntry{
+			path: canonical, size: size, directory: directory,
+		})
+	}
+	return entries, nil
+}
+
+func preflightListingBytes(request Request) int64 {
+	const (
+		perEntry = int64(3072)
+		maximum  = int64(64 << 20)
+	)
+	entries := int64(request.MaxEntries)
+	if entries <= 0 || entries > maximum/perEntry {
+		return maximum
+	}
+	limit := entries * perEntry
+	if limit < 1<<20 {
+		return 1 << 20
+	}
+	return limit
+}
+
+func validatePreflightOutput(root *os.Root, manifest []preflightEntry) error {
+	if root == nil || manifest == nil {
+		return errors.New("archive sandbox preflight manifest is missing")
+	}
+	expectedFiles := make(map[string]preflightEntry, len(manifest))
+	expectedDirectories := make(map[string]struct{})
+	for _, entry := range manifest {
+		if entry.directory {
+			expectedDirectories[entry.path] = struct{}{}
+			continue
+		}
+		expectedFiles[entry.path] = entry
+		for parent := filepath.ToSlash(filepath.Dir(entry.path)); parent != "."; parent = filepath.ToSlash(filepath.Dir(parent)) {
+			expectedDirectories[parent] = struct{}{}
+		}
+	}
+	actualFiles := make(map[string]preflightEntry, len(expectedFiles))
+	err := fs.WalkDir(root.FS(), ".", func(name string, entry fs.DirEntry, err error) error {
+		if err != nil || name == "." {
+			return err
+		}
+		info, err := root.Lstat(name)
+		if err != nil {
+			return err
+		}
+		actual := preflightEntry{
+			path: name, size: info.Size(), directory: info.IsDir(),
+		}
+		if actual.directory {
+			if _, expected := expectedDirectories[name]; !expected {
+				return errors.New("archive sandbox output contains an unlisted directory")
+			}
+			return nil
+		}
+		actualFiles[name] = actual
+		return nil
+	})
+	if err != nil || len(actualFiles) != len(expectedFiles) {
+		return errors.New("archive sandbox output differs from preflight listing")
+	}
+	for path, expected := range expectedFiles {
+		entry, found := actualFiles[path]
+		if !found || entry.directory || entry.size != expected.size {
+			return errors.New("archive sandbox output differs from preflight listing")
+		}
+	}
+	return nil
+}
+
 func (server *Server) runTool(
 	ctx context.Context,
 	request Request,
 	input *os.File,
-	runPath string,
+	run *sandboxRunDirectory,
 	outputPath string,
+	outputRoot *os.Root,
+	outputInfo os.FileInfo,
+	outputDirectory *os.File,
 ) toolResult {
 	identity, arguments, err := server.command(request, outputPath)
 	if err != nil {
 		return toolResult{err: err}
 	}
+	return server.runToolCommand(
+		ctx, request, identity, arguments, input, run,
+		outputRoot, outputInfo, outputDirectory, server.config.MaxDiagnosticBytes,
+	)
+}
+
+func (server *Server) runToolCommand(
+	ctx context.Context,
+	request Request,
+	identity executableIdentity,
+	arguments []string,
+	input *os.File,
+	run *sandboxRunDirectory,
+	outputRoot *os.Root,
+	outputInfo os.FileInfo,
+	outputDirectory *os.File,
+	captureLimit int64,
+) toolResult {
 	if _, err := validateExecutable(identity.path, "verified"); err != nil {
 		return toolResult{err: err}
 	}
@@ -404,13 +698,32 @@ func (server *Server) runTool(
 	duration := time.Duration(request.MaxDurationSeconds) * time.Second
 	runContext, cancel := context.WithTimeout(ctx, duration)
 	defer cancel()
-	stdout := newBoundedCapture(server.config.MaxDiagnosticBytes)
+	if captureLimit <= 0 || captureLimit > 64<<20 {
+		return toolResult{err: errors.New("archive sandbox capture limit is invalid")}
+	}
+	stdout := newBoundedCapture(captureLimit)
 	stderr := newBoundedCapture(server.config.MaxDiagnosticBytes)
 	overflow := make(chan struct{}, 1)
 	stdout.overflow = overflow
 	stderr.overflow = overflow
-	command := exec.Command(identity.path, arguments...)
-	command.Dir = runPath
+	if run == nil {
+		return toolResult{err: errors.New("archive sandbox run directory is missing")}
+	}
+	runDescriptor := 4
+	if outputDirectory != nil {
+		runDescriptor = 5
+	}
+	runPath := run.childPath(runDescriptor)
+	command, cleanupCommand, err := server.buildToolCommand(
+		identity, arguments, request, input, outputDirectory, run.directory,
+	)
+	if err != nil {
+		return toolResult{err: err}
+	}
+	defer cleanupCommand()
+	if command.Dir == "" {
+		command.Dir = runPath
+	}
 	command.Env = []string{
 		"HOME=" + runPath,
 		"TMPDIR=" + runPath,
@@ -421,9 +734,7 @@ func (server *Server) runTool(
 	command.Stdin = strings.NewReader("")
 	command.Stdout = stdout
 	command.Stderr = stderr
-	command.ExtraFiles = []*os.File{input}
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	baseline := cgroupPeerSnapshot()
 	if err := command.Start(); err != nil {
 		return toolResult{err: fmt.Errorf("start archive sandbox tool: %w", err)}
 	}
@@ -434,12 +745,8 @@ func (server *Server) runTool(
 	for {
 		select {
 		case waitErr := <-done:
-			escaped := killNewCgroupPeers(baseline)
-			if escaped {
-				return toolResult{
-					forced: true,
-					err:    errors.New("archive sandbox detected an escaped descendant"),
-				}
+			if err := run.validate(); err != nil {
+				return toolResult{forced: true, err: err}
 			}
 			if stdout.Exceeded() || stderr.Exceeded() {
 				return toolResult{
@@ -458,34 +765,66 @@ func (server *Server) runTool(
 			}
 			return toolResult{stdout: stdout.String()}
 		case <-runContext.Done():
-			server.terminate(command.Process, done)
-			_ = killNewCgroupPeers(baseline)
+			// A disconnected/cancelled client no longer owns the output lease.
+			// Kill immediately so a database lease can be handed to another heavy
+			// worker only after the old tool is gone. A tool's own duration expiry
+			// may still use the short graceful termination path.
+			if ctx.Err() != nil {
+				server.killImmediately(command.Process, done)
+			} else {
+				server.terminate(command.Process, done)
+			}
 			return toolResult{forced: true, err: runContext.Err()}
 		case <-overflow:
-			server.terminate(command.Process, done)
-			_ = killNewCgroupPeers(baseline)
+			server.killImmediately(command.Process, done)
 			return toolResult{
 				forced: true,
 				err:    errors.New("archive sandbox diagnostic output limit reached"),
 			}
 		case <-monitor.C:
-			if outputPath == "" {
+			if outputRoot == nil {
 				continue
 			}
-			if err := inspectOutput(outputPath, request, false); err != nil {
-				server.terminate(command.Process, done)
-				_ = killNewCgroupPeers(baseline)
+			if err := inspectOutputRoot(outputRoot, outputInfo, request, false); err != nil {
+				server.killImmediately(command.Process, done)
+				return toolResult{forced: true, err: err}
+			}
+			if err := server.freeSpaceCheck(
+				outputDirectory, request.MinimumFreeBytes,
+			); err != nil {
+				server.killImmediately(command.Process, done)
 				return toolResult{forced: true, err: err}
 			}
 		}
 	}
 }
 
+func ensureFilesystemMinimumFree(directory *os.File, minimum int64) error {
+	if directory == nil || minimum < 1 {
+		return errors.New("archive sandbox free-space check is invalid")
+	}
+	var statistics syscall.Statfs_t
+	if err := syscall.Fstatfs(int(directory.Fd()), &statistics); err != nil {
+		return fmt.Errorf("inspect archive sandbox free space: %w", err)
+	}
+	if statistics.Bsize <= 0 {
+		return errors.New("archive sandbox filesystem block size is invalid")
+	}
+	blockSize := uint64(statistics.Bsize)
+	if statistics.Bavail > ^uint64(0)/blockSize {
+		return errors.New("archive sandbox free-space value overflows")
+	}
+	if statistics.Bavail*blockSize < uint64(minimum) {
+		return errors.New("archive sandbox filesystem reached its low-water mark")
+	}
+	return nil
+}
+
 func (server *Server) command(
 	request Request,
 	outputPath string,
 ) (executableIdentity, []string, error) {
-	inputPath := "/proc/self/fd/3"
+	inputPath := filepath.Join(server.config.RunRoot, request.RequestID, "input.snapshot")
 	switch request.Engine {
 	case EngineLibmagic:
 		return server.libmagic, []string{
@@ -494,7 +833,7 @@ func (server *Server) command(
 	case EngineSevenZip:
 		return server.sevenZip, []string{
 			"x", "-y", "-aoa", "-bd", "-bb0", "-bso0", "-bsp0",
-			"-spf-", "-o" + outputPath, "--", inputPath,
+			"-o" + outputPath, "--", inputPath,
 		}, nil
 	case EngineLibarchive:
 		return server.libarchive, []string{
@@ -535,10 +874,25 @@ func (server *Server) terminate(process *os.Process, done <-chan error) {
 	}
 }
 
+func (server *Server) killImmediately(process *os.Process, done <-chan error) {
+	if process == nil {
+		return
+	}
+	_ = syscall.Kill(-process.Pid, syscall.SIGKILL)
+	select {
+	case <-done:
+	case <-time.After(server.config.TerminationGrace):
+	}
+}
+
 func (server *Server) openVerifiedInput(
 	ctx context.Context,
 	request Request,
+	run *sandboxRunDirectory,
 ) (*os.File, error) {
+	if run == nil || run.root == nil {
+		return nil, errors.New("archive sandbox input snapshot root is missing")
+	}
 	if err := validateDirectoryIdentity(
 		server.config.InputRoot,
 		server.inputRoot,
@@ -560,15 +914,24 @@ func (server *Server) openVerifiedInput(
 		_ = opened.Close()
 		return nil, errors.New("archive sandbox input changed while opening")
 	}
+	snapshotName := "input.snapshot"
+	snapshot, err := run.root.OpenFile(
+		snapshotName, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o400,
+	)
+	if err != nil {
+		_ = opened.Close()
+		return nil, fmt.Errorf("create private archive input snapshot: %w", err)
+	}
 	hash := sha256.New()
 	written, err := copyContext(
 		ctx,
-		hash,
+		io.MultiWriter(snapshot, hash),
 		io.NewSectionReader(opened, 0, request.InputSizeBytes),
 		request.InputSizeBytes,
 	)
 	if err != nil || written != request.InputSizeBytes ||
 		hex.EncodeToString(hash.Sum(nil)) != request.InputSHA256 {
+		_ = snapshot.Close()
 		_ = opened.Close()
 		return nil, errors.New("archive sandbox input hash does not match")
 	}
@@ -576,31 +939,145 @@ func (server *Server) openVerifiedInput(
 	after, statErr := opened.Stat()
 	if err != nil || statErr != nil || !os.SameFile(info, current) ||
 		!os.SameFile(info, after) || after.Size() != request.InputSizeBytes {
+		_ = snapshot.Close()
 		_ = opened.Close()
 		return nil, errors.New("archive sandbox input changed during verification")
 	}
-	return opened, nil
+	if err := opened.Close(); err != nil {
+		_ = snapshot.Close()
+		return nil, fmt.Errorf("close shared archive sandbox input: %w", err)
+	}
+	if err := snapshot.Sync(); err != nil {
+		_ = snapshot.Close()
+		return nil, fmt.Errorf("sync private archive input snapshot: %w", err)
+	}
+	snapshotInfo, err := snapshot.Stat()
+	if err != nil || !snapshotInfo.Mode().IsRegular() ||
+		snapshotInfo.Size() != request.InputSizeBytes {
+		_ = snapshot.Close()
+		return nil, errors.New("private archive input snapshot is invalid")
+	}
+	if _, err := snapshot.Seek(0, io.SeekStart); err != nil {
+		_ = snapshot.Close()
+		return nil, fmt.Errorf("rewind private archive input snapshot: %w", err)
+	}
+	if err := run.root.Chmod(snapshotName, 0o400); err != nil {
+		_ = snapshot.Close()
+		return nil, fmt.Errorf("seal private archive input snapshot: %w", err)
+	}
+	if _, err := snapshot.Seek(0, io.SeekStart); err != nil {
+		_ = snapshot.Close()
+		return nil, fmt.Errorf("rewind sealed archive input snapshot: %w", err)
+	}
+	return snapshot, nil
+}
+
+type sandboxRunDirectory struct {
+	server    *Server
+	name      string
+	info      os.FileInfo
+	root      *os.Root
+	directory *os.File
+	closed    bool
 }
 
 func (server *Server) createRunDirectory(
 	requestID string,
-) (string, func(), error) {
+) (*sandboxRunDirectory, error) {
 	if err := validateDirectoryIdentity(
 		server.config.RunRoot,
 		server.runRoot,
 		server.runInfo,
 	); err != nil {
-		return "", nil, err
+		return nil, err
 	}
 	if err := server.runRoot.Mkdir(requestID, 0o700); err != nil {
-		return "", nil, fmt.Errorf("create archive sandbox run directory: %w", err)
+		return nil, fmt.Errorf("create archive sandbox run directory: %w", err)
 	}
-	path := filepath.Join(server.config.RunRoot, requestID)
-	return path, func() { _ = server.runRoot.RemoveAll(requestID) }, nil
+	info, err := server.runRoot.Lstat(requestID)
+	if err != nil || !realDirectory(info) {
+		return nil, errors.New("archive sandbox run directory is invalid")
+	}
+	root, err := server.runRoot.OpenRoot(requestID)
+	if err != nil {
+		server.removeRunDirectory(requestID, info)
+		return nil, err
+	}
+	opened, err := root.Stat(".")
+	if err != nil || !os.SameFile(info, opened) {
+		_ = root.Close()
+		server.removeRunDirectory(requestID, info)
+		return nil, errors.New("archive sandbox run directory changed while opening")
+	}
+	directory, err := root.Open(".")
+	if err != nil {
+		_ = root.Close()
+		server.removeRunDirectory(requestID, info)
+		return nil, err
+	}
+	return &sandboxRunDirectory{
+		server: server, name: requestID, info: info, root: root, directory: directory,
+	}, nil
 }
 
-func (server *Server) removeOutput(name string) {
-	if requestIDPattern.MatchString(name) {
+func (run *sandboxRunDirectory) childPath(descriptor int) string {
+	if runtime.GOOS == "linux" {
+		return fmt.Sprintf("/proc/self/fd/%d", descriptor)
+	}
+	return filepath.Join(run.server.config.RunRoot, run.name)
+}
+
+func (run *sandboxRunDirectory) inputPath() string {
+	if run == nil || run.server == nil {
+		return ""
+	}
+	return filepath.Join(run.server.config.RunRoot, run.name, "input.snapshot")
+}
+
+func (run *sandboxRunDirectory) validate() error {
+	if run == nil || run.closed {
+		return errors.New("archive sandbox run directory is closed")
+	}
+	opened, err := run.root.Stat(".")
+	if err != nil || !os.SameFile(run.info, opened) {
+		return errors.New("archive sandbox run directory descriptor changed")
+	}
+	current, err := run.server.runRoot.Lstat(run.name)
+	if err != nil || !os.SameFile(run.info, current) {
+		return errors.New("archive sandbox run directory was replaced")
+	}
+	return validateDirectoryIdentity(
+		run.server.config.RunRoot, run.server.runRoot, run.server.runInfo,
+	)
+}
+
+func (run *sandboxRunDirectory) Close() error {
+	if run == nil || run.closed {
+		return nil
+	}
+	run.closed = true
+	err := clearSandboxRoot(run.root)
+	err = errors.Join(err, run.directory.Close(), run.root.Close())
+	run.server.removeRunDirectory(run.name, run.info)
+	return err
+}
+
+func (server *Server) removeRunDirectory(name string, expected os.FileInfo) {
+	if !requestIDPattern.MatchString(name) || expected == nil {
+		return
+	}
+	current, err := server.runRoot.Lstat(name)
+	if err == nil && os.SameFile(expected, current) {
+		_ = server.runRoot.RemoveAll(name)
+	}
+}
+
+func (server *Server) removeOutput(name string, expected os.FileInfo) {
+	if !requestIDPattern.MatchString(name) || expected == nil {
+		return
+	}
+	current, err := server.outputRoot.Lstat(name)
+	if err == nil && os.SameFile(expected, current) {
 		_ = server.outputRoot.RemoveAll(name)
 	}
 }
@@ -688,16 +1165,22 @@ func failedResponse(request Request, code string, err error) Response {
 	}
 }
 
-func inspectOutput(path string, request Request, harden bool) error {
-	rootInfo, err := os.Lstat(path)
-	if err != nil || !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
+func inspectOutputRoot(
+	root *os.Root,
+	expected os.FileInfo,
+	request Request,
+	harden bool,
+) error {
+	rootInfo, err := root.Stat(".")
+	if err != nil || !realDirectory(rootInfo) || expected == nil ||
+		!os.SameFile(expected, rootInfo) {
 		return errors.New("archive sandbox output root is invalid")
 	}
 	rootDevice := fileDevice(rootInfo)
 	entries := 0
 	var total int64
 	var paths []string
-	err = filepath.WalkDir(path, func(
+	err = fs.WalkDir(root.FS(), ".", func(
 		current string,
 		entry fs.DirEntry,
 		walkErr error,
@@ -705,14 +1188,14 @@ func inspectOutput(path string, request Request, harden bool) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		if current == path {
+		if current == "." {
 			return nil
 		}
-		relative, err := filepath.Rel(path, current)
-		if err != nil || !validRelativeOutputPath(relative) {
+		relative := filepath.FromSlash(current)
+		if !validRelativeOutputPath(relative) {
 			return errors.New("archive sandbox output path is invalid")
 		}
-		info, err := os.Lstat(current)
+		info, err := root.Lstat(current)
 		if err != nil {
 			return err
 		}
@@ -748,7 +1231,7 @@ func inspectOutput(path string, request Request, harden bool) error {
 		return len(paths[left]) > len(paths[right])
 	})
 	for _, current := range paths {
-		info, err := os.Lstat(current)
+		info, err := root.Lstat(current)
 		if err != nil {
 			return err
 		}
@@ -756,11 +1239,35 @@ func inspectOutput(path string, request Request, harden bool) error {
 		if info.IsDir() {
 			mode = 0o750
 		}
-		if err := os.Chmod(current, mode); err != nil {
+		if err := root.Chmod(current, mode); err != nil {
 			return fmt.Errorf("harden archive sandbox output: %w", err)
 		}
 	}
-	return os.Chmod(path, 0o750)
+	if err := root.Chmod(".", 0o750); err != nil {
+		return err
+	}
+	after, err := root.Stat(".")
+	if err != nil || !os.SameFile(expected, after) {
+		return errors.New("archive sandbox output root changed during inspection")
+	}
+	return nil
+}
+
+func clearSandboxRoot(root *os.Root) error {
+	entries, err := fs.ReadDir(root.FS(), ".")
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if err := root.RemoveAll(entry.Name()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func realDirectory(info os.FileInfo) bool {
+	return info != nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0
 }
 
 func validRelativeOutputPath(value string) bool {
@@ -794,6 +1301,14 @@ func fileDevice(info os.FileInfo) uint64 {
 		return 0
 	}
 	return uint64(stat.Dev)
+}
+
+func fileInode(info os.FileInfo) uint64 {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0
+	}
+	return uint64(stat.Ino)
 }
 
 func fileLinkCount(info os.FileInfo) uint64 {

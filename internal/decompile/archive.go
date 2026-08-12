@@ -55,6 +55,24 @@ type preparedSourceArchiveEntry struct {
 	name       string
 }
 
+type sourceArchiveSnapshotItem struct {
+	Result     Result
+	Descriptor SourceDescriptor
+}
+
+type sourceArchiveSnapshot struct {
+	Items   []sourceArchiveSnapshotItem
+	HasMore bool
+}
+
+type sourceArchiveSnapshotRepository interface {
+	ListSourceArchiveSnapshot(
+		context.Context,
+		string,
+		int,
+	) (sourceArchiveSnapshot, error)
+}
+
 func (s *Service) ExportSources(
 	ctx context.Context,
 	query SourceArchiveQuery,
@@ -74,22 +92,14 @@ func (s *Service) ExportSources(
 		manifest.CombinedPath = "all-functions.c"
 	}
 
-	temporary, err := os.CreateTemp(
-		s.repositoryRoot,
-		".decompile-sources-*.zip",
-	)
+	temporary, err := createUnlinkedArchiveTemp(".decompile-sources-*.zip")
 	if err != nil {
 		return SourceArchive{}, fmt.Errorf("create source archive: %w", err)
 	}
-	temporaryPath := temporary.Name()
 	cleanup := true
 	defer func() {
 		if cleanup {
-			returnErr = errors.Join(
-				returnErr,
-				temporary.Close(),
-				os.Remove(temporaryPath),
-			)
+			returnErr = errors.Join(returnErr, temporary.Close())
 		}
 	}()
 
@@ -121,10 +131,7 @@ func (s *Service) ExportSources(
 
 	cleanup = false
 	return SourceArchive{
-		Content: &removingArchiveFile{
-			File: temporary,
-			path: temporaryPath,
-		},
+		Content:     &removingArchiveFile{File: temporary},
 		Filename:    "binaryscan-" + query.TaskID + "-decompile-sources.zip",
 		SHA256:      hex.EncodeToString(hasher.Sum(nil)),
 		SizeBytes:   counter.bytes,
@@ -140,22 +147,29 @@ func (s *Service) prepareSourceArchive(
 		SchemaVersion:     "binaryscan-decompile-sources/v1",
 		TaskID:            query.TaskID,
 		ExportGeneratedAt: s.now().UTC(),
-		SourcePolicy:      "current_task_repeatable_read_metadata_snapshot",
+		SourcePolicy:      "current_task_source_metadata",
 		Items:             []sourceArchiveManifestEntry{},
 	}
 	entries := make([]preparedSourceArchiveEntry, 0)
 	var totalBytes uint64
 
-	page, err := s.repository.List(ctx, ListQuery{
-		TaskID: query.TaskID, PageSize: maxSourceArchiveResults,
-	})
+	repository, ok := s.repository.(sourceArchiveSnapshotRepository)
+	if !ok {
+		return sourceArchiveManifest{}, nil, errors.New(
+			"decompile source archive repository is unavailable",
+		)
+	}
+	snapshot, err := repository.ListSourceArchiveSnapshot(
+		ctx, query.TaskID, maxSourceArchiveResults,
+	)
 	if err != nil {
 		return sourceArchiveManifest{}, nil, err
 	}
-	if page.HasMore {
+	if snapshot.HasMore {
 		return sourceArchiveManifest{}, nil, ErrExportTooLarge
 	}
-	for _, result := range page.Items {
+	for _, snapshotItem := range snapshot.Items {
+		result := snapshotItem.Result
 		item := sourceArchiveManifestEntry{
 			ResultID: result.ID, FileNodeID: result.FileNodeID,
 			SymbolKey: result.SymbolKey, SymbolKind: result.SymbolKind,
@@ -166,15 +180,7 @@ func (s *Service) prepareSourceArchive(
 			SizeBytes: result.SizeBytes,
 		}
 		if resultSupportsSource(result.Status) {
-			descriptor := SourceDescriptor{
-				ResultID: result.ID, Status: result.Status,
-				StorageKey: result.StorageKey,
-				SHA256:     result.ContentSHA256,
-			}
-			if result.SizeBytes != nil {
-				descriptor.SizeBytes = *result.SizeBytes
-				descriptor.SizeKnown = true
-			}
+			descriptor := snapshotItem.Descriptor
 			if err := validateSourceDescriptor(descriptor, SourceQuery{
 				TaskID: query.TaskID, ResultID: result.ID,
 			}); err != nil {
@@ -307,41 +313,17 @@ func (s *Service) copyVerifiedSource(
 		return fmt.Errorf("%w: %v", ErrSourceUnavailable, err)
 	}
 	defer file.Close()
-	if uint64(info.Size()) != descriptor.SizeBytes {
+	storageSize := descriptor.SizeBytes
+	if descriptor.SourceRangeKnown {
+		storageSize = descriptor.StorageSizeBytes
+	}
+	if info.Size() < 0 || uint64(info.Size()) != storageSize {
 		return fmt.Errorf("%w: stored size does not match metadata", ErrSourceUnavailable)
 	}
-	if err := verifySourceSHA256(ctx, file, descriptor.SHA256); err != nil {
-		return err
-	}
-	buffer := make([]byte, 256<<10)
-	remaining := descriptor.SizeBytes
-	for remaining > 0 {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		readSize := uint64(len(buffer))
-		if readSize > remaining {
-			readSize = remaining
-		}
-		read, readErr := file.Read(buffer[:readSize])
-		if read > 0 {
-			written, writeErr := target.Write(buffer[:read])
-			if writeErr != nil {
-				return fmt.Errorf("write source archive content: %w", writeErr)
-			}
-			if written != read {
-				return io.ErrShortWrite
-			}
-			remaining -= uint64(read)
-		}
-		if readErr != nil && !errors.Is(readErr, io.EOF) {
-			return fmt.Errorf("read source archive content: %w", readErr)
-		}
-		if read == 0 {
-			return fmt.Errorf("%w: stored source ended early", ErrSourceUnavailable)
-		}
-	}
-	return nil
+	return copyVerifiedSourceSection(
+		ctx, target, file, info, descriptor.SourceOffsetBytes,
+		descriptor.SizeBytes, descriptor.SHA256,
+	)
 }
 
 func resultSupportsSource(status string) bool {
@@ -465,11 +447,21 @@ func (counter *archiveByteCounter) Write(value []byte) (int, error) {
 
 type removingArchiveFile struct {
 	*os.File
-	path string
 }
 
 func (file *removingArchiveFile) Close() error {
-	return errors.Join(file.File.Close(), os.Remove(file.path))
+	return file.File.Close()
+}
+
+func createUnlinkedArchiveTemp(pattern string) (*os.File, error) {
+	file, err := os.CreateTemp(os.TempDir(), pattern)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Remove(file.Name()); err != nil {
+		return nil, errors.Join(err, file.Close())
+	}
+	return file, nil
 }
 
 var _ ReadSeekCloser = (*removingArchiveFile)(nil)

@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,12 +41,16 @@ type NativeRun struct {
 }
 
 type NativePublishedResult struct {
-	ID          string
-	SymbolKey   string
-	StorageKey  string
-	SHA256      string
-	SizeBytes   uint64
-	Diagnostics json.RawMessage
+	ID                string
+	SymbolKey         string
+	StorageKey        string
+	SHA256            string
+	SizeBytes         uint64
+	SourceOffsetBytes uint64
+	SourceLengthBytes uint64
+	SourceStartLine   uint64
+	SourceEndLine     uint64
+	Diagnostics       json.RawMessage
 }
 
 // NativeResultPublisher promotes analyzer output from its fenced attempt
@@ -53,7 +58,7 @@ type NativePublishedResult struct {
 // exact job lease and analyzer run are locked and valid.
 type NativeResultPublisher func(
 	context.Context,
-) ([]NativePublishedResult, func(), error)
+) (PublishedSourceProject, []NativePublishedResult, func(), error)
 
 type NativeRunRepository interface {
 	BeginNativeRun(
@@ -246,7 +251,7 @@ func (p *NativeProcessor) Process(
 		}
 		return deterministic(code), nil
 	}
-	if !nativeResultWithinLimits(result.Index, payload.Limits) {
+	if !nativeResultWithinLimits(runID, result.Index, payload.Limits) {
 		code := "ghidra_output_limit"
 		p.emitFailure(ctx, lease, code)
 		if failErr := p.failRun(lease, runID, code); failErr != nil {
@@ -261,7 +266,12 @@ func (p *NativeProcessor) Process(
 	if err := p.repository.PublishNativeRun(
 		ctx, lease, payload, runID, p.config.EngineVersion, parameterKey,
 		result.Index.Completeness,
-		func(publishCtx context.Context) ([]NativePublishedResult, func(), error) {
+		func(publishCtx context.Context) (
+			PublishedSourceProject,
+			[]NativePublishedResult,
+			func(),
+			error,
+		) {
 			return p.publishFiles(publishCtx, runID, result)
 		},
 	); err != nil {
@@ -435,17 +445,44 @@ func validNativeResultEnvelope(index ghidra.Index) bool {
 	}
 }
 
-func nativeResultWithinLimits(index ghidra.Index, limits JobLimits) bool {
+func nativeResultWithinLimits(
+	runID string,
+	index ghidra.Index,
+	limits JobLimits,
+) bool {
 	if !validJobLimits(limits) || len(index.Functions) > limits.MaxArtifacts {
 		return false
 	}
 	maximum := uint64(limits.MaxOutputBytes)
-	var total uint64
-	for _, function := range index.Functions {
-		if function.SourceSize == 0 || function.SourceSize > maximum-total {
+	header := fmt.Sprintf(
+		"/* BinaryScan Ghidra pseudo-C project %s. Not original buildable C source. */\n\n",
+		runID,
+	)
+	total := uint64(len(header))
+	if total > maximum {
+		return false
+	}
+	functions := append([]ghidra.Function(nil), index.Functions...)
+	sort.Slice(functions, func(left, right int) bool {
+		if functions[left].Address != functions[right].Address {
+			return functions[left].Address < functions[right].Address
+		}
+		return functions[left].Name < functions[right].Name
+	})
+	for position, function := range functions {
+		banner := fmt.Sprintf(
+			"/* BinaryScan function %06d | result %s | address %s | name %s */\n",
+			position+1, nativeResultID(runID, function.Address),
+			safeNativeProjectComment(function.Address),
+			safeNativeProjectComment(function.Name),
+		)
+		// Use the two-byte separator worst case; sources ending in a newline
+		// use one byte less when the canonical file is written.
+		required := uint64(len(banner)) + function.SourceSize + 2
+		if function.SourceSize == 0 || required > maximum-total {
 			return false
 		}
-		total += function.SourceSize
+		total += required
 	}
 	return true
 }
@@ -473,9 +510,58 @@ func (p *NativeProcessor) publishFiles(
 	ctx context.Context,
 	runID string,
 	result ghidra.Result,
-) ([]NativePublishedResult, func(), error) {
-	values := make([]NativePublishedResult, 0, len(result.Index.Functions))
-	directories := make([]string, 0, len(result.Index.Functions))
+) (PublishedSourceProject, []NativePublishedResult, func(), error) {
+	projectRoot := sourceProjectRoot(runID)
+	canonicalKey := path.Join(projectRoot, "src", "decompiled.c")
+	manifestKey := path.Join(projectRoot, sourceProjectManifestName)
+	cleanup := func() {
+		cleanupSourceProject(p.config.RepositoryRoot, runID)
+	}
+	publication, err := newSourceProjectPublication(
+		p.config.RepositoryRoot, runID,
+	)
+	if err != nil {
+		return PublishedSourceProject{}, nil, func() {}, err
+	}
+	defer publication.Close()
+	fail := func(err error) (PublishedSourceProject, []NativePublishedResult, func(), error) {
+		err = errors.Join(err, publication.Close())
+		cleanup()
+		return PublishedSourceProject{}, nil, func() {}, err
+	}
+
+	if err := publication.MkdirAll("src"); err != nil {
+		return fail(err)
+	}
+	if err := publication.MkdirAll("metadata"); err != nil {
+		return fail(err)
+	}
+
+	outputRoot, err := os.OpenRoot(result.OutputDir)
+	if err != nil {
+		return fail(err)
+	}
+	defer outputRoot.Close()
+	destination, err := publication.CreateFile("src/decompiled.c")
+	if err != nil {
+		return fail(err)
+	}
+	closeDestination := true
+	defer func() {
+		if closeDestination {
+			_ = destination.Close()
+		}
+	}()
+
+	functions := append([]ghidra.Function(nil), result.Index.Functions...)
+	sort.Slice(functions, func(left, right int) bool {
+		if functions[left].Address != functions[right].Address {
+			return functions[left].Address < functions[right].Address
+		}
+		return functions[left].Name < functions[right].Name
+	})
+	values := make([]NativePublishedResult, 0, len(functions))
+	functionEntries := make([]nativeProjectFunction, 0, len(functions))
 	entryPoints := make(map[string]struct{}, len(result.Index.EntryPoints))
 	for _, entry := range result.Index.EntryPoints {
 		entryPoints[entry.Address] = struct{}{}
@@ -486,99 +572,92 @@ func (p *NativeProcessor) publishFiles(
 			outgoingCalls[edge.CallerAddress], edge,
 		)
 	}
-	cleanup := func() {
-		root, err := os.OpenRoot(p.config.RepositoryRoot)
-		if err != nil {
-			return
-		}
-		defer root.Close()
-		for _, directory := range directories {
-			_ = root.RemoveAll(directory)
-		}
-	}
-	outputRoot, err := os.OpenRoot(result.OutputDir)
+	canonicalHasher := sha256.New()
+	canonicalWriter := io.MultiWriter(destination, canonicalHasher)
+	var canonicalSize uint64
+	var currentLine uint64 = 1
+	header := fmt.Sprintf(
+		"/* BinaryScan Ghidra pseudo-C project %s. Not original buildable C source. */\n\n",
+		runID,
+	)
+	written, err := io.WriteString(canonicalWriter, header)
 	if err != nil {
-		return nil, func() {}, err
+		return fail(err)
 	}
-	defer outputRoot.Close()
-	for _, function := range result.Index.Functions {
+	canonicalSize += uint64(written)
+	currentLine += uint64(strings.Count(header, "\n"))
+
+	for index, function := range functions {
 		if err := ctx.Err(); err != nil {
-			cleanup()
-			return nil, func() {}, err
+			return fail(err)
 		}
 		id := nativeResultID(runID, function.Address)
-		directory := path.Join("decompile", id)
-		key := path.Join(directory, "source.c")
-		root, err := os.OpenRoot(p.config.RepositoryRoot)
-		if err != nil {
-			cleanup()
-			return nil, func() {}, err
-		}
-		if err := ensureNativeDirectory(root, "decompile"); err != nil {
-			root.Close()
-			cleanup()
-			return nil, func() {}, err
-		}
-		if err := root.Mkdir(directory, 0o700); err != nil {
-			root.Close()
-			cleanup()
-			return nil, func() {}, err
-		}
-		directories = append(directories, directory)
 		sourceInfo, err := outputRoot.Lstat(function.SourceFile)
 		if err != nil || !sourceInfo.Mode().IsRegular() ||
 			sourceInfo.Mode()&os.ModeSymlink != 0 ||
 			uint64(sourceInfo.Size()) != function.SourceSize {
-			root.Close()
-			cleanup()
-			return nil, func() {}, errors.New(
+			return fail(errors.New(
 				"native decompile source artifact identity is invalid",
-			)
+			))
 		}
 		source, err := outputRoot.Open(function.SourceFile)
 		if err != nil {
-			root.Close()
-			cleanup()
-			return nil, func() {}, err
+			return fail(err)
 		}
 		openedSourceInfo, statErr := source.Stat()
 		if statErr != nil || !openedSourceInfo.Mode().IsRegular() ||
 			!os.SameFile(sourceInfo, openedSourceInfo) ||
 			uint64(openedSourceInfo.Size()) != function.SourceSize {
 			source.Close()
-			root.Close()
-			cleanup()
-			return nil, func() {}, errors.New(
+			return fail(errors.New(
 				"native decompile source artifact changed while opening",
-			)
+			))
 		}
-		destination, err := root.OpenFile(
-			key, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600,
+		banner := fmt.Sprintf(
+			"/* BinaryScan function %06d | result %s | address %s | name %s */\n",
+			index+1, id, safeNativeProjectComment(function.Address),
+			safeNativeProjectComment(function.Name),
 		)
+		bannerBytes, err := io.WriteString(canonicalWriter, banner)
 		if err != nil {
 			source.Close()
-			root.Close()
-			cleanup()
-			return nil, func() {}, err
+			return fail(err)
 		}
-		hasher := sha256.New()
+		canonicalSize += uint64(bannerBytes)
+		currentLine += uint64(strings.Count(banner, "\n"))
+		sourceOffset := canonicalSize
+		sourceStartLine := currentLine
+		fragmentHasher := sha256.New()
+		lineCounter := &nativeSourceLineCounter{}
 		written, copyErr := io.Copy(
-			io.MultiWriter(destination, hasher),
-			io.LimitReader(source, int64(function.SourceSize)+1),
+			io.MultiWriter(canonicalWriter, fragmentHasher, lineCounter),
+			io.LimitReader(
+				&contextReader{ctx: ctx, reader: source},
+				int64(function.SourceSize)+1,
+			),
 		)
 		afterSourceInfo, afterStatErr := source.Stat()
-		syncErr := destination.Sync()
-		closeErr := errors.Join(destination.Close(), source.Close(), root.Close())
-		if copyErr != nil || afterStatErr != nil || syncErr != nil || closeErr != nil ||
+		closeErr := source.Close()
+		if copyErr != nil || afterStatErr != nil || closeErr != nil ||
 			!os.SameFile(openedSourceInfo, afterSourceInfo) ||
 			uint64(afterSourceInfo.Size()) != function.SourceSize ||
 			uint64(written) != function.SourceSize ||
-			hex.EncodeToString(hasher.Sum(nil)) != function.SHA256 {
-			cleanup()
-			return nil, func() {}, errors.Join(
-				copyErr, afterStatErr, syncErr, closeErr,
-			)
+			hex.EncodeToString(fragmentHasher.Sum(nil)) != function.SHA256 {
+			return fail(errors.Join(copyErr, afterStatErr, closeErr))
 		}
+		canonicalSize += uint64(written)
+		sourceEndLine := sourceStartLine + lineCounter.lineSpan() - 1
+		currentLine += lineCounter.newlines
+		separator := "\n\n"
+		if lineCounter.endsWithNewline {
+			separator = "\n"
+		}
+		separatorBytes, err := io.WriteString(canonicalWriter, separator)
+		if err != nil {
+			return fail(err)
+		}
+		canonicalSize += uint64(separatorBytes)
+		currentLine += uint64(strings.Count(separator, "\n"))
 		_, isEntryPoint := entryPoints[function.Address]
 		calls := outgoingCalls[function.Address]
 		if calls == nil {
@@ -597,18 +676,189 @@ func (p *NativeProcessor) publishFiles(
 			"program_completeness":      result.Index.Completeness,
 			"candidate_function_count":  result.Index.CandidateFunctionCount,
 			"decompiled_function_count": result.Index.DecompiledFunctionCount,
+			"source_offset_bytes":       sourceOffset,
+			"source_length_bytes":       function.SourceSize,
+			"source_start_line":         sourceStartLine,
+			"source_end_line":           sourceEndLine,
 		})
 		if err != nil {
-			cleanup()
-			return nil, func() {}, err
+			return fail(err)
 		}
 		values = append(values, NativePublishedResult{
-			ID: id, SymbolKey: function.Address, StorageKey: key,
+			ID: id, SymbolKey: function.Address, StorageKey: canonicalKey,
 			SHA256: function.SHA256, SizeBytes: function.SourceSize,
+			SourceOffsetBytes: sourceOffset,
+			SourceLengthBytes: function.SourceSize,
+			SourceStartLine:   sourceStartLine, SourceEndLine: sourceEndLine,
 			Diagnostics: diagnostics,
 		})
+		functionEntries = append(functionEntries, nativeProjectFunction{
+			ResultID: id, Address: function.Address, Name: function.Name,
+			SHA256: function.SHA256, SizeBytes: function.SourceSize,
+			OffsetBytes: sourceOffset, LengthBytes: function.SourceSize,
+			StartLine: sourceStartLine, EndLine: sourceEndLine,
+			EntryPoint: isEntryPoint, OutgoingCalls: calls,
+		})
 	}
-	return values, cleanup, nil
+	if err := destination.Commit(); err != nil {
+		return fail(err)
+	}
+	closeDestination = false
+	canonicalSHA := hex.EncodeToString(canonicalHasher.Sum(nil))
+
+	metadataFiles := make([]projectManifestFile, 0, 3)
+	functionsFile, err := writeProjectJSON(
+		publication, "metadata/functions.json", functionEntries,
+	)
+	if err != nil {
+		return fail(err)
+	}
+	metadataFiles = append(metadataFiles, functionsFile)
+	callGraphFile, err := writeProjectJSON(
+		publication, "metadata/callgraph.json", result.Index.CallEdges,
+	)
+	if err != nil {
+		return fail(err)
+	}
+	metadataFiles = append(metadataFiles, callGraphFile)
+	diagnosticsFile, err := writeProjectJSON(publication, "metadata/diagnostics.json", map[string]any{
+		"format": result.Index.Format, "architecture": result.Index.Architecture,
+		"completeness":              result.Index.Completeness,
+		"candidate_function_count":  result.Index.CandidateFunctionCount,
+		"decompiled_function_count": result.Index.DecompiledFunctionCount,
+		"entry_points":              result.Index.EntryPoints, "segments": result.Index.Segments,
+	})
+	if err != nil {
+		return fail(err)
+	}
+	metadataFiles = append(metadataFiles, diagnosticsFile)
+	manifest := nativeProjectManifest{
+		SchemaVersion: "binaryscan-source-project/v1", ProjectID: runID,
+		LayoutVersion: sourceProjectLayoutV1, SourceKind: "ghidra-pseudoc",
+		Language: "c", EngineName: "ghidra",
+		EngineVersion: p.config.EngineVersion, Status: result.Index.Completeness,
+		CanonicalSource: projectManifestFile{
+			Path: "src/decompiled.c", SHA256: canonicalSHA, SizeBytes: canonicalSize,
+		},
+		SourceFileCount: 1, SymbolCount: len(values), MetadataFiles: metadataFiles,
+	}
+	manifestFile, err := writeProjectJSON(
+		publication, sourceProjectManifestName, manifest,
+	)
+	if err != nil {
+		return fail(err)
+	}
+	project := PublishedSourceProject{
+		ID: runID, LayoutVersion: sourceProjectLayoutV1,
+		SourceKind: "ghidra-pseudoc", Language: "c",
+		RootStorageKey: projectRoot, CanonicalStorageKey: canonicalKey,
+		CanonicalSHA256: canonicalSHA, CanonicalSizeBytes: canonicalSize,
+		ManifestStorageKey: manifestKey, ManifestSHA256: manifestFile.SHA256,
+		ManifestSizeBytes: manifestFile.SizeBytes,
+		SourceFileCount:   1, SymbolCount: len(values),
+		SourceSizeBytes: canonicalSize,
+	}
+	if err := publication.Finalize(ctx); err != nil {
+		return fail(err)
+	}
+	if err := publication.Close(); err != nil {
+		return fail(err)
+	}
+	return project, values, cleanup, nil
+}
+
+type projectManifestFile struct {
+	Path      string `json:"path"`
+	SHA256    string `json:"sha256"`
+	SizeBytes uint64 `json:"size_bytes"`
+}
+
+type nativeProjectFunction struct {
+	ResultID      string            `json:"result_id"`
+	Address       string            `json:"address"`
+	Name          string            `json:"name"`
+	SHA256        string            `json:"sha256"`
+	SizeBytes     uint64            `json:"size_bytes"`
+	OffsetBytes   uint64            `json:"offset_bytes"`
+	LengthBytes   uint64            `json:"length_bytes"`
+	StartLine     uint64            `json:"start_line"`
+	EndLine       uint64            `json:"end_line"`
+	EntryPoint    bool              `json:"entry_point"`
+	OutgoingCalls []ghidra.CallEdge `json:"outgoing_calls"`
+}
+
+type nativeProjectManifest struct {
+	SchemaVersion   string                `json:"schema_version"`
+	ProjectID       string                `json:"project_id"`
+	LayoutVersion   string                `json:"layout_version"`
+	SourceKind      string                `json:"source_kind"`
+	Language        string                `json:"language"`
+	EngineName      string                `json:"engine_name"`
+	EngineVersion   string                `json:"engine_version"`
+	Status          string                `json:"status"`
+	CanonicalSource projectManifestFile   `json:"canonical_source"`
+	SourceFileCount int                   `json:"source_file_count"`
+	SymbolCount     int                   `json:"symbol_count"`
+	MetadataFiles   []projectManifestFile `json:"metadata_files"`
+}
+
+type nativeSourceLineCounter struct {
+	newlines        uint64
+	bytes           uint64
+	endsWithNewline bool
+}
+
+func (counter *nativeSourceLineCounter) Write(payload []byte) (int, error) {
+	counter.bytes += uint64(len(payload))
+	counter.newlines += uint64(strings.Count(string(payload), "\n"))
+	if len(payload) > 0 {
+		counter.endsWithNewline = payload[len(payload)-1] == '\n'
+	}
+	return len(payload), nil
+}
+
+func (counter nativeSourceLineCounter) lineSpan() uint64 {
+	if counter.bytes == 0 {
+		return 0
+	}
+	if counter.endsWithNewline {
+		if counter.newlines == 0 {
+			return 1
+		}
+		return counter.newlines
+	}
+	return counter.newlines + 1
+}
+
+func safeNativeProjectComment(value string) string {
+	return safeSourceComment(value)
+}
+
+func writeProjectJSON(
+	publication *sourceProjectPublication,
+	relative string,
+	value any,
+) (projectManifestFile, error) {
+	encoded, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return projectManifestFile{}, err
+	}
+	encoded = append(encoded, '\n')
+	file, err := publication.CreateFile(relative)
+	if err != nil {
+		return projectManifestFile{}, err
+	}
+	if _, err := file.Write(encoded); err != nil {
+		return projectManifestFile{}, errors.Join(err, file.Close())
+	}
+	if err := file.Commit(); err != nil {
+		return projectManifestFile{}, err
+	}
+	digest := sha256.Sum256(encoded)
+	return projectManifestFile{
+		Path:   relative,
+		SHA256: hex.EncodeToString(digest[:]), SizeBytes: uint64(len(encoded)),
+	}, nil
 }
 
 func copyVerifiedNativeSource(

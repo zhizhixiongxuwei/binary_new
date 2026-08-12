@@ -2,6 +2,7 @@
 
 ARG BUILDER_IMAGE
 ARG TRIVY_RUNTIME_DB_IMAGE
+ARG ARCHIVE_TOOLS_IMAGE
 
 FROM ${BUILDER_IMAGE} AS build
 WORKDIR /src
@@ -22,9 +23,12 @@ RUN --network=none go build -buildvcs=false -trimpath \
 	&& go build -buildvcs=false -trimpath -ldflags="-s -w" \
 	  -o /out/binaryscan-bundle-check ./cmd/bundle-check \
 	&& go build -buildvcs=false -trimpath -ldflags="-s -w" \
+	  -o /out/binaryscan-archive-sandbox ./cmd/archive-sandbox \
+	&& go build -buildvcs=false -trimpath -ldflags="-s -w" \
       -o /out/binaryscan-supervisor ./cmd/supervisor
 
-FROM ${TRIVY_RUNTIME_DB_IMAGE}
+FROM ${TRIVY_RUNTIME_DB_IMAGE} AS trivy-runtime
+FROM ${ARCHIVE_TOOLS_IMAGE}
 ARG BINARYSCAN_VERSION
 ARG BINARYSCAN_REVISION
 ARG BINARYSCAN_SOURCE_MANIFEST_SHA256
@@ -32,6 +36,9 @@ USER root
 COPY --from=build --chmod=0555 /out/binaryscan-worker /usr/local/bin/binaryscan-worker
 COPY --from=build --chmod=0555 /out/binaryscan-bundle-check /usr/local/bin/binaryscan-bundle-check
 COPY --from=build --chmod=0555 /out/binaryscan-supervisor /usr/local/bin/binaryscan-supervisor
+COPY --from=build --chmod=0555 /out/binaryscan-archive-sandbox /usr/local/bin/binaryscan-archive-sandbox
+COPY --from=trivy-runtime --chmod=0555 /usr/local/bin/trivy /usr/local/bin/trivy
+COPY --from=trivy-runtime --chown=10001:10001 /opt/trivy-cache /opt/trivy-cache
 COPY --chown=10001:10001 licenses/ /usr/share/licenses/binaryscan/
 ENV HOME=/tmp \
     TMPDIR=/tmp \

@@ -224,6 +224,7 @@ func (r *MySQLRepository) PublishBytecodeCacheHit(
 	runID string,
 	identity BytecodeRunIdentity,
 	candidate BytecodeCacheCandidate,
+	project PublishedSourceProject,
 	results []BytecodePublishedResult,
 ) (returnErr error) {
 	nodeID, err := targetNodeID(payload)
@@ -231,7 +232,8 @@ func (r *MySQLRepository) PublishBytecodeCacheHit(
 		!uuidPattern.MatchString(runID) || !validBytecodeRunIdentity(identity) ||
 		!validJobLimits(payload.Limits) ||
 		!validBytecodeCacheCandidate(candidate, payload.Limits) ||
-		!validBytecodeCachePublication(runID, candidate, results) {
+		!validBytecodeCachePublication(runID, candidate, results) ||
+		!validPublishedSourceProject(runID, project, len(results)) {
 		return ErrRequestConflict
 	}
 	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
@@ -279,6 +281,13 @@ INSERT INTO decompile_results (
 		); err != nil {
 			return fmt.Errorf("insert bytecode cached result: %w", err)
 		}
+	}
+	if err := insertPublishedSourceProject(
+		ctx, tx, lease.TaskID, nodeID, lease.JobID,
+		identity.EngineName, identity.EngineVersion,
+		string(candidate.ResultStatus), project,
+	); err != nil {
+		return fmt.Errorf("insert cached bytecode source project: %w", err)
 	}
 	result, err := tx.ExecContext(ctx, `
 UPDATE analyzer_runs

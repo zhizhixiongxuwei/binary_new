@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -27,6 +28,7 @@ const (
 	decompileResultTestID  = "223e4567-e89b-42d3-a456-426614174001"
 	decompileJobTestID     = "323e4567-e89b-42d3-a456-426614174002"
 	decompileRequestTestID = "423e4567-e89b-42d3-a456-426614174003"
+	decompileProjectTestID = "523e4567-e89b-42d3-a456-426614174004"
 )
 
 func decompileCursorTestValue() string {
@@ -37,26 +39,49 @@ func decompileCursorTestValue() string {
 }
 
 type decompileServiceStub struct {
-	createInput  decompile.CreateInput
-	request      decompile.Request
-	createErr    error
-	created      bool
-	createCalls  int
-	requestQuery decompile.RequestQuery
-	requestErr   error
-	requestCalls int
-	listQuery    decompile.ListQuery
-	page         decompile.Page
-	listErr      error
-	listCalls    int
-	sourceQuery  decompile.SourceQuery
-	chunk        decompile.SourceChunk
-	sourceErr    error
-	sourceCalls  int
-	archiveQuery decompile.SourceArchiveQuery
-	archive      decompile.SourceArchive
-	archiveErr   error
-	archiveCalls int
+	createInput          decompile.CreateInput
+	request              decompile.Request
+	createErr            error
+	created              bool
+	createCalls          int
+	requestQuery         decompile.RequestQuery
+	requestErr           error
+	requestCalls         int
+	listQuery            decompile.ListQuery
+	page                 decompile.Page
+	listErr              error
+	listCalls            int
+	sourceQuery          decompile.SourceQuery
+	chunk                decompile.SourceChunk
+	sourceErr            error
+	sourceCalls          int
+	archiveQuery         decompile.SourceArchiveQuery
+	archive              decompile.SourceArchive
+	archiveErr           error
+	archiveCalls         int
+	projectListQuery     decompile.SourceProjectListQuery
+	projectPage          decompile.SourceProjectPage
+	projectListErr       error
+	projectListCalls     int
+	projectQuery         decompile.SourceProjectQuery
+	project              decompile.SourceProject
+	projectErr           error
+	projectCalls         int
+	projectArchiveQuery  decompile.SourceProjectArchiveQuery
+	projectArchive       decompile.SourceArchive
+	projectArchiveErr    error
+	projectArchiveCalls  int
+	deleteProjectInput   decompile.DeleteSourceProjectInput
+	deleteProjectErr     error
+	deleteProjectCalls   int
+	deletionPreviewInput decompile.SourceProjectDeletionPreviewInput
+	deletionPreview      decompile.SourceProjectDeletionPreview
+	deletionPreviewErr   error
+	deletionConfirmInput decompile.ConfirmSourceProjectDeletionInput
+	deletionOperation    decompile.SourceProjectDeletionOperation
+	deletionConfirmErr   error
+	deletionQuery        decompile.SourceProjectDeletionOperationQuery
+	deletionGetErr       error
 }
 
 type decompileRepositoryStub struct {
@@ -145,6 +170,284 @@ func (s *decompileServiceStub) ExportSources(
 	s.archiveCalls++
 	s.archiveQuery = query
 	return s.archive, s.archiveErr
+}
+
+func (s *decompileServiceStub) ListProjects(
+	_ context.Context,
+	query decompile.SourceProjectListQuery,
+) (decompile.SourceProjectPage, error) {
+	s.projectListCalls++
+	s.projectListQuery = query
+	return s.projectPage, s.projectListErr
+}
+
+func (s *decompileServiceStub) GetProject(
+	_ context.Context,
+	query decompile.SourceProjectQuery,
+) (decompile.SourceProject, error) {
+	s.projectCalls++
+	s.projectQuery = query
+	return s.project, s.projectErr
+}
+
+func (s *decompileServiceStub) ExportProject(
+	_ context.Context,
+	query decompile.SourceProjectArchiveQuery,
+) (decompile.SourceArchive, error) {
+	s.projectArchiveCalls++
+	s.projectArchiveQuery = query
+	return s.projectArchive, s.projectArchiveErr
+}
+
+func (s *decompileServiceStub) DeleteProject(
+	_ context.Context,
+	input decompile.DeleteSourceProjectInput,
+) error {
+	s.deleteProjectCalls++
+	s.deleteProjectInput = input
+	return s.deleteProjectErr
+}
+
+func (s *decompileServiceStub) PreviewProjectDeletion(
+	_ context.Context,
+	input decompile.SourceProjectDeletionPreviewInput,
+) (decompile.SourceProjectDeletionPreview, error) {
+	s.deletionPreviewInput = input
+	return s.deletionPreview, s.deletionPreviewErr
+}
+
+func (s *decompileServiceStub) ConfirmProjectDeletion(
+	_ context.Context,
+	input decompile.ConfirmSourceProjectDeletionInput,
+) (decompile.SourceProjectDeletionOperation, error) {
+	s.deletionConfirmInput = input
+	return s.deletionOperation, s.deletionConfirmErr
+}
+
+func (s *decompileServiceStub) GetProjectDeletion(
+	_ context.Context,
+	query decompile.SourceProjectDeletionOperationQuery,
+) (decompile.SourceProjectDeletionOperation, error) {
+	s.deletionQuery = query
+	return s.deletionOperation, s.deletionGetErr
+}
+
+func TestDecompileProjectListAndDetailAllowReader(t *testing.T) {
+	completedAt := time.Date(2026, 8, 10, 2, 3, 4, 0, time.UTC)
+	project := decompile.SourceProject{
+		ID: decompileProjectTestID, TaskID: decompileTaskTestID,
+		JobID: decompileJobTestID, FileNodeID: "42", TargetPath: "bin/app",
+		LayoutVersion: decompile.SourceProjectLayoutV1,
+		SourceKind:    decompile.SourceProjectKindGhidraPseudoC,
+		Language:      "ghidra-pseudoc", EngineName: "ghidra",
+		EngineVersion: "11.4", Status: "complete", SourceFileCount: 1,
+		SymbolCount: 18, SourceSizeBytes: 4096,
+		CanonicalFilename: "decompiled.c", ManifestAvailable: true,
+		CreatedAt: completedAt.Add(-time.Minute), CompletedAt: &completedAt,
+	}
+	service := &decompileServiceStub{
+		projectPage: decompile.SourceProjectPage{Items: []decompile.SourceProject{project}},
+		project:     project,
+	}
+	router := decompileTestRouter(
+		&authManagerStub{session: auth.Session{User: auth.Principal{
+			UserID: 7, Role: auth.RoleReader,
+		}}},
+		service,
+		discardLogger(),
+	)
+
+	listResponse := httptest.NewRecorder()
+	router.ServeHTTP(listResponse, authenticatedDecompileRequest(
+		"/api/v1/tasks/"+decompileTaskTestID+
+			"/decompile-projects?page_size=25",
+	))
+	if listResponse.Code != http.StatusOK || service.projectListCalls != 1 ||
+		service.projectListQuery.TaskID != decompileTaskTestID ||
+		service.projectListQuery.PageSize != 25 ||
+		!strings.Contains(listResponse.Body.String(), `"canonical_filename":"decompiled.c"`) {
+		t.Fatalf(
+			"project list status/calls/query/body = %d/%d/%#v/%s",
+			listResponse.Code, service.projectListCalls,
+			service.projectListQuery, listResponse.Body.String(),
+		)
+	}
+
+	detailResponse := httptest.NewRecorder()
+	router.ServeHTTP(detailResponse, authenticatedDecompileRequest(
+		"/api/v1/tasks/"+decompileTaskTestID+
+			"/decompile-projects/"+decompileProjectTestID,
+	))
+	if detailResponse.Code != http.StatusOK || service.projectCalls != 1 ||
+		service.projectQuery.TaskID != decompileTaskTestID ||
+		service.projectQuery.ProjectID != decompileProjectTestID ||
+		!strings.Contains(detailResponse.Body.String(), `"symbol_count":18`) {
+		t.Fatalf(
+			"project detail status/calls/query/body = %d/%d/%#v/%s",
+			detailResponse.Code, service.projectCalls,
+			service.projectQuery, detailResponse.Body.String(),
+		)
+	}
+}
+
+func TestDownloadDecompileProjectUsesDocumentedDotZipURL(t *testing.T) {
+	payload := []byte("PK\x03\x04project-archive")
+	digest := sha256.Sum256(payload)
+	reader := &decompileArchiveReader{Reader: bytes.NewReader(payload)}
+	service := &decompileServiceStub{projectArchive: decompile.SourceArchive{
+		Content:  reader,
+		Filename: "binaryscan-" + decompileProjectTestID + "-source-project.zip",
+		SHA256:   hex.EncodeToString(digest[:]), SizeBytes: uint64(len(payload)),
+		ResultCount: 18,
+	}}
+	router := decompileTestRouter(
+		&authManagerStub{session: auth.Session{User: auth.Principal{
+			UserID: 7, Role: auth.RoleReader,
+		}}},
+		service,
+		discardLogger(),
+	)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, authenticatedDecompileRequest(
+		"/api/v1/tasks/"+decompileTaskTestID+
+			"/decompile-projects/"+decompileProjectTestID+".zip",
+	))
+	if response.Code != http.StatusOK || response.Body.String() != string(payload) ||
+		service.projectArchiveCalls != 1 ||
+		service.projectArchiveQuery.ProjectID != decompileProjectTestID ||
+		response.Header().Get("X-Decompile-Project-ID") != decompileProjectTestID ||
+		!reader.closed {
+		t.Fatalf(
+			"project archive status/calls/query/header/closed/body = %d/%d/%#v/%q/%v/%q",
+			response.Code, service.projectArchiveCalls, service.projectArchiveQuery,
+			response.Header().Get("X-Decompile-Project-ID"), reader.closed,
+			response.Body.String(),
+		)
+	}
+}
+
+func TestDeleteDecompileProjectRequiresCascadeConfirmation(t *testing.T) {
+	const csrf = "csrf-token"
+	service := &decompileServiceStub{
+		deleteProjectErr: decompile.ErrDeletionConfirmationRequired,
+	}
+	manager := &authManagerStub{
+		session: auth.Session{User: auth.Principal{
+			UserID: 8, Role: auth.RoleOperator,
+		}},
+		csrfToken: csrf,
+	}
+	router := decompileTestRouter(manager, service, discardLogger())
+	request := httptest.NewRequest(
+		http.MethodDelete,
+		"/api/v1/tasks/"+decompileTaskTestID+
+			"/decompile-projects/"+decompileProjectTestID,
+		nil,
+	)
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "session-token"})
+	request.AddCookie(&http.Cookie{Name: csrfCookieName, Value: csrf})
+	request.Header.Set(csrfHeaderName, csrf)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusConflict || service.deleteProjectCalls != 1 ||
+		service.deleteProjectInput.TaskID != decompileTaskTestID ||
+		service.deleteProjectInput.ProjectID != decompileProjectTestID ||
+		service.deleteProjectInput.UserID != 8 ||
+		service.deleteProjectInput.Role != auth.RoleOperator {
+		t.Fatalf(
+			"delete project status/calls/input = %d/%d/%#v",
+			response.Code, service.deleteProjectCalls, service.deleteProjectInput,
+		)
+	}
+	assertDecompileError(
+		t, response, http.StatusConflict, "decompile_project_confirmation_required",
+	)
+}
+
+func TestDecompileProjectDeletionRoutesUsePreviewConfirmationAndOperationStatus(t *testing.T) {
+	const csrf = "csrf-token"
+	expiresAt := time.Date(2026, 8, 10, 12, 5, 0, 0, time.UTC)
+	createdAt := expiresAt.Add(-time.Minute)
+	service := &decompileServiceStub{
+		deletionPreview: decompile.SourceProjectDeletionPreview{
+			ProjectID: decompileProjectTestID,
+			Counts: decompile.SourceProjectDeletionCounts{
+				CAnalysisRuns: 2, CAnalysisFindings: 7, Reports: 1,
+			},
+			TypedSuffix:       decompileProjectTestID[len(decompileProjectTestID)-8:],
+			ConfirmationToken: strings.Repeat("a", 43), ExpiresAt: expiresAt,
+		},
+		deletionOperation: decompile.SourceProjectDeletionOperation{
+			ID:        "a23e4567-e89b-42d3-a456-42661417400a",
+			ProjectID: decompileProjectTestID, Status: "cancelling",
+			Counts: decompile.SourceProjectDeletionCounts{
+				CAnalysisRuns: 2, CAnalysisFindings: 7, Reports: 1,
+			},
+			CreatedAt: createdAt,
+		},
+	}
+	manager := &authManagerStub{
+		session: auth.Session{User: auth.Principal{
+			UserID: 8, Role: auth.RoleOperator,
+		}},
+		csrfToken: csrf,
+	}
+	router := decompileTestRouter(manager, service, discardLogger())
+	projectPath := "/api/v1/tasks/" + decompileTaskTestID +
+		"/decompile-projects/" + decompileProjectTestID
+
+	previewRequest := authenticatedDecompileMutationRequest(
+		http.MethodPost, projectPath+"/deletion-preview", nil, csrf,
+	)
+	previewResponse := httptest.NewRecorder()
+	router.ServeHTTP(previewResponse, previewRequest)
+	if previewResponse.Code != http.StatusOK ||
+		service.deletionPreviewInput.TaskID != decompileTaskTestID ||
+		service.deletionPreviewInput.ProjectID != decompileProjectTestID ||
+		service.deletionPreviewInput.UserID != 8 ||
+		!strings.Contains(previewResponse.Body.String(), `"confirmation_token"`) ||
+		!strings.Contains(previewResponse.Body.String(), `"typed_suffix"`) {
+		t.Fatalf(
+			"preview status/input/body = %d/%#v/%s",
+			previewResponse.Code, service.deletionPreviewInput,
+			previewResponse.Body.String(),
+		)
+	}
+
+	confirmBody := strings.NewReader(`{"confirmation_token":"` +
+		strings.Repeat("a", 43) + `","cascade":true,"typed_suffix":"` +
+		decompileProjectTestID[len(decompileProjectTestID)-8:] + `"}`)
+	confirmRequest := authenticatedDecompileMutationRequest(
+		http.MethodPost, projectPath+"/deletion", confirmBody, csrf,
+	)
+	confirmResponse := httptest.NewRecorder()
+	router.ServeHTTP(confirmResponse, confirmRequest)
+	if confirmResponse.Code != http.StatusAccepted ||
+		!service.deletionConfirmInput.Cascade ||
+		service.deletionConfirmInput.ConfirmationToken != strings.Repeat("a", 43) ||
+		!strings.Contains(confirmResponse.Body.String(), `"completed_at":null`) ||
+		!strings.Contains(confirmResponse.Body.String(), `"error_code":null`) ||
+		!strings.Contains(confirmResponse.Body.String(), `"error_message":null`) {
+		t.Fatalf(
+			"confirm status/input/body = %d/%#v/%s",
+			confirmResponse.Code, service.deletionConfirmInput,
+			confirmResponse.Body.String(),
+		)
+	}
+
+	statusResponse := httptest.NewRecorder()
+	router.ServeHTTP(statusResponse, authenticatedDecompileRequest(
+		"/api/v1/tasks/"+decompileTaskTestID+
+			"/decompile-project-deletions/"+service.deletionOperation.ID,
+	))
+	if statusResponse.Code != http.StatusOK ||
+		service.deletionQuery.TaskID != decompileTaskTestID ||
+		service.deletionQuery.OperationID != service.deletionOperation.ID {
+		t.Fatalf(
+			"deletion status response/query = %d/%#v/%s",
+			statusResponse.Code, service.deletionQuery, statusResponse.Body.String(),
+		)
+	}
 }
 
 func TestDownloadDecompileSourcesStreamsTaskCurrentArchive(t *testing.T) {
@@ -944,6 +1247,11 @@ func TestDecompileRoutesRequireAuthentication(t *testing.T) {
 		"/api/v1/tasks/" + decompileTaskTestID + "/decompile-results/" +
 			decompileResultTestID + "/source",
 		"/api/v1/tasks/" + decompileTaskTestID + "/decompile-sources.zip",
+		"/api/v1/tasks/" + decompileTaskTestID + "/decompile-projects",
+		"/api/v1/tasks/" + decompileTaskTestID + "/decompile-projects/" +
+			decompileProjectTestID,
+		"/api/v1/tasks/" + decompileTaskTestID + "/decompile-projects/" +
+			decompileProjectTestID + ".zip",
 	}
 	for _, target := range tests {
 		t.Run(target, func(t *testing.T) {
@@ -960,7 +1268,9 @@ func TestDecompileRoutesRequireAuthentication(t *testing.T) {
 			)
 			if response.Code != http.StatusUnauthorized ||
 				service.requestCalls != 0 || service.listCalls != 0 ||
-				service.sourceCalls != 0 || service.archiveCalls != 0 {
+				service.sourceCalls != 0 || service.archiveCalls != 0 ||
+				service.projectListCalls != 0 || service.projectCalls != 0 ||
+				service.projectArchiveCalls != 0 {
 				t.Fatalf(
 					"status/request/list/source calls = %d/%d/%d/%d",
 					response.Code, service.requestCalls,
@@ -1051,6 +1361,24 @@ func authenticatedDecompileRequest(target string) *http.Request {
 	request.AddCookie(&http.Cookie{
 		Name: sessionCookieName, Value: "session-token",
 	})
+	return request
+}
+
+func authenticatedDecompileMutationRequest(
+	method string,
+	target string,
+	body io.Reader,
+	csrf string,
+) *http.Request {
+	request := httptest.NewRequest(method, target, body)
+	request.AddCookie(&http.Cookie{
+		Name: sessionCookieName, Value: "session-token",
+	})
+	request.AddCookie(&http.Cookie{Name: csrfCookieName, Value: csrf})
+	request.Header.Set(csrfHeaderName, csrf)
+	if body != nil {
+		request.Header.Set("Content-Type", "application/json")
+	}
 	return request
 }
 

@@ -149,9 +149,9 @@ func TestPublishNativeRunRejectsLostFenceBeforeRows(t *testing.T) {
 	err = repository.PublishNativeRun(
 		context.Background(), lease, payload, runID, "12.1.2",
 		testNativeParameterKey, "complete",
-		func(context.Context) ([]NativePublishedResult, func(), error) {
+		func(context.Context) (PublishedSourceProject, []NativePublishedResult, func(), error) {
 			publisherCalled = true
-			return nil, func() {}, nil
+			return PublishedSourceProject{}, nil, func() {}, nil
 		},
 	)
 	if !errors.Is(err, ErrRequestConflict) {
@@ -192,8 +192,8 @@ func TestPublishNativeRunRejectsZeroResultSuccess(t *testing.T) {
 	err = repository.PublishNativeRun(
 		context.Background(), lease, payload, runID, "12.1.2",
 		testNativeParameterKey, "complete",
-		func(context.Context) ([]NativePublishedResult, func(), error) {
-			return []NativePublishedResult{}, func() { cleanupCalls++ }, nil
+		func(context.Context) (PublishedSourceProject, []NativePublishedResult, func(), error) {
+			return PublishedSourceProject{}, []NativePublishedResult{}, func() { cleanupCalls++ }, nil
 		},
 	)
 	if !errors.Is(err, ErrRequestConflict) || cleanupCalls != 1 {
@@ -223,7 +223,14 @@ func TestPublishNativeRunCleansFilesWhenLeaseExpiresBeforeCommit(t *testing.T) {
 		),
 	}
 	value.ID = nativeResultID(runID, value.SymbolKey)
-	value.StorageKey = "decompile/" + value.ID + "/source.c"
+	value.StorageKey = sourceProjectRoot(runID) + "/src/decompiled.c"
+	value.SourceOffsetBytes = 128
+	value.SourceLengthBytes = value.SizeBytes
+	value.SourceStartLine = 4
+	value.SourceEndLine = 6
+	project := publishedProjectFixture(
+		runID, SourceProjectKindGhidraPseudoC, "c", 1, true,
+	)
 	expectedCacheKey := nativeResultCacheKey(
 		payload, lease.JobID, "12.1.2", testNativeParameterKey, value.SymbolKey,
 	)
@@ -242,7 +249,20 @@ func TestPublishNativeRunCleansFilesWhenLeaseExpiresBeforeCommit(t *testing.T) {
 		WithArgs(
 			value.ID, lease.TaskID, uint64(42), runID, expectedCacheKey,
 			value.SymbolKey, "12.1.2", value.StorageKey, value.SHA256,
-			value.SizeBytes, []byte(value.Diagnostics),
+			value.SizeBytes, []byte(value.Diagnostics), value.SourceOffsetBytes,
+			value.SourceLengthBytes, value.SourceStartLine, value.SourceEndLine,
+		).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`(?s)INSERT INTO decompile_source_projects`).
+		WithArgs(
+			project.ID, lease.TaskID, uint64(42), lease.JobID,
+			project.LayoutVersion, project.SourceKind, project.Language,
+			"ghidra", "12.1.2", "complete", project.RootStorageKey,
+			project.CanonicalStorageKey, project.CanonicalSHA256,
+			project.CanonicalSizeBytes, project.ManifestStorageKey,
+			project.ManifestSHA256, project.ManifestSizeBytes,
+			project.SourceFileCount, project.SymbolCount,
+			project.SourceSizeBytes,
 		).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(`(?s)UPDATE analyzer_runs.*status = \?`).
@@ -264,9 +284,9 @@ func TestPublishNativeRunCleansFilesWhenLeaseExpiresBeforeCommit(t *testing.T) {
 	err = repository.PublishNativeRun(
 		context.Background(), lease, payload, runID, "12.1.2",
 		testNativeParameterKey, "complete",
-		func(context.Context) ([]NativePublishedResult, func(), error) {
+		func(context.Context) (PublishedSourceProject, []NativePublishedResult, func(), error) {
 			publisherCalled = true
-			return []NativePublishedResult{value}, func() {
+			return project, []NativePublishedResult{value}, func() {
 				cleanupCalls++
 			}, nil
 		},
@@ -304,7 +324,11 @@ func TestValidNativePublishedResultIsScopedToRun(t *testing.T) {
 		SizeBytes: 10, Diagnostics: json.RawMessage(`{"ok":true}`),
 	}
 	value.ID = nativeResultID(runID, value.SymbolKey)
-	value.StorageKey = "decompile/" + value.ID + "/source.c"
+	value.StorageKey = sourceProjectRoot(runID) + "/src/decompiled.c"
+	value.SourceOffsetBytes = 128
+	value.SourceLengthBytes = value.SizeBytes
+	value.SourceStartLine = 4
+	value.SourceEndLine = 4
 	if !validNativePublishedResult(runID, value) {
 		t.Fatal("valid run-scoped result was rejected")
 	}

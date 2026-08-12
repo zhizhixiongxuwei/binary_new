@@ -18,6 +18,8 @@ import (
 
 func TestServiceExportsTaskCurrentFunctionSources(t *testing.T) {
 	root := t.TempDir()
+	privateTemp := t.TempDir()
+	t.Setenv("TMPDIR", privateTemp)
 	createdAt := time.Date(2026, 8, 4, 1, 2, 3, 0, time.UTC)
 	exportedAt := createdAt.Add(time.Minute)
 	const source = "int verify_header(void) { return 1; }\n"
@@ -60,6 +62,16 @@ func TestServiceExportsTaskCurrentFunctionSources(t *testing.T) {
 				},
 			}, nil
 		},
+		getSource: func(_ context.Context, query SourceQuery) (SourceDescriptor, error) {
+			if query.TaskID != testTaskID || query.ResultID != testResultID {
+				t.Fatalf("archive GetSource() query = %#v", query)
+			}
+			return SourceDescriptor{
+				ResultID: testResultID, Status: "complete",
+				StorageKey: storageKey, SHA256: sourceSHA256(source),
+				SizeBytes: size, SizeKnown: true,
+			}, nil
+		},
 	}
 	service, err := NewService(repository, Config{RepositoryRoot: root})
 	if err != nil {
@@ -73,7 +85,16 @@ func TestServiceExportsTaskCurrentFunctionSources(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	temporaryPath := archive.Content.(*removingArchiveFile).path
+	if repository.archiveCalls != 1 {
+		t.Fatalf("source archive snapshot calls = %d, want 1", repository.archiveCalls)
+	}
+	temporaryPath := archive.Content.(*removingArchiveFile).File.Name()
+	if filepath.Dir(temporaryPath) != privateTemp {
+		t.Fatalf("temporary archive directory = %q, want %q", filepath.Dir(temporaryPath), privateTemp)
+	}
+	if _, err := os.Stat(temporaryPath); !os.IsNotExist(err) {
+		t.Fatalf("temporary archive was not unlinked immediately: %v", err)
+	}
 	payload, err := io.ReadAll(archive.Content)
 	if err != nil {
 		t.Fatal(err)
@@ -127,14 +148,18 @@ func TestServiceExportsTaskCurrentFunctionSources(t *testing.T) {
 		manifest.Items[0].ArchivePath != functionPath ||
 		manifest.Items[1].ArchivePath != "" ||
 		!manifest.ExportGeneratedAt.Equal(exportedAt) ||
-		manifest.SourcePolicy != "current_task_repeatable_read_metadata_snapshot" {
+		manifest.SourcePolicy != "current_task_source_metadata" {
 		t.Fatalf("manifest = %#v", manifest)
+	}
+	const replacement = "unrelated replacement"
+	if err := os.WriteFile(temporaryPath, []byte(replacement), 0o600); err != nil {
+		t.Fatal(err)
 	}
 	if err := archive.Content.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(temporaryPath); !os.IsNotExist(err) {
-		t.Fatalf("temporary archive still exists: %v", err)
+	if value, err := os.ReadFile(temporaryPath); err != nil || string(value) != replacement {
+		t.Fatalf("archive Close removed or changed a replacement: %q, %v", value, err)
 	}
 }
 
@@ -210,6 +235,16 @@ func TestServiceRejectsSourceArchiveExpandedPayloadOverBudget(t *testing.T) {
 						ContentSHA256: strings.Repeat("0", 64),
 					}}}, nil
 				},
+				getSource: func(_ context.Context, _ SourceQuery) (SourceDescriptor, error) {
+					return SourceDescriptor{
+						ResultID: testResultID, Status: "complete",
+						StorageKey: filepath.ToSlash(filepath.Join(
+							"decompile", testResultID, "source.c",
+						)),
+						SHA256:    strings.Repeat("0", 64),
+						SizeBytes: size, SizeKnown: true,
+					}, nil
+				},
 			}
 			service, err := NewService(
 				repository,
@@ -265,6 +300,8 @@ func TestServiceSourceArchiveFailsClosedAndRemovesTemporaryFile(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			root := t.TempDir()
+			privateTemp := t.TempDir()
+			t.Setenv("TMPDIR", privateTemp)
 			storageKey := filepath.ToSlash(filepath.Join(
 				"decompile", testResultID, "source.c",
 			))
@@ -282,6 +319,13 @@ func TestServiceSourceArchiveFailsClosedAndRemovesTemporaryFile(t *testing.T) {
 						ContentSHA256: test.sha,
 					}}}, nil
 				},
+				getSource: func(_ context.Context, _ SourceQuery) (SourceDescriptor, error) {
+					return SourceDescriptor{
+						ResultID: testResultID, Status: "complete",
+						StorageKey: storageKey, SHA256: test.sha,
+						SizeBytes: size, SizeKnown: true,
+					}, nil
+				},
 			}
 			service, err := NewService(repository, Config{RepositoryRoot: root})
 			if err != nil {
@@ -297,14 +341,16 @@ func TestServiceSourceArchiveFailsClosedAndRemovesTemporaryFile(t *testing.T) {
 					err,
 				)
 			}
-			matches, err := filepath.Glob(filepath.Join(
-				root, ".decompile-sources-*.zip",
-			))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(matches) != 0 {
-				t.Fatalf("temporary source archives remain: %v", matches)
+			for _, directory := range []string{root, privateTemp} {
+				matches, err := filepath.Glob(filepath.Join(
+					directory, ".decompile-sources-*.zip",
+				))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(matches) != 0 {
+					t.Fatalf("temporary source archives remain: %v", matches)
+				}
 			}
 		})
 	}

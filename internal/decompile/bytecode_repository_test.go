@@ -75,9 +75,9 @@ func TestPublishBytecodeRunRejectsLostFenceBeforeFilesystem(t *testing.T) {
 	err = repository.PublishBytecodeRun(
 		context.Background(), lease, payload, runID, identity,
 		bytecode.StatusBytecodeOnly, 0,
-		func(context.Context) ([]BytecodePublishedResult, func(), error) {
+		func(context.Context) (PublishedSourceProject, []BytecodePublishedResult, func(), error) {
 			publisherCalled = true
-			return nil, func() {}, nil
+			return PublishedSourceProject{}, nil, func() {}, nil
 		},
 	)
 	if !errors.Is(err, ErrRequestConflict) || publisherCalled {
@@ -104,7 +104,10 @@ func TestPublishBytecodeRunCleansReadableArtifactWhenLeaseExpires(t *testing.T) 
 		),
 	}
 	value.ID = bytecodeResultID(runID, value.SymbolKey)
-	value.StorageKey = "decompile/" + value.ID + "/bytecode.json"
+	value.StorageKey = sourceProjectRoot(runID) + "/artifacts/bytecode/A.json"
+	project := publishedProjectFixture(
+		runID, SourceProjectKindBytecode, "java-bytecode", 1, false,
+	)
 	expectedCache := bytecodeResultCacheKey(payload, lease.JobID, identity, value.SymbolKey)
 
 	mock.ExpectBegin()
@@ -119,6 +122,9 @@ func TestPublishBytecodeRunCleansReadableArtifactWhenLeaseExpires(t *testing.T) 
 			value.SizeBytes, []byte(value.Diagnostics),
 		).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	expectPublishedProjectInsert(
+		mock, project, lease, identity, string(bytecode.StatusBytecodeOnly),
+	)
 	mock.ExpectExec(`(?s)UPDATE analyzer_runs.*parameters_json = JSON_SET.*result_status`).
 		WithArgs(
 			"succeeded", 0, string(bytecode.StatusBytecodeOnly),
@@ -133,8 +139,8 @@ func TestPublishBytecodeRunCleansReadableArtifactWhenLeaseExpires(t *testing.T) 
 	err = repository.PublishBytecodeRun(
 		context.Background(), lease, payload, runID, identity,
 		bytecode.StatusBytecodeOnly, 0,
-		func(context.Context) ([]BytecodePublishedResult, func(), error) {
-			return []BytecodePublishedResult{value}, func() { cleanupCalls++ }, nil
+		func(context.Context) (PublishedSourceProject, []BytecodePublishedResult, func(), error) {
+			return project, []BytecodePublishedResult{value}, func() { cleanupCalls++ }, nil
 		},
 	)
 	if !errors.Is(err, ErrRequestConflict) || cleanupCalls != 1 {
@@ -161,7 +167,10 @@ func TestPublishBytecodeRunCommitsFencedReadableResult(t *testing.T) {
 		),
 	}
 	value.ID = bytecodeResultID(runID, value.SymbolKey)
-	value.StorageKey = "decompile/" + value.ID + "/source.java"
+	value.StorageKey = sourceProjectRoot(runID) + "/src/main/java/A.java"
+	project := publishedProjectFixture(
+		runID, SourceProjectKindJava, "java", 1, false,
+	)
 
 	mock.ExpectBegin()
 	mock.ExpectQuery(`(?s)SELECT 1.*run[.]status = \?.*FOR UPDATE`).
@@ -176,6 +185,9 @@ func TestPublishBytecodeRunCommitsFencedReadableResult(t *testing.T) {
 			value.SizeBytes, []byte(value.Diagnostics),
 		).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	expectPublishedProjectInsert(
+		mock, project, lease, identity, string(bytecode.StatusComplete),
+	)
 	mock.ExpectExec(`(?s)UPDATE analyzer_runs.*parameters_json = JSON_SET.*result_status`).
 		WithArgs(
 			"succeeded", 0, string(bytecode.StatusComplete),
@@ -190,8 +202,8 @@ func TestPublishBytecodeRunCommitsFencedReadableResult(t *testing.T) {
 	err = repository.PublishBytecodeRun(
 		context.Background(), lease, payload, runID, identity,
 		bytecode.StatusComplete, 0,
-		func(context.Context) ([]BytecodePublishedResult, func(), error) {
-			return []BytecodePublishedResult{value}, func() { cleanupCalls++ }, nil
+		func(context.Context) (PublishedSourceProject, []BytecodePublishedResult, func(), error) {
+			return project, []BytecodePublishedResult{value}, func() { cleanupCalls++ }, nil
 		},
 	)
 	if err != nil || cleanupCalls != 0 {
@@ -210,7 +222,7 @@ func TestBytecodePublicationStatusPreservesPartialAndBytecodeOnly(t *testing.T) 
 		Diagnostics: json.RawMessage(`{"methods":[]}`),
 	}
 	readable.ID = bytecodeResultID(runID, readable.SymbolKey)
-	readable.StorageKey = "decompile/" + readable.ID + "/bytecode.json"
+	readable.StorageKey = sourceProjectRoot(runID) + "/artifacts/bytecode/A.json"
 	failed := BytecodePublishedResult{
 		SymbolKey: "class:B", Language: "java", Status: "failed",
 		Diagnostics: json.RawMessage(`{"class_errors":[{"code":"bad"}]}`),
@@ -238,14 +250,14 @@ func TestBytecodePublishedResultRejectsInvalidUTF8Metadata(t *testing.T) {
 		Diagnostics: json.RawMessage(`{"methods":[]}`),
 	}
 	baseline.ID = bytecodeResultID(runID, baseline.SymbolKey)
-	baseline.StorageKey = "decompile/" + baseline.ID + "/source.java"
+	baseline.StorageKey = sourceProjectRoot(runID) + "/src/main/java/A.java"
 	if !validBytecodePublishedResult(runID, baseline) {
 		t.Fatal("valid bytecode result was rejected")
 	}
 	invalidSymbol := baseline
 	invalidSymbol.SymbolKey = "class:\x00A"
 	invalidSymbol.ID = bytecodeResultID(runID, invalidSymbol.SymbolKey)
-	invalidSymbol.StorageKey = "decompile/" + invalidSymbol.ID + "/source.java"
+	invalidSymbol.StorageKey = sourceProjectRoot(runID) + "/src/main/java/invalid.java"
 	if validBytecodePublishedResult(runID, invalidSymbol) {
 		t.Fatal("NUL bytecode symbol was accepted")
 	}
@@ -348,6 +360,26 @@ func expectBytecodeReplayMiss(
 			payload.Target.Architecture, payload.Limits.MaxArtifacts,
 		).
 		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow(""))
+}
+
+func expectPublishedProjectInsert(
+	mock sqlmock.Sqlmock,
+	project PublishedSourceProject,
+	lease queue.Lease,
+	identity BytecodeRunIdentity,
+	status string,
+) {
+	mock.ExpectExec(`(?s)INSERT INTO decompile_source_projects`).
+		WithArgs(
+			project.ID, lease.TaskID, uint64(42), lease.JobID,
+			project.LayoutVersion, project.SourceKind, project.Language,
+			identity.EngineName, identity.EngineVersion, status,
+			project.RootStorageKey, nil, nil, nil,
+			project.ManifestStorageKey, project.ManifestSHA256,
+			project.ManifestSizeBytes, project.SourceFileCount,
+			project.SymbolCount, project.SourceSizeBytes,
+		).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 }
 
 func bytecodePublishLeaseArguments(

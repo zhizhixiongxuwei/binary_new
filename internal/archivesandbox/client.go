@@ -1,6 +1,7 @@
 package archivesandbox
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -11,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -25,10 +27,11 @@ const (
 )
 
 type ClientConfig struct {
-	SocketPath string
-	InputRoot  string
-	OutputRoot string
-	Timeout    time.Duration
+	SocketPath       string
+	InputRoot        string
+	OutputRoot       string
+	Timeout          time.Duration
+	MinimumFreeBytes int64
 }
 
 // Client stages inputs into a mount that is read-only in the archive service
@@ -41,12 +44,44 @@ type Client struct {
 	outputInfo os.FileInfo
 }
 
+type managedConnection struct {
+	net.Conn
+	cancel context.CancelFunc
+	stop   func() bool
+	once   sync.Once
+	err    error
+}
+
+func (connection *managedConnection) Close() error {
+	if connection == nil {
+		return nil
+	}
+	connection.once.Do(func() {
+		if connection.stop != nil {
+			connection.stop()
+		}
+		if connection.cancel != nil {
+			connection.cancel()
+		}
+		if connection.Conn != nil {
+			connection.err = connection.Conn.Close()
+		}
+	})
+	return connection.err
+}
+
 func NewClient(config ClientConfig) (*Client, error) {
 	if config.Timeout == 0 {
 		config.Timeout = defaultClientTimeout
 	}
 	if config.Timeout <= 0 || config.Timeout > 24*time.Hour {
 		return nil, errors.New("archive sandbox client timeout is invalid")
+	}
+	if config.MinimumFreeBytes == 0 {
+		config.MinimumFreeBytes = 1
+	}
+	if config.MinimumFreeBytes < 1 || config.MinimumFreeBytes > 50<<30 {
+		return nil, errors.New("archive sandbox minimum free bytes is invalid")
 	}
 	for name, value := range map[string]string{
 		"socket": config.SocketPath,
@@ -107,6 +142,79 @@ func (client *Client) Ping(ctx context.Context) error {
 	return err
 }
 
+// SelfTest exercises every production tool path, including the Linux
+// confinement launcher and descriptor-bound output consumer. Ping alone
+// cannot detect a broken 7zz flag, libarchive frontend, or Landlock failure.
+func (client *Client) SelfTest(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("archive sandbox self-test context is nil")
+	}
+	for _, fixture := range []struct {
+		name, engine, format string
+		content              []byte
+	}{
+		{
+			name: "7z", engine: extract.ExternalEngineSevenZip, format: "7z",
+			content: selfTestSevenZip,
+		},
+		{
+			name: "cab", engine: extract.ExternalEngineLibarchive, format: "cab",
+			content: selfTestCAB,
+		},
+	} {
+		classified, err := client.Classify(
+			ctx, bytes.NewReader(fixture.content), int64(len(fixture.content)),
+		)
+		if err != nil || classified.MIMEType == "" {
+			return fmt.Errorf("archive sandbox %s identify self-test: %w", fixture.name, err)
+		}
+		temporary, err := os.CreateTemp("", ".archive-selftest-")
+		if err != nil {
+			return err
+		}
+		name := temporary.Name()
+		_ = os.Remove(name)
+		if _, err := temporary.Write(fixture.content); err != nil {
+			_ = temporary.Close()
+			return err
+		}
+		if _, err := temporary.Seek(0, io.SeekStart); err != nil {
+			_ = temporary.Close()
+			return err
+		}
+		session, err := client.Extract(ctx, temporary, int64(len(fixture.content)), extract.ExternalArchiveRequest{
+			Engine: fixture.engine, Format: fixture.format,
+			MaxEntries: 4, MaxEntryBytes: 1024,
+			MaxExpandedBytes: 4096, MaxDurationSeconds: 15,
+		})
+		_ = temporary.Close()
+		if err != nil {
+			return fmt.Errorf("archive sandbox %s extraction self-test: %w", fixture.name, err)
+		}
+		rootSession, ok := session.(extract.ExternalArchiveRootSession)
+		if !ok {
+			_ = session.Close()
+			return errors.New("archive sandbox self-test output is not descriptor bound")
+		}
+		root, _, err := rootSession.OpenOutputRoot()
+		if err != nil {
+			_ = session.Close()
+			return err
+		}
+		contents, readErr := root.ReadFile("payload.txt")
+		closeRootErr := root.Close()
+		closeErr := session.Close()
+		if readErr != nil || closeRootErr != nil || closeErr != nil ||
+			string(contents) != "ok" {
+			return errors.Join(
+				fmt.Errorf("archive sandbox %s consumer self-test failed", fixture.name),
+				readErr, closeRootErr, closeErr,
+			)
+		}
+	}
+	return nil
+}
+
 func (client *Client) Classify(
 	ctx context.Context,
 	source io.ReaderAt,
@@ -162,10 +270,16 @@ func (client *Client) Extract(
 	if err != nil {
 		return nil, err
 	}
+	output, err := client.createOutput(staged.id)
+	if err != nil {
+		staged.remove()
+		return nil, err
+	}
 	engine := request.Engine
 	if engine != extract.ExternalEngineSevenZip &&
 		engine != extract.ExternalEngineLibarchive {
 		staged.remove()
+		output.remove()
 		return nil, errors.New("archive sandbox extraction engine is invalid")
 	}
 	protocolRequest := Request{
@@ -178,9 +292,12 @@ func (client *Client) Extract(
 		InputSHA256:        staged.sha256,
 		InputSizeBytes:     staged.size,
 		OutputName:         staged.id,
+		OutputDevice:       output.device,
+		OutputInode:        output.inode,
 		MaxEntries:         request.MaxEntries,
 		MaxEntryBytes:      request.MaxEntryBytes,
 		MaxExpandedBytes:   request.MaxExpandedBytes,
+		MinimumFreeBytes:   client.config.MinimumFreeBytes,
 		MaxDurationSeconds: request.MaxDurationSeconds,
 	}
 	connection, response, err := client.exchange(ctx, protocolRequest)
@@ -189,33 +306,27 @@ func (client *Client) Extract(
 			_ = connection.Close()
 		}
 		staged.remove()
+		output.remove()
 		return nil, err
 	}
 	if response.Status != "succeeded" {
 		_ = connection.Close()
 		staged.remove()
+		output.remove()
 		return nil, responseError(response)
 	}
-	if err := validateDirectoryIdentity(
-		client.config.OutputRoot,
-		client.outputRoot,
-		client.outputInfo,
-	); err != nil {
+	if err := output.validate(); err != nil {
 		_ = connection.Close()
 		staged.remove()
+		output.remove()
 		return nil, fmt.Errorf("archive sandbox output root changed: %w", err)
-	}
-	info, err := client.outputRoot.Lstat(response.OutputName)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		_ = connection.Close()
-		staged.remove()
-		return nil, errors.New("archive sandbox output directory is invalid")
 	}
 	return &clientSession{
 		client: client,
 		staged: staged,
+		output: output,
 		conn:   connection,
-		path:   filepath.Join(client.config.OutputRoot, response.OutputName),
+		path:   output.path(),
 	}, nil
 }
 
@@ -233,25 +344,38 @@ func (client *Client) exchange(
 		return nil, Response{}, err
 	}
 	operationContext, cancel := context.WithTimeout(ctx, client.config.Timeout)
-	defer cancel()
-	connection, err := (&net.Dialer{}).DialContext(
+	rawConnection, err := (&net.Dialer{}).DialContext(
 		operationContext,
 		"unix",
 		client.config.SocketPath,
 	)
 	if err != nil {
+		cancel()
 		return nil, Response{}, fmt.Errorf("connect archive sandbox: %w", err)
 	}
+	connection := &managedConnection{Conn: rawConnection, cancel: cancel}
+	connection.stop = context.AfterFunc(operationContext, func() {
+		_ = rawConnection.Close()
+	})
 	if deadline, ok := operationContext.Deadline(); ok {
 		_ = connection.SetDeadline(deadline)
 	}
 	if err := writeFrame(connection, request); err != nil {
 		_ = connection.Close()
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, Response{}, contextErr
+		}
 		return nil, Response{}, err
 	}
 	var response Response
 	if err := readFrame(connection, &response); err != nil {
 		_ = connection.Close()
+		if contextErr := operationContext.Err(); contextErr != nil {
+			return nil, Response{}, contextErr
+		}
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, Response{}, contextErr
+		}
 		return nil, Response{}, err
 	}
 	if err := response.validate(request); err != nil {
@@ -361,6 +485,7 @@ func (staged *stagedInput) remove() {
 type clientSession struct {
 	client *Client
 	staged *stagedInput
+	output *stagedOutput
 	conn   net.Conn
 	path   string
 	once   sync.Once
@@ -374,11 +499,34 @@ func (session *clientSession) OutputPath() string {
 	return session.path
 }
 
+func (session *clientSession) OpenOutputRoot() (*os.Root, os.FileInfo, error) {
+	if session == nil || session.output == nil {
+		return nil, nil, errors.New("archive sandbox output is missing")
+	}
+	if err := session.output.validate(); err != nil {
+		return nil, nil, err
+	}
+	root, err := session.output.root.OpenRoot(".")
+	if err != nil {
+		return nil, nil, fmt.Errorf("duplicate archive sandbox output root: %w", err)
+	}
+	info, err := root.Lstat(".")
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 ||
+		!os.SameFile(session.output.info, info) {
+		_ = root.Close()
+		return nil, nil, errors.New("archive sandbox output descriptor changed")
+	}
+	return root, info, nil
+}
+
 func (session *clientSession) Close() error {
 	if session == nil {
 		return nil
 	}
 	session.once.Do(func() {
+		if session.output != nil {
+			session.err = session.output.validate()
+		}
 		if session.conn != nil {
 			_ = session.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			if _, err := session.conn.Write([]byte{ackByte}); err != nil {
@@ -390,8 +538,130 @@ func (session *clientSession) Close() error {
 			session.err = errors.Join(session.err, session.conn.Close())
 		}
 		session.staged.remove()
+		if session.output != nil {
+			session.err = errors.Join(session.err, session.output.remove())
+		}
 	})
 	return session.err
+}
+
+type stagedOutput struct {
+	client    *Client
+	name      string
+	info      os.FileInfo
+	root      *os.Root
+	directory *os.File
+	device    uint64
+	inode     uint64
+	once      sync.Once
+	err       error
+}
+
+func (client *Client) createOutput(name string) (_ *stagedOutput, returnedErr error) {
+	if !requestIDPattern.MatchString(name) {
+		return nil, errors.New("archive sandbox output name is invalid")
+	}
+	if err := validateDirectoryIdentity(
+		client.config.OutputRoot, client.outputRoot, client.outputInfo,
+	); err != nil {
+		return nil, fmt.Errorf("archive sandbox output root changed: %w", err)
+	}
+	output := &stagedOutput{client: client, name: name}
+	defer func() {
+		if returnedErr != nil {
+			_ = output.remove()
+		}
+	}()
+	if err := client.outputRoot.Mkdir(name, 0o700); err != nil {
+		return nil, fmt.Errorf("create archive sandbox output: %w", err)
+	}
+	info, err := client.outputRoot.Lstat(name)
+	if err != nil || !realDirectory(info) {
+		return nil, errors.New("archive sandbox output identity is invalid")
+	}
+	output.info = info
+	output.device = fileDevice(info)
+	output.inode = fileInode(info)
+	if output.device == 0 || output.inode == 0 {
+		return nil, errors.New("archive sandbox output filesystem identity is unavailable")
+	}
+	output.root, err = client.outputRoot.OpenRoot(name)
+	if err != nil {
+		return nil, fmt.Errorf("open archive sandbox output root: %w", err)
+	}
+	opened, err := output.root.Stat(".")
+	if err != nil || !os.SameFile(info, opened) {
+		return nil, errors.New("archive sandbox output changed while opening")
+	}
+	output.directory, err = output.root.Open(".")
+	if err != nil {
+		return nil, fmt.Errorf("bind archive sandbox client output: %w", err)
+	}
+	return output, nil
+}
+
+func (output *stagedOutput) path() string {
+	if output == nil || output.directory == nil {
+		return ""
+	}
+	descriptor := output.directory.Fd()
+	if runtime.GOOS == "linux" {
+		return fmt.Sprintf("/proc/self/fd/%d", descriptor)
+	}
+	// Darwin exposes directory descriptors in /dev/fd but does not permit
+	// walking children through them. Production is Linux; other platforms keep
+	// the descriptor pinned and validate the name before acknowledgement.
+	return filepath.Join(output.client.config.OutputRoot, output.name)
+}
+
+func (output *stagedOutput) validate() error {
+	if output == nil || output.client == nil || output.root == nil ||
+		output.directory == nil || output.info == nil {
+		return errors.New("archive sandbox output identity is missing")
+	}
+	if err := validateDirectoryIdentity(
+		output.client.config.OutputRoot,
+		output.client.outputRoot,
+		output.client.outputInfo,
+	); err != nil {
+		return err
+	}
+	opened, err := output.root.Stat(".")
+	if err != nil || !os.SameFile(output.info, opened) ||
+		fileDevice(opened) != output.device || fileInode(opened) != output.inode {
+		return errors.New("archive sandbox output descriptor changed")
+	}
+	current, err := output.client.outputRoot.Lstat(output.name)
+	if err != nil || !os.SameFile(output.info, current) {
+		return errors.New("archive sandbox output name was replaced")
+	}
+	return nil
+}
+
+func (output *stagedOutput) remove() error {
+	if output == nil {
+		return nil
+	}
+	output.once.Do(func() {
+		if output.root != nil {
+			output.err = errors.Join(output.err, clearSandboxRoot(output.root))
+		}
+		if output.directory != nil {
+			output.err = errors.Join(output.err, output.directory.Close())
+		}
+		if output.root != nil {
+			output.err = errors.Join(output.err, output.root.Close())
+		}
+		if output.client != nil && output.info != nil {
+			current, err := output.client.outputRoot.Lstat(output.name)
+			if err == nil && os.SameFile(output.info, current) {
+				output.err = errors.Join(
+					output.err, output.client.outputRoot.RemoveAll(output.name),
+				)
+			}
+		}
+	})
+	return output.err
 }
 
 func responseError(response Response) error {

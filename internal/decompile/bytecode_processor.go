@@ -146,6 +146,7 @@ type BytecodePublishedResult struct {
 	SymbolKey   string
 	Language    string
 	Status      string
+	LogicalPath string
 	StorageKey  string
 	SHA256      string
 	SizeBytes   uint64
@@ -154,7 +155,7 @@ type BytecodePublishedResult struct {
 
 type BytecodeResultPublisher func(
 	context.Context,
-) ([]BytecodePublishedResult, func(), error)
+) (PublishedSourceProject, []BytecodePublishedResult, func(), error)
 
 type BytecodeRunRepository interface {
 	BeginBytecodeRun(
@@ -169,7 +170,7 @@ type BytecodeRunRepository interface {
 	) (BytecodeCacheCandidate, bool, error)
 	PublishBytecodeCacheHit(
 		context.Context, queue.Lease, JobPayload, string, BytecodeRunIdentity,
-		BytecodeCacheCandidate, []BytecodePublishedResult,
+		BytecodeCacheCandidate, PublishedSourceProject, []BytecodePublishedResult,
 	) error
 	FailBytecodeRun(
 		context.Context, queue.Lease, string, string, string,
@@ -406,13 +407,13 @@ func (p *BytecodeProcessor) Process(
 	if candidate, found, cacheErr := p.repository.FindBytecodeCache(
 		attemptCtx, lease, payload, runID, runIdentity,
 	); cacheErr == nil && found {
-		published, cleanup, materializeErr := p.materializeBytecodeCache(
+		project, published, cleanup, materializeErr := p.materializeBytecodeCache(
 			attemptCtx, runID, candidate, payload.Limits,
 		)
 		if materializeErr == nil {
 			cacheErr = p.repository.PublishBytecodeCacheHit(
 				attemptCtx, lease, payload, runID, runIdentity,
-				candidate, published,
+				candidate, project, published,
 			)
 			if cacheErr == nil {
 				finish := finishForBytecodeStatus(candidate.ResultStatus)
@@ -490,7 +491,12 @@ func (p *BytecodeProcessor) Process(
 	})
 	if err := p.repository.PublishBytecodeRun(
 		attemptCtx, lease, payload, runID, runIdentity, result.Status, exitCode,
-		func(publishCtx context.Context) ([]BytecodePublishedResult, func(), error) {
+		func(publishCtx context.Context) (
+			PublishedSourceProject,
+			[]BytecodePublishedResult,
+			func(),
+			error,
+		) {
 			return p.publishResults(publishCtx, runID, workDirectory.Path(), result)
 		},
 	); err != nil {
@@ -795,7 +801,7 @@ func (p *BytecodeProcessor) publishResults(
 	runID string,
 	workRoot string,
 	result bytecode.Result,
-) ([]BytecodePublishedResult, func(), error) {
+) (PublishedSourceProject, []BytecodePublishedResult, func(), error) {
 	artifacts := make(map[string]bytecode.Artifact, len(result.Artifacts))
 	for _, artifact := range result.Artifacts {
 		artifacts[artifact.ID] = artifact
@@ -810,31 +816,37 @@ func (p *BytecodeProcessor) publishResults(
 			ArtifactIDs: []string{}, Methods: []bytecode.MethodIndex{},
 		}}
 	}
-	values := make([]BytecodePublishedResult, 0, len(classes))
-	directories := make([]string, 0, len(classes))
+	projectRoot := sourceProjectRoot(runID)
 	cleanup := func() {
-		root, err := os.OpenRoot(p.config.RepositoryRoot)
-		if err != nil {
-			return
-		}
-		defer root.Close()
-		for _, directory := range directories {
-			_ = root.RemoveAll(directory)
-		}
+		cleanupSourceProject(p.config.RepositoryRoot, runID)
 	}
 	workspaceRoot, err := os.OpenRoot(workRoot)
 	if err != nil {
-		return nil, func() {}, err
+		return PublishedSourceProject{}, nil, func() {}, err
 	}
 	defer workspaceRoot.Close()
+	publication, err := newSourceProjectPublication(
+		p.config.RepositoryRoot, runID,
+	)
+	if err != nil {
+		return PublishedSourceProject{}, nil, func() {}, err
+	}
+	defer publication.Close()
+	fail := func(err error) (PublishedSourceProject, []BytecodePublishedResult, func(), error) {
+		err = errors.Join(err, publication.Close())
+		cleanup()
+		return PublishedSourceProject{}, nil, func() {}, err
+	}
+	values := make([]BytecodePublishedResult, 0, len(classes))
+	manifestEntries := make([]bytecodeProjectEntry, 0, len(classes))
+	usedPaths := make(map[string]struct{}, len(classes))
 	classErrors := make(map[string][]bytecode.ClassError)
 	for _, classErr := range result.ClassErrors {
 		classErrors[classErr.ClassKey] = append(classErrors[classErr.ClassKey], classErr)
 	}
 	for _, class := range classes {
 		if err := ctx.Err(); err != nil {
-			cleanup()
-			return nil, func() {}, err
+			return fail(err)
 		}
 		id := bytecodeResultID(runID, class.Key)
 		status := persistedBytecodeStatus(class.Status)
@@ -846,39 +858,27 @@ func (p *BytecodeProcessor) publishResults(
 		if class.Status == bytecode.ClassSource ||
 			class.Status == bytecode.ClassBytecodeOnly {
 			if len(readableArtifacts) == 0 {
-				cleanup()
-				return nil, func() {}, errors.New(
+				return fail(errors.New(
 					"bytecode class has no readable artifacts",
-				)
+				))
 			}
-			directory := path.Join("decompile", id)
-			key := path.Join(
-				directory, bytecodeReadableName(class.Status, readableArtifacts),
+			logicalPath, pathErr := bytecodeProjectPath(
+				class, readableArtifacts, id, usedPaths,
 			)
-			root, err := os.OpenRoot(p.config.RepositoryRoot)
-			if err != nil {
-				cleanup()
-				return nil, func() {}, err
+			if pathErr != nil {
+				return fail(pathErr)
 			}
-			if err := ensureNativeDirectory(root, "decompile"); err != nil {
-				root.Close()
-				cleanup()
-				return nil, func() {}, err
+			key := path.Join(projectRoot, logicalPath)
+			if err := publication.MkdirAll(path.Dir(logicalPath)); err != nil {
+				return fail(err)
 			}
-			if err := root.Mkdir(directory, 0o700); err != nil {
-				root.Close()
-				cleanup()
-				return nil, func() {}, err
-			}
-			directories = append(directories, directory)
 			digest, size, err := copyBytecodeReadableArtifacts(
-				ctx, workspaceRoot, root, key, readableArtifacts,
+				ctx, workspaceRoot, publication, logicalPath, readableArtifacts,
 			)
-			root.Close()
 			if err != nil {
-				cleanup()
-				return nil, func() {}, err
+				return fail(err)
 			}
+			value.LogicalPath = logicalPath
 			value.StorageKey = key
 			value.SHA256 = digest
 			value.SizeBytes = size
@@ -904,13 +904,273 @@ func (p *BytecodeProcessor) publishResults(
 		})
 		if err != nil || len(diagnostics) == 0 ||
 			len(diagnostics) > maxBytecodeDiagnosticsBytes {
-			cleanup()
-			return nil, func() {}, errors.New("bytecode diagnostics exceed publication limit")
+			return fail(errors.New("bytecode diagnostics exceed publication limit"))
 		}
 		value.Diagnostics = diagnostics
 		values = append(values, value)
+		manifestEntries = append(manifestEntries, bytecodeProjectEntry{
+			ResultID: id, SymbolKey: class.Key, BinaryName: class.BinaryName,
+			DisplayName: class.DisplayName, Language: language, Status: status,
+			LogicalPath: value.LogicalPath, SHA256: value.SHA256,
+			SizeBytes: value.SizeBytes,
+		})
 	}
-	return values, cleanup, nil
+	fileCount, sourceBytes := 0, uint64(0)
+	for _, value := range values {
+		if value.StorageKey == "" {
+			continue
+		}
+		fileCount++
+		if value.SizeBytes > ^uint64(0)-sourceBytes {
+			return fail(errors.New("bytecode project size overflow"))
+		}
+		sourceBytes += value.SizeBytes
+	}
+	if fileCount == 0 {
+		_ = publication.Close()
+		cleanup()
+		return PublishedSourceProject{}, values, func() {}, nil
+	}
+	sourceKind, language := bytecodeProjectKind(values)
+	manifest := bytecodeProjectManifest{
+		SchemaVersion: "binaryscan-source-project/v1", ProjectID: runID,
+		LayoutVersion: sourceProjectLayoutV1, SourceKind: sourceKind,
+		Language: language, EngineName: p.identity.Engine.Name,
+		EngineVersion: p.identity.Engine.Version, Status: string(result.Status),
+		SourceFileCount: fileCount, SymbolCount: len(values), Files: manifestEntries,
+	}
+	manifestKey := path.Join(projectRoot, sourceProjectManifestName)
+	manifestFile, err := writeProjectJSON(
+		publication, sourceProjectManifestName, manifest,
+	)
+	if err != nil {
+		return fail(err)
+	}
+	project := PublishedSourceProject{
+		ID: runID, LayoutVersion: sourceProjectLayoutV1,
+		SourceKind: sourceKind, Language: language,
+		RootStorageKey: projectRoot, ManifestStorageKey: manifestKey,
+		ManifestSHA256:    manifestFile.SHA256,
+		ManifestSizeBytes: manifestFile.SizeBytes,
+		SourceFileCount:   fileCount, SymbolCount: len(values),
+		SourceSizeBytes: sourceBytes,
+	}
+	if err := publication.Finalize(ctx); err != nil {
+		return fail(err)
+	}
+	if err := publication.Close(); err != nil {
+		return fail(err)
+	}
+	return project, values, cleanup, nil
+}
+
+type bytecodeProjectEntry struct {
+	ResultID    string `json:"result_id"`
+	SymbolKey   string `json:"symbol_key"`
+	BinaryName  string `json:"binary_name"`
+	DisplayName string `json:"display_name"`
+	Language    string `json:"language"`
+	Status      string `json:"status"`
+	LogicalPath string `json:"logical_path,omitempty"`
+	SHA256      string `json:"sha256,omitempty"`
+	SizeBytes   uint64 `json:"size_bytes,omitempty"`
+}
+
+type bytecodeProjectManifest struct {
+	SchemaVersion   string                 `json:"schema_version"`
+	ProjectID       string                 `json:"project_id"`
+	LayoutVersion   string                 `json:"layout_version"`
+	SourceKind      string                 `json:"source_kind"`
+	Language        string                 `json:"language"`
+	EngineName      string                 `json:"engine_name"`
+	EngineVersion   string                 `json:"engine_version"`
+	Status          string                 `json:"status"`
+	SourceFileCount int                    `json:"source_file_count"`
+	SymbolCount     int                    `json:"symbol_count"`
+	Files           []bytecodeProjectEntry `json:"files"`
+}
+
+const (
+	maxBytecodeProjectPathComponents     = 28
+	maxBytecodeProjectPathComponentBytes = 128
+	maxBytecodeProjectRelativePathBytes  = maxProjectStorageKeyBytes -
+		len("source-projects/00000000-0000-4000-8000-000000000000/")
+)
+
+func bytecodeProjectPath(
+	class bytecode.ClassIndex,
+	artifacts []bytecode.Artifact,
+	resultID string,
+	used map[string]struct{},
+) (string, error) {
+	if !uuidPattern.MatchString(resultID) {
+		return "", errors.New("bytecode project result ID is invalid")
+	}
+	name := ""
+	fallback := ""
+	if class.Status == bytecode.ClassSource {
+		extension := path.Ext(bytecodeSourceName(persistedBytecodeLanguage(class)))
+		candidate := strings.TrimPrefix(path.Clean(class.SourceFile), "sources/")
+		if candidate == "." || candidate == "" || path.IsAbs(candidate) ||
+			candidate == ".." || strings.HasPrefix(candidate, "../") ||
+			strings.Contains(candidate, `\`) {
+			candidate = ""
+		}
+		if candidate == "" || path.Ext(candidate) == "" ||
+			(!strings.Contains(candidate, "/") && strings.Contains(class.BinaryName, ".")) {
+			binaryPath := strings.ReplaceAll(class.BinaryName, ".", "/")
+			if binaryPath == "" {
+				binaryPath = resultID
+			}
+			candidate = binaryPath + extension
+		}
+		candidate = safeBytecodeProjectRelativePath(candidate)
+		if candidate == "" {
+			candidate = resultID + extension
+		}
+		prefix := "src/main/other"
+		switch strings.ToLower(persistedBytecodeLanguage(class)) {
+		case "java":
+			prefix = "src/main/java"
+		case "kotlin":
+			prefix = "src/main/kotlin"
+		case "python":
+			prefix = "src/main/python"
+		}
+		name = path.Join(prefix, candidate)
+		fallback = path.Join(prefix, resultID+extension)
+	} else {
+		readableName := bytecodeReadableName(class.Status, artifacts)
+		stem := safeBytecodeProjectRelativePath(
+			strings.ReplaceAll(class.BinaryName, ".", "/"),
+		)
+		if stem == "" {
+			stem = resultID
+		}
+		name = path.Join("artifacts/bytecode", stem+"-"+readableName)
+		fallback = path.Join(
+			"artifacts/bytecode",
+			resultID+"-"+readableName,
+		)
+	}
+	if !validBytecodeProjectLogicalPath(name) {
+		name = fallback
+	}
+	if !validBytecodeProjectLogicalPath(name) {
+		return "", errors.New("bytecode project path is invalid")
+	}
+	if _, exists := used[bytecodeProjectCollisionKey(name)]; exists {
+		extension := path.Ext(name)
+		name = strings.TrimSuffix(name, extension) + "-" +
+			resultID + extension
+	}
+	if !validBytecodeProjectLogicalPath(name) {
+		name = fallback
+	}
+	collisionKey := bytecodeProjectCollisionKey(name)
+	if _, exists := used[collisionKey]; exists {
+		return "", errors.New("bytecode project path is duplicated")
+	}
+	if !validBytecodeProjectLogicalPath(name) {
+		return "", errors.New("bytecode project fallback path is invalid")
+	}
+	used[collisionKey] = struct{}{}
+	return name, nil
+}
+
+func bytecodeProjectCollisionKey(value string) string {
+	return strings.ToLower(value)
+}
+
+func validBytecodeProjectLogicalPath(value string) bool {
+	if value == "" || len(value) > maxBytecodeProjectRelativePathBytes ||
+		path.Clean(value) != value || path.IsAbs(value) || strings.Contains(value, `\`) {
+		return false
+	}
+	for _, component := range strings.Split(value, "/") {
+		if component == "" || component == "." || component == ".." ||
+			len(component) > 255 {
+			return false
+		}
+	}
+	return true
+}
+
+func safeBytecodeProjectRelativePath(value string) string {
+	components := strings.Split(path.Clean(value), "/")
+	if len(components) == 0 || len(components) > maxBytecodeProjectPathComponents {
+		return ""
+	}
+	for index, component := range components {
+		if component == "" || component == "." || component == ".." {
+			return ""
+		}
+		var builder strings.Builder
+		for _, character := range component {
+			if character >= 'a' && character <= 'z' ||
+				character >= 'A' && character <= 'Z' ||
+				character >= '0' && character <= '9' ||
+				character == '.' || character == '_' || character == '-' ||
+				character == '$' {
+				builder.WriteRune(character)
+			} else {
+				builder.WriteByte('_')
+			}
+		}
+		components[index] = strings.Trim(builder.String(), ".")
+		if components[index] == "" ||
+			len(components[index]) > maxBytecodeProjectPathComponentBytes {
+			return ""
+		}
+		if windowsReservedProjectComponent(components[index]) {
+			components[index] = "_" + components[index]
+		}
+	}
+	result := path.Join(components...)
+	if len(result) > maxBytecodeProjectRelativePathBytes {
+		return ""
+	}
+	return result
+}
+
+func windowsReservedProjectComponent(value string) bool {
+	base := strings.ToUpper(strings.SplitN(value, ".", 2)[0])
+	switch base {
+	case "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$":
+		return true
+	}
+	return len(base) == 4 && (strings.HasPrefix(base, "COM") ||
+		strings.HasPrefix(base, "LPT")) && base[3] >= '1' && base[3] <= '9'
+}
+
+func bytecodeProjectKind(values []BytecodePublishedResult) (string, string) {
+	found := map[string]bool{}
+	for _, value := range values {
+		if value.StorageKey != "" {
+			found[strings.ToLower(value.Language)] = true
+		}
+	}
+	for _, candidate := range []struct{ language, kind string }{
+		{"java", SourceProjectKindJava}, {"kotlin", SourceProjectKindKotlin},
+		{"python", SourceProjectKindPython},
+	} {
+		if found[candidate.language] {
+			language := candidate.language
+			if len(found) > 1 {
+				language = "mixed"
+			}
+			return candidate.kind, language
+		}
+	}
+	if len(found) == 1 {
+		for language := range found {
+			if strings.Contains(language, "bytecode") {
+				return SourceProjectKindBytecode, language
+			}
+			return SourceProjectKindBytecode, language
+		}
+	}
+	return SourceProjectKindBytecode, "mixed"
 }
 
 func readableArtifactsForClass(
@@ -953,13 +1213,11 @@ func readableArtifactsForClass(
 func copyBytecodeReadableArtifacts(
 	ctx context.Context,
 	sourceRoot *os.Root,
-	destinationRoot *os.Root,
-	destinationKey string,
+	publication *sourceProjectPublication,
+	destinationPath string,
 	artifacts []bytecode.Artifact,
 ) (string, uint64, error) {
-	destination, err := destinationRoot.OpenFile(
-		destinationKey, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600,
-	)
+	destination, err := publication.CreateFile(destinationPath)
 	if err != nil {
 		return "", 0, err
 	}
@@ -1014,10 +1272,7 @@ func copyBytecodeReadableArtifacts(
 	if !textValidator.Valid() {
 		return fail(errors.New("bytecode readable artifact is not valid UTF-8"))
 	}
-	if err := destination.Sync(); err != nil {
-		return fail(err)
-	}
-	if err := destination.Close(); err != nil {
+	if err := destination.Commit(); err != nil {
 		return "", 0, err
 	}
 	return hex.EncodeToString(overall.Sum(nil)), total, nil

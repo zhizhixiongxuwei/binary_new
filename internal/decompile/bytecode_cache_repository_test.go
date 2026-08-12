@@ -75,6 +75,9 @@ func TestPublishBytecodeCacheHitRejectsCandidateDeletionRace(t *testing.T) {
 	payload, lease, identity, runID := bytecodeRepositoryFixture()
 	candidate := bytecodeRepositoryCacheCandidate()
 	results := bytecodeRepositoryCachePublication(runID, candidate)
+	project := publishedProjectFixture(
+		runID, SourceProjectKindJava, "java", len(results), false,
+	)
 
 	mock.ExpectBegin()
 	mock.ExpectQuery(`(?s)SELECT 1.*run[.]cache_identity = \?.*run[.]status = \?.*FOR UPDATE`).
@@ -88,7 +91,8 @@ func TestPublishBytecodeCacheHitRejectsCandidateDeletionRace(t *testing.T) {
 	mock.ExpectRollback()
 
 	err = repository.PublishBytecodeCacheHit(
-		context.Background(), lease, payload, runID, identity, candidate, results,
+		context.Background(), lease, payload, runID, identity, candidate,
+		project, results,
 	)
 	if !errors.Is(err, errBytecodeCacheStale) {
 		t.Fatalf("PublishBytecodeCacheHit() error = %v", err)
@@ -108,6 +112,9 @@ func TestPublishBytecodeCacheHitCommitsPrivateVerifiedRows(t *testing.T) {
 	payload, lease, identity, runID := bytecodeRepositoryFixture()
 	candidate := bytecodeRepositoryCacheCandidate()
 	results := bytecodeRepositoryCachePublication(runID, candidate)
+	project := publishedProjectFixture(
+		runID, SourceProjectKindJava, "java", len(results), false,
+	)
 
 	mock.ExpectBegin()
 	mock.ExpectQuery(`(?s)SELECT 1.*run[.]cache_identity = \?.*run[.]status = \?.*FOR UPDATE`).
@@ -137,6 +144,9 @@ func TestPublishBytecodeCacheHitCommitsPrivateVerifiedRows(t *testing.T) {
 			[]byte(results[0].Diagnostics),
 		).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	expectPublishedProjectInsert(
+		mock, project, lease, identity, string(candidate.ResultStatus),
+	)
 	mock.ExpectExec(`(?s)UPDATE analyzer_runs.*cache_hit.*cache_source_task_id.*cache_copy_mode`).
 		WithArgs(
 			string(candidate.ResultStatus), 1, candidate.TaskID, candidate.RunID,
@@ -151,7 +161,8 @@ func TestPublishBytecodeCacheHitCommitsPrivateVerifiedRows(t *testing.T) {
 	mock.ExpectCommit()
 
 	if err := repository.PublishBytecodeCacheHit(
-		context.Background(), lease, payload, runID, identity, candidate, results,
+		context.Background(), lease, payload, runID, identity, candidate,
+		project, results,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -238,8 +249,9 @@ func bytecodeRepositoryCachePublication(
 	id := bytecodeResultID(runID, cached.SymbolKey)
 	return []BytecodePublishedResult{{
 		ID: id, SymbolKey: cached.SymbolKey, Language: cached.Language,
-		Status: cached.Status, StorageKey: "decompile/" + id + "/source.java",
-		SHA256: cached.SHA256, SizeBytes: cached.SizeBytes,
+		Status:     cached.Status,
+		StorageKey: sourceProjectRoot(runID) + "/src/main/java/A.java",
+		SHA256:     cached.SHA256, SizeBytes: cached.SizeBytes,
 		Diagnostics: append([]byte(nil), cached.Diagnostics...),
 	}}
 }

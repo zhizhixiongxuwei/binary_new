@@ -55,65 +55,106 @@ func (p *BytecodeProcessor) materializeBytecodeCache(
 	runID string,
 	candidate BytecodeCacheCandidate,
 	limits JobLimits,
-) ([]BytecodePublishedResult, func(), error) {
+) (PublishedSourceProject, []BytecodePublishedResult, func(), error) {
 	if !validJobLimits(limits) || !uuidPattern.MatchString(runID) ||
 		!validBytecodeCacheCandidate(candidate, limits) {
-		return nil, func() {}, errBytecodeCacheInvalid
+		return PublishedSourceProject{}, nil, func() {}, errBytecodeCacheInvalid
 	}
 	root, err := os.OpenRoot(p.config.RepositoryRoot)
 	if err != nil {
-		return nil, func() {}, err
+		return PublishedSourceProject{}, nil, func() {}, err
 	}
 	defer root.Close()
-	if err := ensureNativeDirectory(root, "decompile"); err != nil {
-		return nil, func() {}, err
+	projectRoot := sourceProjectRoot(runID)
+	publication, err := newSourceProjectPublication(
+		p.config.RepositoryRoot, runID,
+	)
+	if err != nil {
+		return PublishedSourceProject{}, nil, func() {}, err
 	}
-
-	directories := make([]string, 0, len(candidate.Results))
+	defer publication.Close()
 	cleanup := func() {
-		cleanupRoot, openErr := os.OpenRoot(p.config.RepositoryRoot)
-		if openErr != nil {
-			return
-		}
-		defer cleanupRoot.Close()
-		for _, directory := range directories {
-			_ = cleanupRoot.RemoveAll(directory)
-		}
+		cleanupSourceProject(p.config.RepositoryRoot, runID)
+	}
+	fail := func(err error) (PublishedSourceProject, []BytecodePublishedResult, func(), error) {
+		err = errors.Join(err, publication.Close())
+		cleanup()
+		return PublishedSourceProject{}, nil, func() {}, err
 	}
 	values := make([]BytecodePublishedResult, 0, len(candidate.Results))
+	manifestEntries := make([]bytecodeProjectEntry, 0, len(candidate.Results))
+	usedPaths := make(map[string]struct{}, len(candidate.Results))
+	var sourceBytes uint64
 	for _, cached := range candidate.Results {
 		if err := ctx.Err(); err != nil {
-			cleanup()
-			return nil, func() {}, err
+			return fail(err)
 		}
 		id := bytecodeResultID(runID, cached.SymbolKey)
-		directory := path.Join("decompile", id)
-		if err := root.Mkdir(directory, 0o700); err != nil {
-			cleanup()
-			return nil, func() {}, err
+		logicalPath, pathErr := bytecodeCachedProjectPath(cached, id, usedPaths)
+		if pathErr != nil {
+			return fail(pathErr)
 		}
-		directories = append(directories, directory)
-		name, ok := bytecodeCachedDestinationName(cached)
-		if !ok {
-			cleanup()
-			return nil, func() {}, errBytecodeCacheInvalid
+		destinationKey := path.Join(projectRoot, logicalPath)
+		if err := publication.MkdirAll(path.Dir(logicalPath)); err != nil {
+			return fail(err)
 		}
-		destinationKey := path.Join(directory, name)
 		digest, size, copyErr := copyVerifiedBytecodeCacheFile(
-			ctx, root, cached, destinationKey,
+			ctx, root, publication, cached, logicalPath,
 		)
 		if copyErr != nil {
-			cleanup()
-			return nil, func() {}, copyErr
+			return fail(copyErr)
 		}
 		values = append(values, BytecodePublishedResult{
 			ID: id, SymbolKey: cached.SymbolKey, Language: cached.Language,
-			Status: cached.Status, StorageKey: destinationKey,
-			SHA256: digest, SizeBytes: size,
+			Status: cached.Status, LogicalPath: logicalPath,
+			StorageKey: destinationKey,
+			SHA256:     digest, SizeBytes: size,
 			Diagnostics: append([]byte(nil), cached.Diagnostics...),
 		})
+		manifestEntries = append(manifestEntries, bytecodeProjectEntry{
+			ResultID: id, SymbolKey: cached.SymbolKey,
+			BinaryName:  bytecodeCachedDiagnosticString(cached.Diagnostics, "binary_name"),
+			DisplayName: bytecodeCachedDiagnosticString(cached.Diagnostics, "display_name"),
+			Language:    cached.Language, Status: cached.Status,
+			LogicalPath: logicalPath, SHA256: digest, SizeBytes: size,
+		})
+		if size > ^uint64(0)-sourceBytes {
+			return fail(errBytecodeCacheInvalid)
+		}
+		sourceBytes += size
 	}
-	return values, cleanup, nil
+	sourceKind, language := bytecodeProjectKind(values)
+	manifest := bytecodeProjectManifest{
+		SchemaVersion: "binaryscan-source-project/v1", ProjectID: runID,
+		LayoutVersion: sourceProjectLayoutV1, SourceKind: sourceKind,
+		Language: language, EngineName: p.identity.Engine.Name,
+		EngineVersion: p.identity.Engine.Version,
+		Status:        string(candidate.ResultStatus), SourceFileCount: len(values),
+		SymbolCount: len(values), Files: manifestEntries,
+	}
+	manifestKey := path.Join(projectRoot, sourceProjectManifestName)
+	manifestFile, err := writeProjectJSON(
+		publication, sourceProjectManifestName, manifest,
+	)
+	if err != nil {
+		return fail(err)
+	}
+	project := PublishedSourceProject{
+		ID: runID, LayoutVersion: sourceProjectLayoutV1,
+		SourceKind: sourceKind, Language: language,
+		RootStorageKey: projectRoot, ManifestStorageKey: manifestKey,
+		ManifestSHA256:    manifestFile.SHA256,
+		ManifestSizeBytes: manifestFile.SizeBytes,
+		SourceFileCount:   len(values), SymbolCount: len(values),
+		SourceSizeBytes: sourceBytes,
+	}
+	if err := publication.Finalize(ctx); err != nil {
+		return fail(err)
+	}
+	if err := publication.Close(); err != nil {
+		return fail(err)
+	}
+	return project, values, cleanup, nil
 }
 
 func validBytecodeCacheCandidate(
@@ -182,10 +223,7 @@ func validBytecodeCachedResult(value BytecodeCachedResult) bool {
 		!utf8.Valid(value.Diagnostics) || !json.Valid(value.Diagnostics) {
 		return false
 	}
-	expectedPrefix := path.Join("decompile", value.ID) + "/"
-	return strings.HasPrefix(value.StorageKey, expectedPrefix) &&
-		path.Clean(value.StorageKey) == value.StorageKey &&
-		!strings.Contains(value.StorageKey, `\`)
+	return validBytecodeCacheStorageKey(value.StorageKey, value.ID, value.Status)
 }
 
 func validASCIIBytecodeLanguage(value string) bool {
@@ -201,8 +239,8 @@ func bytecodeCachedDestinationName(value BytecodeCachedResult) (string, bool) {
 	name := path.Base(value.StorageKey)
 	switch value.Status {
 	case "complete":
-		expected := bytecodeSourceName(value.Language)
-		return expected, name == expected
+		extension := path.Ext(bytecodeSourceName(value.Language))
+		return name, extension != "" && strings.EqualFold(path.Ext(name), extension)
 	case "bytecode_only":
 		if name == "bytecode.json" || name == "bytecode.txt" {
 			return name, true
@@ -211,11 +249,71 @@ func bytecodeCachedDestinationName(value BytecodeCachedResult) (string, bool) {
 	return "", false
 }
 
+func validBytecodeCacheStorageKey(key string, resultID string, status string) bool {
+	if key == "" || path.IsAbs(key) || path.Clean(key) != key ||
+		strings.Contains(key, `\`) {
+		return false
+	}
+	components := strings.Split(key, "/")
+	legacy := len(components) == 3 && components[0] == "decompile" &&
+		components[1] == resultID
+	project := len(components) >= 4 && components[0] == sourceProjectRootName &&
+		uuidPattern.MatchString(components[1])
+	if !legacy && !project {
+		return false
+	}
+	name := path.Base(key)
+	if status == "bytecode_only" {
+		return strings.HasSuffix(name, ".json") || strings.HasSuffix(name, ".txt")
+	}
+	return path.Ext(name) != ""
+}
+
+func bytecodeCachedProjectPath(
+	cached BytecodeCachedResult,
+	resultID string,
+	used map[string]struct{},
+) (string, error) {
+	binaryName := bytecodeCachedDiagnosticString(cached.Diagnostics, "binary_name")
+	sourceFile := bytecodeCachedDiagnosticString(cached.Diagnostics, "source_file")
+	classStatus := bytecode.ClassSource
+	if cached.Status == "bytecode_only" {
+		classStatus = bytecode.ClassBytecodeOnly
+	}
+	mediaType := "text/plain"
+	switch strings.ToLower(cached.Language) {
+	case "java":
+		mediaType = "text/x-java-source"
+	case "kotlin":
+		mediaType = "text/x-kotlin-source"
+	case "python":
+		mediaType = "text/x-python"
+	}
+	if cached.Status == "bytecode_only" && strings.HasSuffix(cached.StorageKey, ".json") {
+		mediaType = "application/json"
+	}
+	return bytecodeProjectPath(bytecode.ClassIndex{
+		BinaryName: binaryName, SourceFile: sourceFile,
+		Language: cached.Language, Status: classStatus,
+	}, []bytecode.Artifact{{MediaType: mediaType}}, resultID, used)
+}
+
+func bytecodeCachedDiagnosticString(raw json.RawMessage, key string) string {
+	var values map[string]json.RawMessage
+	if json.Unmarshal(raw, &values) != nil {
+		return ""
+	}
+	var value string
+	_ = json.Unmarshal(values[key], &value)
+	return value
+}
+
 func copyVerifiedBytecodeCacheFile(
 	ctx context.Context,
 	root *os.Root,
+	publication *sourceProjectPublication,
 	cached BytecodeCachedResult,
-	destinationKey string,
+	destinationPath string,
 ) (string, uint64, error) {
 	if !bytecodeCachePathHasNoSymlinks(root, cached.StorageKey) {
 		return "", 0, errBytecodeCacheInvalid
@@ -249,9 +347,7 @@ func copyVerifiedBytecodeCacheFile(
 			errBytecodeCacheInvalid,
 		)
 	}
-	destination, err := root.OpenFile(
-		destinationKey, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600,
-	)
+	destination, err := publication.CreateFile(destinationPath)
 	if err != nil {
 		source.Close()
 		return "", 0, err
@@ -283,16 +379,7 @@ func copyVerifiedBytecodeCacheFile(
 	if err := source.Close(); err != nil {
 		return "", 0, errors.Join(errBytecodeCacheInvalid, err, destination.Close())
 	}
-	if err := destination.Sync(); err != nil {
-		return "", 0, errors.Join(err, destination.Close())
-	}
-	destinationInfo, err := destination.Stat()
-	if err != nil || !destinationInfo.Mode().IsRegular() ||
-		destinationInfo.Mode().Perm()&0o077 != 0 ||
-		uint64(destinationInfo.Size()) != cached.SizeBytes {
-		return "", 0, errors.Join(errBytecodeCacheInvalid, err, destination.Close())
-	}
-	if err := destination.Close(); err != nil {
+	if err := destination.Commit(); err != nil {
 		return "", 0, err
 	}
 	return cached.SHA256, cached.SizeBytes, nil
@@ -316,7 +403,8 @@ func sameBytecodeCacheFileIdentity(
 
 func bytecodeCachePathHasNoSymlinks(root *os.Root, storageKey string) bool {
 	components := strings.Split(storageKey, "/")
-	if len(components) != 3 || components[0] != "decompile" {
+	if len(components) < 3 ||
+		(components[0] != "decompile" && components[0] != sourceProjectRootName) {
 		return false
 	}
 	for index := range components {

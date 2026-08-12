@@ -1,6 +1,7 @@
 package decompile
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -139,6 +140,7 @@ type nativeRepositoryStub struct {
 	beginParameterKey   string
 	publishParameterKey string
 	publishCompleteness string
+	publishedProject    PublishedSourceProject
 	published           []NativePublishedResult
 	publishErr          error
 	failErr             error
@@ -165,10 +167,11 @@ func (s *nativeRepositoryStub) PublishNativeRun(
 	if s.publishErr != nil {
 		return s.publishErr
 	}
-	results, _, err := publish(ctx)
+	project, results, _, err := publish(ctx)
 	if err != nil {
 		return err
 	}
+	s.publishedProject = project
 	s.published = append([]NativePublishedResult(nil), results...)
 	return nil
 }
@@ -332,8 +335,122 @@ func TestNativeProcessorPublishesOnlyAfterVerifiedAnalysis(t *testing.T) {
 		filepath.FromSlash(repository.published[0].StorageKey),
 	)
 	if value, err := os.ReadFile(stored); err != nil ||
-		string(value) != string(pseudo) {
+		!strings.Contains(string(value), string(pseudo)) ||
+		!strings.Contains(string(value), "BinaryScan Ghidra pseudo-C project") {
 		t.Fatalf("published source = %q, %v", value, err)
+	}
+	if repository.publishedProject.CanonicalStorageKey !=
+		repository.published[0].StorageKey ||
+		repository.publishedProject.SourceFileCount != 1 {
+		t.Fatalf("published project = %+v", repository.publishedProject)
+	}
+}
+
+func TestNativeProjectPublishesOneCanonicalCFileWithExactFunctionRanges(t *testing.T) {
+	repositoryRoot := t.TempDir()
+	outputRoot := t.TempDir()
+	first := []byte("int first(void) {\n  return 1;\n}")
+	second := []byte("int second(void) {\n  return 2;\n}\n")
+	for name, content := range map[string][]byte{
+		"first.c": first, "second.c": second,
+	} {
+		if err := os.WriteFile(filepath.Join(outputRoot, name), content, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	processor := &NativeProcessor{config: NativeProcessorConfig{
+		RepositoryRoot: repositoryRoot, EngineVersion: "12.1.2",
+	}}
+	runID := "323e4567-e89b-42d3-a456-426614174003"
+	project, results, cleanup, err := processor.publishFiles(
+		context.Background(), runID, ghidra.Result{
+			OutputDir: outputRoot,
+			Index: ghidra.Index{
+				SchemaVersion: ghidra.IndexSchemaVersion,
+				Format:        "ELF", Architecture: "x86:LE:64",
+				Completeness: "complete", CandidateFunctionCount: 2,
+				DecompiledFunctionCount: 2,
+				Functions: []ghidra.Function{
+					{
+						Name: "second", Address: "00402000", SourceFile: "second.c",
+						SourceSize: uint64(len(second)), SHA256: digestBytes(second),
+					},
+					{
+						Name: "first", Address: "00401000", SourceFile: "first.c",
+						SourceSize: uint64(len(first)), SHA256: digestBytes(first),
+					},
+				},
+			},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	if project.SourceFileCount != 1 || len(results) != 2 ||
+		project.CanonicalStorageKey != "source-projects/"+runID+"/src/decompiled.c" {
+		t.Fatalf("native project/results = %+v / %+v", project, results)
+	}
+	canonical, err := os.ReadFile(filepath.Join(
+		repositoryRoot, filepath.FromSlash(project.CanonicalStorageKey),
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSources := [][]byte{first, second}
+	for index, result := range results {
+		start := result.SourceOffsetBytes
+		end := start + result.SourceLengthBytes
+		if end > uint64(len(canonical)) ||
+			!bytes.Equal(canonical[start:end], wantSources[index]) {
+			t.Fatalf("function %d range %d:%d does not select its source", index, start, end)
+		}
+		wantStartLine := uint64(bytes.Count(canonical[:start], []byte("\n"))) + 1
+		lineCount := uint64(bytes.Count(wantSources[index], []byte("\n"))) + 1
+		if wantSources[index][len(wantSources[index])-1] == '\n' {
+			lineCount--
+		}
+		if result.SourceStartLine != wantStartLine ||
+			result.SourceEndLine != wantStartLine+lineCount-1 {
+			t.Fatalf("function %d lines = %d:%d, want %d:%d", index,
+				result.SourceStartLine, result.SourceEndLine,
+				wantStartLine, wantStartLine+lineCount-1)
+		}
+	}
+	var cFiles []string
+	err = filepath.WalkDir(
+		filepath.Join(repositoryRoot, "source-projects", runID),
+		func(path string, entry os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if !entry.IsDir() && strings.EqualFold(filepath.Ext(path), ".c") {
+				cFiles = append(cFiles, path)
+			}
+			return nil
+		},
+	)
+	if err != nil || len(cFiles) != 1 ||
+		cFiles[0] != filepath.Join(repositoryRoot, filepath.FromSlash(project.CanonicalStorageKey)) {
+		t.Fatalf("canonical C files = %v, error = %v", cFiles, err)
+	}
+}
+
+func TestNativeResultLimitIncludesCanonicalProjectFraming(t *testing.T) {
+	runID := "323e4567-e89b-42d3-a456-426614174003"
+	index := ghidra.Index{Functions: []ghidra.Function{{
+		Name: "near_limit", Address: "00401000", SourceSize: 96,
+	}}}
+	limits := JobLimits{
+		MaxDurationSeconds: 30, MaxOutputBytes: 128,
+		MaxArtifacts: 10, MaxStandardOutputBytes: 64,
+	}
+	if nativeResultWithinLimits(runID, index, limits) {
+		t.Fatal("fragment-only size passed despite canonical header and banner overhead")
+	}
+	limits.MaxOutputBytes = 4096
+	if !nativeResultWithinLimits(runID, index, limits) {
+		t.Fatal("canonical project within the configured limit was rejected")
 	}
 }
 
@@ -388,8 +505,7 @@ func TestNativeProcessorStalePublishCleansOnlyItsAttempt(t *testing.T) {
 		newRun   = "423e4567-e89b-42d3-a456-426614174004"
 		address  = "00401000"
 	)
-	newResultID := nativeResultID(newRun, address)
-	newDirectory := filepath.Join(repositoryRoot, "decompile", newResultID)
+	newDirectory := filepath.Join(repositoryRoot, "source-projects", newRun, "src")
 	if err := os.MkdirAll(newDirectory, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -440,9 +556,7 @@ func TestNativeProcessorStalePublishCleansOnlyItsAttempt(t *testing.T) {
 	if !errors.Is(err, ErrRequestConflict) {
 		t.Fatalf("Process() error = %v", err)
 	}
-	staleDirectory := filepath.Join(
-		repositoryRoot, "decompile", nativeResultID(staleRun, address),
-	)
+	staleDirectory := filepath.Join(repositoryRoot, "source-projects", staleRun)
 	if _, err := os.Lstat(staleDirectory); !os.IsNotExist(err) {
 		t.Fatalf("stale attempt output remains: %v", err)
 	}
