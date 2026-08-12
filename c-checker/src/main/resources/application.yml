@@ -1,0 +1,41 @@
+server:
+  port: 8080
+  shutdown: graceful
+  error:
+    include-message: never
+  tomcat:
+    max-swallow-size: 134217728
+
+spring:
+  application:
+    name: c-checker
+  jackson:
+    deserialization:
+      fail-on-unknown-properties: true
+  servlet:
+    multipart:
+      enabled: true
+      file-size-threshold: 0
+      location: /tmp
+      max-file-size: 128MB
+      max-request-size: 146MB
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: never
+
+c-checker:
+  limits:
+    max-source-bytes: 134217728
+    max-functions: 3000
+    max-findings: 10000
+    max-diagnostics: 1000
+    max-snippet-bytes: 1024
+    analysis-timeout: 10m

@@ -1,0 +1,5 @@
+#!/bin/sh
+exec java \
+  -Dloader.main=com.binaryscan.cchecker.health.HealthcheckMain \
+  -cp /opt/binaryscan/c-checker/c-checker.jar \
+  org.springframework.boot.loader.launch.PropertiesLauncher
