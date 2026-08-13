@@ -763,7 +763,7 @@ func isLowerHex(value string) bool {
 func isRootArchiveFormat(format string) bool {
 	switch format {
 	case "zip", "7z", "rar", "tar", "gzip", "bzip2", "xz", "zstd",
-		"cab", "cpio", "ar", "deb", "rpm":
+		"cab", "cpio", "ar", "deb", "rpm", "iso9660":
 		return true
 	default:
 		return false

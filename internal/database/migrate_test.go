@@ -19,8 +19,8 @@ func TestMigrationsAreEmbedded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(files) != 33 {
-		t.Fatalf("embedded migration count = %d, want 33: %v", len(files), files)
+	if len(files) != 34 {
+		t.Fatalf("embedded migration count = %d, want 34: %v", len(files), files)
 	}
 	if files[0] != "00001_initial.sql" {
 		t.Fatalf("first migration = %q, want 00001_initial.sql", files[0])
@@ -38,15 +38,16 @@ func TestMigrationsAreEmbedded(t *testing.T) {
 		files[29] != "00032_java_analysis_domain.sql" ||
 		files[30] != "00033_report_java_analysis_snapshots.sql" ||
 		files[31] != "00034_upload_intake_profiles.sql" ||
-		files[32] != "00035_archive_imports.sql" {
+		files[32] != "00035_archive_imports.sql" ||
+		files[33] != "00036_archive_import_iso9660.sql" {
 		t.Fatalf("embedded migration order = %v", files)
 	}
 	version, err := LatestMigrationVersion()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if version != 35 {
-		t.Fatalf("latest migration version = %d, want 35", version)
+	if version != 36 {
+		t.Fatalf("latest migration version = %d, want 36", version)
 	}
 }
 

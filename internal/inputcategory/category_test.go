@@ -10,9 +10,10 @@ func TestForFormatMatchesFrozenContract(t *testing.T) {
 		},
 		Archive: {
 			"zip", "7z", "rar", "tar", "gzip", "bzip2", "xz", "zstd",
-			"cab", "cpio", "ar", "deb", "rpm",
+			"cab", "cpio", "ar", "deb", "rpm", "iso9660",
 		},
-		Container: {"docker-tar", "oci-tar"},
+		Container: {"docker-tar", "oci-tar", "ext2", "ext3", "ext4",
+			"mbr-img", "gpt-img"},
 	}
 	for expected, formats := range tests {
 		for _, format := range formats {
@@ -23,8 +24,8 @@ func TestForFormatMatchesFrozenContract(t *testing.T) {
 		}
 	}
 	for _, format := range []string{
-		"unknown", "ext2", "ext3", "ext4", "squashfs", "iso9660", "udf",
-		"mbr-img", "gpt-img", "JAR", "",
+		"unknown", "squashfs", "udf",
+		"JAR", "",
 	} {
 		if category, ok := ForFormat(format); ok {
 			t.Errorf("ForFormat(%q) = %q, true; want unsupported", format, category)

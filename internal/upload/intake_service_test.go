@@ -129,7 +129,7 @@ func TestDirectBinaryAndContainerCompletionRemainIdempotent(t *testing.T) {
 
 func TestCompleteRejectsUnsupportedFormatWithoutPublishingBlob(t *testing.T) {
 	service, repository, _, _ := newTestService(t)
-	service.config.Detector = contentDetectorStub{result: filetype.Result{Format: "ext4"}}
+	service.config.Detector = contentDetectorStub{result: filetype.Result{Format: "squashfs"}}
 	view, principal := createIntakeUploadWithContent(
 		t, service, inputcategory.Binary, []byte("data"),
 	)

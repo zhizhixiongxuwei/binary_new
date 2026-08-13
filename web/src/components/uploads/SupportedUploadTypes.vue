@@ -19,13 +19,15 @@ const groups = [
     category: 'archive',
     icon: Archive,
     title: '归档导入',
-    formats: 'ZIP、7Z、RAR、TAR、GZIP、BZIP2、XZ、ZSTD、CAB、CPIO、AR、DEB、RPM',
+    formats:
+      'ZIP、7Z、RAR、TAR、GZIP、BZIP2、XZ、ZSTD、CAB、CPIO、AR、DEB、RPM、ISO 9660',
   },
   {
     category: 'container',
     icon: Box,
     title: '镜像漏洞扫描',
-    formats: 'Docker Save TAR、OCI Image Layout TAR',
+    formats:
+      'Docker Save TAR、OCI Image Layout TAR、EXT2/3/4 磁盘映像、MBR/GPT 磁盘映像',
   },
 ] as const
 

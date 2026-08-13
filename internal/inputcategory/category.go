@@ -22,7 +22,16 @@ var formatCategories = map[string]Category{
 	"cab": Archive, "cpio": Archive, "ar": Archive, "deb": Archive,
 	"rpm": Archive,
 
+	// ISO 9660 disc images are unpacked one level like any other archive.
+	"iso9660": Archive,
+
 	"docker-tar": Container, "oci-tar": Container,
+
+	// Disk and filesystem images are scanned by Trivy's vm subcommand through
+	// the same container image-scan task pipeline. raw-img is intentionally
+	// absent: the detector never produces it.
+	"ext2": Container, "ext3": Container, "ext4": Container,
+	"mbr-img": Container, "gpt-img": Container,
 }
 
 func Parse(value string) (Category, bool) {
