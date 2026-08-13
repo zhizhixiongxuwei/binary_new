@@ -6,6 +6,7 @@ import (
 	"math"
 
 	"binaryscan/internal/containerarchive"
+	"binaryscan/internal/trivyhandoff"
 )
 
 const (
@@ -122,6 +123,38 @@ func buildQuotaPlan(
 			result.ExpandedBytes += usage.ExpandedLayerBytes
 			remainingInput -= usage.MaterializedBudgetBytes
 			remainingExpanded -= usage.ExpandedLayerBytes
+		case trivyhandoff.FormatVMImage:
+			// The image is copied once into the input root and scanned
+			// in place; no archive layers are materialized.
+			inputBytes, ok := allocatedFileBytes(plan.source.size)
+			if !ok {
+				return quotaPlan{}, quotaOverflow()
+			}
+			inputBytes, ok = quotaAdd(
+				inputBytes,
+				quotaAllocationUnitBytes,
+			)
+			if !ok {
+				return quotaPlan{}, quotaOverflow()
+			}
+			if inputBytes > remainingInput {
+				return quotaPlan{}, &quotaLimitError{
+					code: "trivy_materialized_size_limit",
+					message: "VM image inputs exceed the configured " +
+						"temporary-space limit.",
+				}
+			}
+			if plan.source.size > remainingExpanded {
+				return quotaPlan{}, &quotaLimitError{
+					code: "trivy_expanded_size_limit",
+					message: "VM image data exceeds the configured " +
+						"expanded-data limit.",
+				}
+			}
+			result.InputBytes += inputBytes
+			result.ExpandedBytes += plan.source.size
+			remainingInput -= inputBytes
+			remainingExpanded -= plan.source.size
 		default:
 			return quotaPlan{}, errors.New(
 				"unsupported Trivy quota source format",

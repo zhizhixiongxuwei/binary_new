@@ -19,6 +19,46 @@ import (
 const maxOCIMetadataBytes = int64(1 << 20)
 const maxOCIManifestBytes = int64(16 << 20)
 
+// VerifyVMImage accepts a raw disk or filesystem image whose content is
+// recognized as an ext2/ext3/ext4 filesystem or a partitioned disk image.
+// Trivy's vm subcommand identifies the exact layout itself; this check only
+// bounds the input to formats it can parse.
+func VerifyVMImage(path string) (VerifiedSource, error) {
+	canonical, err := canonicalLeaf(path, false)
+	if err != nil {
+		return VerifiedSource{}, fmt.Errorf("%w: VM image: %v", ErrInvalidInput, err)
+	}
+	file, err := openRegularNoFollow(canonical)
+	if err != nil {
+		return VerifiedSource{}, fmt.Errorf("%w: VM image: %v", ErrInvalidInput, err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return VerifiedSource{}, fmt.Errorf("%w: stat VM image: %v", ErrInvalidInput, err)
+	}
+	detected, err := (filetype.Detector{}).Detect(file, info.Size())
+	if err != nil {
+		return VerifiedSource{}, fmt.Errorf("%w: identify VM image: %v", ErrInvalidInput, err)
+	}
+	switch detected.Format {
+	// raw-img is defensive: the detector never emits it today, but Trivy's vm
+	// subcommand accepts bare filesystem images without a partition table.
+	case "ext2", "ext3", "ext4", "raw-img", "mbr-img", "gpt-img":
+		return VerifiedSource{path: canonical, kind: SourceVMImage}, nil
+	default:
+		format := detected.Format
+		if format == "" {
+			format = "unknown"
+		}
+		return VerifiedSource{}, fmt.Errorf(
+			"%w: expected a VM disk or filesystem image, detected %s",
+			ErrInvalidInput,
+			format,
+		)
+	}
+}
+
 // VerifyDockerSaveTAR accepts only a structurally identified Docker Save TAR.
 func VerifyDockerSaveTAR(path string) (VerifiedSource, error) {
 	canonical, err := canonicalLeaf(path, false)
@@ -183,6 +223,14 @@ func verifySourceAgain(source VerifiedSource) error {
 		if verified.path != source.path ||
 			verified.manifestDigest != source.manifestDigest {
 			return fmt.Errorf("%w: OCI layout path changed", ErrInvalidInput)
+		}
+	case SourceVMImage:
+		verified, err := VerifyVMImage(source.path)
+		if err != nil {
+			return err
+		}
+		if verified.path != source.path {
+			return fmt.Errorf("%w: VM image path changed", ErrInvalidInput)
 		}
 	default:
 		return fmt.Errorf("%w: unverified source", ErrInvalidInput)

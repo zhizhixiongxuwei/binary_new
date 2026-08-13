@@ -25,6 +25,7 @@ type SourceKind string
 const (
 	SourceDockerSaveTAR SourceKind = "docker-save-tar"
 	SourceOCILayout     SourceKind = "oci-layout"
+	SourceVMImage       SourceKind = "vm-image"
 )
 
 // VerifiedSource can only be created by the verification constructors in this

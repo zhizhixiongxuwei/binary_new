@@ -236,13 +236,23 @@ FOR UPDATE`,
 		}
 	}
 	if sizeBytes > uint64(^uint64(0)>>1) ||
-		format != source.Format ||
+		!handoffFormatMatches(format, source.Format) ||
 		storageKey != source.SourceStorageKey ||
 		sha256Value != source.SourceSHA256 ||
 		int64(sizeBytes) != source.SourceSizeBytes {
 		return queue.ErrInconsistentState
 	}
 	return nil
+}
+
+// handoffFormatMatches accepts the exact detector format for container
+// archives, and any Trivy-supported VM image format for vm-image sources whose
+// root node keeps the detected ext/partitioned format name.
+func handoffFormatMatches(detected string, handoff string) bool {
+	if detected == handoff {
+		return true
+	}
+	return handoff == trivyhandoff.FormatVMImage && vmImageFormat(detected)
 }
 
 func validTrivyJobPayload(payload TrivyJobPayload) bool {

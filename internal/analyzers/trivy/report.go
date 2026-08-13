@@ -442,10 +442,18 @@ func rejectUnknownTopLevel(raw []byte) error {
 		"SchemaVersion",
 		"ArtifactName",
 		"ArtifactType",
-		"Results",
 	} {
 		if _, found := fields[required]; !found {
 			return fmt.Errorf("required top-level field %q is missing", required)
+		}
+	}
+	// Results may be absent only for the vm subcommand when no package
+	// databases are found; container image reports must still carry it.
+	var artifactType string
+	if err := json.Unmarshal(fields["ArtifactType"], &artifactType); err == nil &&
+		artifactType != "vm" {
+		if _, found := fields["Results"]; !found {
+			return fmt.Errorf("required top-level field %q is missing", "Results")
 		}
 	}
 	return nil

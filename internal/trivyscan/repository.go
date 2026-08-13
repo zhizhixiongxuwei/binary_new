@@ -1023,7 +1023,8 @@ func validatePublication(
 		!canonicalUUIDPattern.MatchString(lease.TaskID) ||
 		!analyzerVersionPattern.MatchString(value.AnalyzerVersion) ||
 		(value.SourceFormat != containerarchive.FormatDocker &&
-			value.SourceFormat != containerarchive.FormatOCI) ||
+			value.SourceFormat != containerarchive.FormatOCI &&
+			value.SourceFormat != trivyhandoff.FormatVMImage) ||
 		!lowercaseSHA256Pattern.MatchString(value.SourceSHA256) ||
 		value.SourceStorageKey != "blobs/sha256/"+
 			value.SourceSHA256[:2]+"/"+value.SourceSHA256 ||
@@ -1040,8 +1041,9 @@ func validatePublication(
 			return ErrInvalidPublication
 		}
 		targetKeys[run.TargetKey] = struct{}{}
-		if run.Platform == "" || len(run.Platform) > 128 ||
-			len(run.References) == 0 || len(run.References) > 10_000 {
+		if run.SourceFormat != trivyhandoff.FormatVMImage &&
+			(run.Platform == "" || len(run.Platform) > 128 ||
+				len(run.References) == 0 || len(run.References) > 10_000) {
 			return ErrInvalidPublication
 		}
 		if run.SourceFormat == "" {
@@ -1083,6 +1085,10 @@ func validatePublication(
 				}
 			case containerarchive.FormatOCI:
 				if !ociDigestPattern.MatchString(run.ManifestDigest) {
+					return ErrInvalidPublication
+				}
+			case trivyhandoff.FormatVMImage:
+				if run.ManifestDigest != "" {
 					return ErrInvalidPublication
 				}
 			default:

@@ -605,6 +605,27 @@ func TestRejectsMaliciousOrOutOfContractJSON(t *testing.T) {
 	}
 }
 
+func TestVMImageEmptyReportWithoutResultsIsAccepted(t *testing.T) {
+	// Trivy's vm subcommand omits the Results field entirely when no package
+	// databases are found; the report must still be accepted with zero
+	// findings rather than rejected as invalid.
+	raw := `{"SchemaVersion":2,"ArtifactName":"/scan/disk.ext4","ArtifactType":"vm"}`
+	fixture := newAdapterFixture(t, raw)
+	adapter := mustAdapter(t, fixture.config)
+	report, err := adapter.Analyze(context.Background(), Request{
+		Source:        fixture.source,
+		WorkDirectory: newWorkDirectory(t, fixture.workRoot),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Findings) != 0 ||
+		report.Raw.ResultCount != 0 ||
+		report.Raw.ArtifactType != "vm" {
+		t.Fatalf("report = %+v", report)
+	}
+}
+
 func TestInputMustBeVerifiedAndRemainInsideConfiguredRoots(t *testing.T) {
 	root := t.TempDir()
 	ordinaryPath := filepath.Join(root, "ordinary.tar")

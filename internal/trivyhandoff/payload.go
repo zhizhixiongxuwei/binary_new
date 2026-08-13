@@ -20,6 +20,10 @@ const (
 	maxPayloadBytes     = 64 << 10
 	maxExpandedBytes    = int64(50 * 1024 * 1024 * 1024)
 	maxArchiveRatio     = 100
+
+	// FormatVMImage marks a raw disk-image or filesystem-image source that is
+	// scanned with the Trivy vm subcommand instead of container archives.
+	FormatVMImage = "vm-image"
 )
 
 var (
@@ -222,7 +226,7 @@ func Validate(value Payload, maxSourceBytes int64, maxSources int) error {
 	paths := make(map[string]struct{}, len(value.Sources))
 	var totalSourceBytes int64
 	for index, source := range value.Sources {
-		if (source.Format != "docker-tar" && source.Format != "oci-tar") ||
+		if !validSourceFormat(source.Format) ||
 			source.SourceSizeBytes <= 0 ||
 			source.SourceSizeBytes > maxSourceBytes ||
 			!sha256Pattern.MatchString(source.SourceSHA256) ||
@@ -288,6 +292,11 @@ func decodeExact(raw []byte, destination any) error {
 		)
 	}
 	return nil
+}
+
+func validSourceFormat(format string) bool {
+	return format == "docker-tar" || format == "oci-tar" ||
+		format == FormatVMImage
 }
 
 func validLogicalPath(value string) bool {

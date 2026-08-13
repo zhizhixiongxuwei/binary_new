@@ -17,6 +17,7 @@ import (
 	"binaryscan/internal/queue"
 	"binaryscan/internal/storageguard"
 	"binaryscan/internal/trivydb"
+	"binaryscan/internal/trivyhandoff"
 	"binaryscan/internal/workspace"
 )
 
@@ -248,6 +249,13 @@ func (p *Processor) Process(
 				plans[len(plans)-1].inspection =
 					plans[len(plans)-1].ociPlan.Inspection()
 			}
+		case trivyhandoff.FormatVMImage:
+			// VM images are scanned as-is by the vm subcommand. The single
+			// placeholder target keeps the quota and run plans uniform.
+			plans[len(plans)-1].inspection = containerarchive.Inspection{
+				Format:  trivyhandoff.FormatVMImage,
+				Targets: []containerarchive.Target{{}},
+			}
 		default:
 			return deterministicFinish(
 				"trivy_handoff_invalid",
@@ -456,6 +464,30 @@ func (p *Processor) Process(
 					source:  verified,
 				})
 			}
+		case trivyhandoff.FormatVMImage:
+			verifiedPath, copyErr := plan.source.copyVerified(
+				ctx,
+				sourceInputRoot,
+				"vm-image.img",
+			)
+			if copyErr != nil {
+				if ctx.Err() != nil {
+					return queue.FinishInput{}, ctx.Err()
+				}
+				return finishForSourceError(copyErr), nil
+			}
+			verified, verifyErr := trivyadapter.VerifyVMImage(verifiedPath)
+			if verifyErr != nil {
+				return deterministicFinish(
+					"vm_image_verification_failed",
+					"The verified VM image input was rejected.",
+				), nil
+			}
+			targets = append(targets, targetPlan{
+				handoff: plan.handoff,
+				target:  plan.inspection.Targets[0],
+				source:  verified,
+			})
 		default:
 			return queue.FinishInput{}, errors.New(
 				"unreachable Trivy source format",
@@ -506,9 +538,11 @@ func (p *Processor) scanAndPublish(
 			SourceSHA256:     plan.handoff.SourceSHA256,
 			SourceSizeBytes:  plan.handoff.SourceSizeBytes,
 			ImageLogicalPath: plan.handoff.ImageLogicalPath,
-			Platform:         plan.target.Platform.String(),
 			ManifestDigest:   plan.target.ManifestDigest,
 			References:       append([]string(nil), plan.target.References...),
+		}
+		if plan.handoff.Format != trivyhandoff.FormatVMImage {
+			run.Platform = plan.target.Platform.String()
 		}
 		if plan.limited {
 			run.Status = "failed"

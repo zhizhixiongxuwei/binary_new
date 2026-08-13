@@ -66,6 +66,14 @@ const containerFormats = new Set([
   'oci-archive',
 ])
 
+const vmImageFormats = new Set([
+  'ext2',
+  'ext3',
+  'ext4',
+  'mbr-img',
+  'gpt-img',
+])
+
 const decompileFormats = new Set([
   'pe',
   'pe32',
@@ -148,7 +156,9 @@ function workflowFromTask(
   entries: readonly TaskExecutionLogEntry[],
 ): AnalyzerWorkflow {
   const inputType = normalizedInputType(source.input_type)
-  if (containerFormats.has(inputType)) return 'image-scan'
+  if (containerFormats.has(inputType) || vmImageFormats.has(inputType)) {
+    return 'image-scan'
+  }
   if (decompileFormats.has(inputType)) return 'decompile'
 
   const latestWorkflow = [...entries]
@@ -164,7 +174,12 @@ function workflowLabel(
   source: TaskStageSource,
   workflow: AnalyzerWorkflow,
 ): string {
-  if (workflow === 'image-scan') return '镜像漏洞扫描'
+  if (workflow === 'image-scan') {
+    if (vmImageFormats.has(normalizedInputType(source.input_type))) {
+      return '映像漏洞扫描'
+    }
+    return '镜像漏洞扫描'
+  }
   const inputType = normalizedInputType(source.input_type)
   if (javaFormats.has(inputType)) return 'Java 反编译'
   if (nativeFormats.has(inputType)) return '类 C 反编译'

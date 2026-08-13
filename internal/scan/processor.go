@@ -220,10 +220,13 @@ func (p *Processor) Process(
 				"publish unsupported extraction result: %w", err,
 			)
 		}
-		if err := p.reportProgress(ctx, lease, "REPORTING"); err != nil {
-			return queue.FinishInput{}, err
-		}
-		return queue.FinishInput{Outcome: queue.OutcomePartialSucceeded}, nil
+		// Unsupported-for-extraction root formats may still carry a VM-image
+		// source (ext2/ext3/ext4, MBR/GPT/raw disk images) that Trivy scans
+		// directly.
+		return p.finishPublishedTree(
+			ctx, lease, rootContainerSources(detected.Format, sample),
+			sample.Limits, true,
+		)
 	}
 	if err := p.reportProgress(ctx, lease, "EXTRACTING"); err != nil {
 		return queue.FinishInput{}, err
@@ -382,16 +385,38 @@ func (p *Processor) finishPublishedTree(
 }
 
 func rootContainerSources(format string, sample Sample) []TrivySource {
-	if format != "docker-tar" && format != "oci-tar" {
+	switch {
+	case format == "docker-tar" || format == "oci-tar":
+		return []TrivySource{{
+			Format:           format,
+			SourceStorageKey: sample.StorageKey,
+			SourceSHA256:     sample.SHA256,
+			SourceSizeBytes:  sample.SizeBytes,
+			ImageLogicalPath: "/",
+		}}
+	case vmImageFormat(format):
+		return []TrivySource{{
+			Format:           trivyhandoff.FormatVMImage,
+			SourceStorageKey: sample.StorageKey,
+			SourceSHA256:     sample.SHA256,
+			SourceSizeBytes:  sample.SizeBytes,
+			ImageLogicalPath: "/",
+		}}
+	default:
 		return nil
 	}
-	return []TrivySource{{
-		Format:           format,
-		SourceStorageKey: sample.StorageKey,
-		SourceSHA256:     sample.SHA256,
-		SourceSizeBytes:  sample.SizeBytes,
-		ImageLogicalPath: "/",
-	}}
+}
+
+// vmImageFormat reports whether a detected root format is handed to the Trivy
+// vm subcommand instead of container-archive inspection. raw-img is defensive:
+// the filetype detector never emits it today.
+func vmImageFormat(format string) bool {
+	switch format {
+	case "ext2", "ext3", "ext4", "raw-img", "mbr-img", "gpt-img":
+		return true
+	default:
+		return false
+	}
 }
 
 func (p *Processor) prepareContainerSources(

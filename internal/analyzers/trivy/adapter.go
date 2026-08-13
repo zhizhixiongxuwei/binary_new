@@ -192,26 +192,68 @@ func (a *Adapter) validateRequest(request Request) (VerifiedSource, string, erro
 }
 
 func (a *Adapter) arguments(source VerifiedSource, outputPath string) []string {
-	inputPath := source.path
-	if source.kind == SourceOCILayout {
-		inputPath += "@" + source.manifestDigest
-	}
-	return []string{
-		"image",
-		"--input", inputPath,
-		"--cache-dir", a.cacheDirectory,
-		"--cache-backend", "memory",
-		"--format", "json",
-		"--output", outputPath,
-		"--scanners", "vuln",
-		"--offline-scan",
-		"--skip-db-update",
-		"--skip-java-db-update",
-		"--disable-telemetry",
-		"--skip-version-check",
-		"--no-progress",
-		"--exit-code", "0",
-		"--timeout", a.maxDuration.String(),
+	switch source.kind {
+	case SourceDockerSaveTAR:
+		return []string{
+			"image",
+			"--input", source.path,
+			"--cache-dir", a.cacheDirectory,
+			"--cache-backend", "memory",
+			"--format", "json",
+			"--output", outputPath,
+			"--scanners", "vuln",
+			"--offline-scan",
+			"--skip-db-update",
+			"--skip-java-db-update",
+			"--disable-telemetry",
+			"--skip-version-check",
+			"--no-progress",
+			"--exit-code", "0",
+			"--timeout", a.maxDuration.String(),
+		}
+	case SourceOCILayout:
+		input := source.path + "@" + source.manifestDigest
+		return []string{
+			"image",
+			"--input", input,
+			"--cache-dir", a.cacheDirectory,
+			"--cache-backend", "memory",
+			"--format", "json",
+			"--output", outputPath,
+			"--scanners", "vuln",
+			"--offline-scan",
+			"--skip-db-update",
+			"--skip-java-db-update",
+			"--disable-telemetry",
+			"--skip-version-check",
+			"--no-progress",
+			"--exit-code", "0",
+			"--timeout", a.maxDuration.String(),
+		}
+	case SourceVMImage:
+		// The vm subcommand takes the image path positionally; it has no
+		// --input flag and identifies partitions and filesystems itself.
+		return []string{
+			"vm",
+			source.path,
+			"--cache-dir", a.cacheDirectory,
+			"--cache-backend", "memory",
+			"--format", "json",
+			"--output", outputPath,
+			"--scanners", "vuln",
+			"--offline-scan",
+			"--skip-db-update",
+			"--skip-java-db-update",
+			"--disable-telemetry",
+			"--skip-version-check",
+			"--no-progress",
+			"--exit-code", "0",
+			"--timeout", a.maxDuration.String(),
+		}
+	default:
+		// Unreachable: every verified source kind is handled above. Returning
+		// nil keeps the command boundary safe if a future kind is forgotten.
+		return nil
 	}
 }
 

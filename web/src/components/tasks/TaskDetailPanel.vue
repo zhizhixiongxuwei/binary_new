@@ -134,6 +134,11 @@ const CONTAINER_PREVIEW_FORMATS = new Set([
   'docker-archive',
   'oci-tar',
   'oci-archive',
+  'ext2',
+  'ext3',
+  'ext4',
+  'mbr-img',
+  'gpt-img',
 ])
 
 const props = defineProps<{
@@ -280,8 +285,8 @@ const deferredResultStates = computed<TaskResultStates>(() => {
       ? { status: 'ready' }
       : {
           status: 'empty',
-          title: '该任务不是 Docker / OCI 镜像包',
-          description: '容器漏洞界面样例仅对 docker-tar 和 oci-tar 示例任务展示。',
+          title: '该任务不是容器 / 磁盘镜像包',
+          description: '容器漏洞界面样例仅对镜像包示例任务展示。',
         },
     reports: { status: 'ready' },
   }

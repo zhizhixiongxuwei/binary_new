@@ -8,6 +8,11 @@ const CONTAINER_IMAGE_FORMATS = new Set([
   'docker-archive',
   'oci-tar',
   'oci-archive',
+  'ext2',
+  'ext3',
+  'ext4',
+  'mbr-img',
+  'gpt-img',
 ])
 
 const DECOMPILE_FORMATS = new Set([
