@@ -22,6 +22,8 @@ Commands:
   status                 Show service state
   logs [SERVICE]         Follow all logs or one service
   down                   Stop services without deleting data
+  reset                  Stop services, delete all scan data, restart, and
+                         re-create the administrator (asks for confirmation)
 EOF
 }
 
@@ -201,6 +203,56 @@ initialize_admin() {
 	note "administrator created: admin"
 }
 
+# reset_data_path removes exactly one allow-listed data-root entry. The list
+# mirrors the compose bind mounts plus the administrator marker; nothing else
+# under BINARYSCAN_DATA_ROOT is ever touched.
+reset_data_path() {
+	relative=$1
+	case "$relative" in
+	application | mysql | archive-sandbox | .admin-initialized) ;;
+	*) fail "refusing to remove unexpected data path: $relative" ;;
+	esac
+	target=$BINARYSCAN_DATA_ROOT/$relative
+	[ ! -L "$target" ] || fail "data path must not be a symbolic link: $target"
+	if [ -e "$target" ]; then
+		rm -rf -- "$target"
+	fi
+}
+
+reset_runtime() {
+	load_existing_runtime
+	require_command docker
+	probe=$BINARYSCAN_DATA_ROOT/.reset-write-probe
+	[ ! -e "$probe" ] || fail "stale reset write probe exists: $probe"
+	if ! (set -C; : >"$probe") 2>/dev/null; then
+		fail "data root is not writable by the current user: $BINARYSCAN_DATA_ROOT"
+	fi
+	rm -f -- "$probe"
+	cat <<EOF
+This will permanently delete all BinaryScan data under:
+  $BINARYSCAN_DATA_ROOT/application
+  $BINARYSCAN_DATA_ROOT/mysql
+  $BINARYSCAN_DATA_ROOT/archive-sandbox
+  $BINARYSCAN_DATA_ROOT/.admin-initialized
+
+Uploaded samples, scan tasks, results, and the administrator account will be
+lost. Secrets under $PROJECT_ROOT/runtime/secrets are kept. Services will be
+restarted afterwards and the initial administrator re-created.
+
+Type RESET and press Enter to continue, or anything else to cancel:
+EOF
+	IFS= read -r answer || fail "reset confirmation could not be read"
+	[ "$answer" = "RESET" ] || fail "reset cancelled"
+	compose down --remove-orphans
+	reset_data_path application
+	reset_data_path mysql
+	reset_data_path archive-sandbox
+	reset_data_path .admin-initialized
+	start_services
+	initialize_admin
+	note "runtime data was reset; administrator re-created as: admin"
+}
+
 verify_running() {
 	verify_source_manifest
 	compose ps
@@ -268,6 +320,10 @@ logs)
 down)
 	load_existing_runtime
 	compose down --remove-orphans
+	;;
+reset)
+	[ "$#" -eq 1 ] || fail "reset accepts no arguments"
+	reset_runtime
 	;;
 help|-h|--help)
 	usage
