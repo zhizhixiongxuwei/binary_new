@@ -81,6 +81,12 @@ type Config struct {
 	JavaAnalysisMaxResponseBytes int64
 	JavaAnalysisMaxFindings      int
 	JavaAnalysisMaxDiagnostics   int
+	PythonCheckerURL            string
+	PythonCheckerVersion        string
+	PythonAnalysisMaxDuration   time.Duration
+	PythonAnalysisMaxResponseBytes int64
+	PythonAnalysisMaxFindings   int
+	PythonAnalysisMaxDiagnostics int
 
 	QueueLeaseInterval time.Duration
 	QueuePollInterval  time.Duration
@@ -174,6 +180,12 @@ func Load(service string) (Config, error) {
 		JavaAnalysisMaxResponseBytes: 32 * 1024 * 1024,
 		JavaAnalysisMaxFindings:      10_000,
 		JavaAnalysisMaxDiagnostics:   1_000,
+		PythonCheckerURL:             "http://python-checker:8080",
+		PythonCheckerVersion:         "0.1.0",
+		PythonAnalysisMaxDuration:    10 * time.Minute,
+		PythonAnalysisMaxResponseBytes: 32 * 1024 * 1024,
+		PythonAnalysisMaxFindings:    10_000,
+		PythonAnalysisMaxDiagnostics: 1_000,
 		QueueLeaseInterval:           60 * time.Second,
 		QueuePollInterval:            2 * time.Second,
 		QueueHeavySlots:              1,
@@ -454,6 +466,22 @@ func (c Config) Validate() error {
 		c.JavaAnalysisMaxDiagnostics <= 0 || c.JavaAnalysisMaxDiagnostics > 1_000 {
 		errs = append(errs, errors.New("Java analysis execution limits are invalid"))
 	}
+	pythonCheckerURL, pythonCheckerURLErr := url.Parse(c.PythonCheckerURL)
+	if pythonCheckerURLErr != nil ||
+		pythonCheckerURL.Scheme != "http" && pythonCheckerURL.Scheme != "https" ||
+		pythonCheckerURL.Host == "" || pythonCheckerURL.User != nil ||
+		pythonCheckerURL.RawQuery != "" || pythonCheckerURL.Fragment != "" ||
+		c.PythonCheckerVersion != "0.1.0" {
+		errs = append(errs, errors.New("python_analysis checker URL or version is invalid"))
+	}
+	if c.PythonAnalysisMaxDuration <= 0 ||
+		c.PythonAnalysisMaxDuration > 10*time.Minute ||
+		c.PythonAnalysisMaxResponseBytes <= 0 ||
+		c.PythonAnalysisMaxResponseBytes > 32*1024*1024 ||
+		c.PythonAnalysisMaxFindings <= 0 || c.PythonAnalysisMaxFindings > 10_000 ||
+		c.PythonAnalysisMaxDiagnostics <= 0 || c.PythonAnalysisMaxDiagnostics > 1_000 {
+		errs = append(errs, errors.New("Python analysis execution limits are invalid"))
+	}
 	if c.StorageMinFreeBytes <= 0 {
 		errs = append(errs, errors.New("BINARYSCAN_STORAGE_MIN_FREE_BYTES must be positive"))
 	}
@@ -729,6 +757,14 @@ type fileConfig struct {
 		MaxFindings      int    `yaml:"max_findings"`
 		MaxDiagnostics   int    `yaml:"max_diagnostics"`
 	} `yaml:"java_analysis"`
+	PythonAnalysis struct {
+		CheckerURL       string `yaml:"checker_url"`
+		CheckerVersion   string `yaml:"checker_version"`
+		TimeoutSeconds   int    `yaml:"timeout_seconds"`
+		MaxResponseBytes int64  `yaml:"max_response_bytes"`
+		MaxFindings      int    `yaml:"max_findings"`
+		MaxDiagnostics   int    `yaml:"max_diagnostics"`
+	} `yaml:"python_analysis"`
 	Queue struct {
 		LeaseSeconds     int `yaml:"lease_seconds"`
 		HeartbeatSeconds int `yaml:"heartbeat_seconds"`
@@ -977,6 +1013,25 @@ func applyFileConfig(cfg *Config, fileCfg fileConfig) {
 	if fileCfg.JavaAnalysis.MaxDiagnostics != 0 {
 		cfg.JavaAnalysisMaxDiagnostics = fileCfg.JavaAnalysis.MaxDiagnostics
 	}
+	if fileCfg.PythonAnalysis.CheckerURL != "" {
+		cfg.PythonCheckerURL = fileCfg.PythonAnalysis.CheckerURL
+	}
+	if fileCfg.PythonAnalysis.CheckerVersion != "" {
+		cfg.PythonCheckerVersion = fileCfg.PythonAnalysis.CheckerVersion
+	}
+	if fileCfg.PythonAnalysis.TimeoutSeconds != 0 {
+		cfg.PythonAnalysisMaxDuration =
+			time.Duration(fileCfg.PythonAnalysis.TimeoutSeconds) * time.Second
+	}
+	if fileCfg.PythonAnalysis.MaxResponseBytes != 0 {
+		cfg.PythonAnalysisMaxResponseBytes = fileCfg.PythonAnalysis.MaxResponseBytes
+	}
+	if fileCfg.PythonAnalysis.MaxFindings != 0 {
+		cfg.PythonAnalysisMaxFindings = fileCfg.PythonAnalysis.MaxFindings
+	}
+	if fileCfg.PythonAnalysis.MaxDiagnostics != 0 {
+		cfg.PythonAnalysisMaxDiagnostics = fileCfg.PythonAnalysis.MaxDiagnostics
+	}
 	if fileCfg.Limits.MaxUploadBytes != 0 {
 		cfg.MaxUploadBytes = fileCfg.Limits.MaxUploadBytes
 	}
@@ -1158,6 +1213,28 @@ func applyEnvironment(cfg *Config) error {
 	}
 	if value := strings.TrimSpace(os.Getenv("BINARYSCAN_JAVA_CHECKER_VERSION")); value != "" {
 		cfg.JavaCheckerVersion = value
+	}
+	if value := strings.TrimSpace(os.Getenv("BINARYSCAN_PYTHON_CHECKER_URL")); value != "" {
+		cfg.PythonCheckerURL = value
+	}
+	if value := strings.TrimSpace(os.Getenv("BINARYSCAN_PYTHON_CHECKER_VERSION")); value != "" {
+		cfg.PythonCheckerVersion = value
+	}
+	if value := strings.TrimSpace(os.Getenv("BINARYSCAN_PYTHON_ANALYSIS_TIMEOUT")); value != "" {
+		parsed, err := time.ParseDuration(value)
+		if err != nil {
+			cfg.PythonAnalysisMaxDuration = -1
+		} else {
+			cfg.PythonAnalysisMaxDuration = parsed
+		}
+	}
+	if value := strings.TrimSpace(os.Getenv("BINARYSCAN_PYTHON_ANALYSIS_MAX_RESPONSE_BYTES")); value != "" {
+		parsed, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			cfg.PythonAnalysisMaxResponseBytes = -1
+		} else {
+			cfg.PythonAnalysisMaxResponseBytes = parsed
+		}
 	}
 	if value := strings.TrimSpace(os.Getenv("BINARYSCAN_JAVA_ANALYSIS_TIMEOUT")); value != "" {
 		parsed, err := time.ParseDuration(value)

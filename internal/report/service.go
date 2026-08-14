@@ -96,7 +96,7 @@ func (s *Service) Generate(
 		return Report{}, false, err
 	}
 	if !uuidPattern.MatchString(taskID) ||
-		(format != FormatJSON && format != FormatHTML) ||
+		(format != FormatJSON && format != FormatHTML && format != FormatDOCX) ||
 		!validIdempotencyKey(idempotencyKey) {
 		return Report{}, false, ErrInvalidInput
 	}
@@ -199,7 +199,8 @@ func (s *Service) Download(
 		descriptor.Status != "complete" ||
 		!sha256Pattern.MatchString(descriptor.SHA256) ||
 		descriptor.SizeBytes > math.MaxInt64 ||
-		(descriptor.Format != FormatJSON && descriptor.Format != FormatHTML) {
+		(descriptor.Format != FormatJSON && descriptor.Format != FormatHTML &&
+			descriptor.Format != FormatDOCX) {
 		return Download{}, ErrArtifactUnavailable
 	}
 	expectedKey := reportStorageKey(taskID, reportID, descriptor.Format)
@@ -247,6 +248,9 @@ func (s *Service) Download(
 	contentType := "application/json"
 	if descriptor.Format == FormatHTML {
 		contentType = "text/html; charset=utf-8"
+	}
+	if descriptor.Format == FormatDOCX {
+		contentType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 	}
 	return Download{
 		Content: file, ContentType: contentType,
@@ -313,15 +317,19 @@ func (s *Service) generateArtifact(
 	writer := io.MultiWriter(file, hasher, counter)
 	dependencies := make([]CAnalysisDependency, 0)
 	javaDependencies := make([]JavaAnalysisDependency, 0)
+	pythonDependencies := make([]PythonAnalysisDependency, 0)
 	request := SnapshotRequest{
 		TaskID: value.TaskID, ReportID: value.ID, GeneratedAt: generatedAt,
 		Dependencies: &dependencies, JavaDependencies: &javaDependencies,
+		PythonDependencies: &pythonDependencies,
 	}
 	switch value.Format {
 	case FormatJSON:
 		err = s.repository.WriteJSONSnapshot(ctx, request, writer)
 	case FormatHTML:
 		err = s.repository.WriteHTMLSnapshot(ctx, request, writer)
+	case FormatDOCX:
+		err = s.repository.WriteDOCXSnapshot(ctx, request, writer)
 	default:
 		err = ErrInvalidInput
 	}

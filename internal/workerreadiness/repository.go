@@ -171,6 +171,10 @@ func validateRegistration(value Registration) error {
 		if value.AnalyzerName != "binaryscan-java-checker" {
 			return errors.New("Java analysis readiness requires the Java checker identity")
 		}
+	case "python_analysis":
+		if value.AnalyzerName != "binaryscan-python-checker" {
+			return errors.New("Python analysis readiness requires the Python checker identity")
+		}
 	default:
 		return errors.New("worker readiness kind is invalid")
 	}

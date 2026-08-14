@@ -99,7 +99,7 @@ docker image inspect binaryscan/java-checker:0.1.0
 
 判定标准：
 
-- Compose 服务列表恰好为 `mysql app scanner c-checker ghidra java java-checker`，总数 7；
+- Compose 服务列表恰好为 `mysql app scanner c-checker ghidra java java-checker python-checker`，总数 8；
 - 6 个产品镜像均从本次源码在断网模式编译；
 - `scanner` 的 Bundle 校验输出同时包含主库版本和 Java 库版本；
 - 所有 7 个服务为 running/healthy；
@@ -112,6 +112,7 @@ docker image inspect binaryscan/java-checker:0.1.0
 - 加密包、分卷包、路径穿越、链接、设备节点、重复路径和全局解压限制均 fail closed，空包或无有效成员时不创建任务并提供删除入口；
 - 完成一次 Ghidra 反编译后，能创建 C 检测、查看四级发现/函数片段、生成含独立 C 章节的报告，并通过多重确认级联删除源码和衍生证据；
 - 完成一次 Java 字节码反编译后，能创建 Java 检测、查看四级发现/文件和可调用符号/代码片段、生成含独立 Java 章节的报告，且结果不改变任务总风险等级；
+- 上传 PYC 后由 pycdc 反编译为 Python 源码（不支持版本降级为字节码索引），能创建 Python 检测、查看发现与中文结论，报告（JSON/HTML/Word）包含独立 Python 章节；
 - 源码 ZIP 中不存在 `.tar`、`trivy.db`、`trivy-java.db`、`node_modules`、`runtime` 或密码文件。
 
 ## 版本升级

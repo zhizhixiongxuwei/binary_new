@@ -85,7 +85,8 @@ func generateReportHandler(service ReportService) gin.HandlerFunc {
 		}
 		idempotencyKey := c.GetHeader("Idempotency-Key")
 		if (request.Format != report.FormatJSON &&
-			request.Format != report.FormatHTML) ||
+			request.Format != report.FormatHTML &&
+			request.Format != report.FormatDOCX) ||
 			!validReportIdempotencyKey(idempotencyKey) {
 			writeReportInvalid(c)
 			return

@@ -711,8 +711,57 @@ export function createDemoApiClient(options: DemoApiOptions = {}): ApiClient {
       requireUser()
       throw new ApiError('界面预览不会删除 Java 源码检测运行', 501, {
         code: 'DEMO_READ_ONLY',
+
       })
     },
+  async createPythonAnalysisRun(): Promise<never> {
+    await delay()
+    requireUser()
+    throw new ApiError('界面预览不会创建 Python 源码检测', 501, {
+      code: 'PYTHON_ANALYSIS_UNAVAILABLE',
+      message: '连接后端后可创建 Python 源码检测。',
+    })
+  },
+  async listPythonAnalysisRuns(): Promise<never> {
+    await delay()
+    requireUser()
+    throw new ApiError('界面预览不会列出 Python 源码检测', 501, {
+      code: 'PYTHON_ANALYSIS_UNAVAILABLE',
+      message: '连接后端后可查看 Python 源码检测结果。',
+    })
+  },
+  async getPythonAnalysisRun(): Promise<never> {
+    await delay()
+    requireUser()
+    throw new ApiError('界面预览不会读取 Python 源码检测', 501, {
+      code: 'PYTHON_ANALYSIS_UNAVAILABLE',
+      message: '连接后端后可查看 Python 源码检测结果。',
+    })
+  },
+  async listPythonAnalysisFindings(): Promise<never> {
+    await delay()
+    requireUser()
+    throw new ApiError('界面预览不会列出 Python 源码检测发现', 501, {
+      code: 'PYTHON_ANALYSIS_UNAVAILABLE',
+      message: '连接后端后可查看 Python 源码检测发现。',
+    })
+  },
+  async cancelPythonAnalysisRun(): Promise<never> {
+    await delay()
+    requireUser()
+    throw new ApiError('界面预览不会取消 Python 源码检测', 501, {
+      code: 'PYTHON_ANALYSIS_UNAVAILABLE',
+      message: '连接后端后可取消 Python 源码检测。',
+    })
+  },
+  async deletePythonAnalysisRun(): Promise<never> {
+    await delay()
+    requireUser()
+    throw new ApiError('界面预览不会删除 Python 源码检测运行', 501, {
+      code: 'PYTHON_ANALYSIS_UNAVAILABLE',
+      message: '连接后端后可删除 Python 源码检测运行。',
+    })
+  },
 
     async createManualImageScanRequest() {
       await delay()

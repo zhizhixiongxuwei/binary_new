@@ -96,6 +96,12 @@ const LiveJavaAnalysisResult =
     : defineAsyncComponent(
         () => import('@/components/tasks/java-analysis/JavaAnalysisWorkspace.vue'),
       )
+const LivePythonAnalysisResult =
+  import.meta.env.VITE_APP_MODE === 'demo'
+    ? null
+    : defineAsyncComponent(
+        () => import('@/components/tasks/python-analysis/PythonAnalysisWorkspace.vue'),
+      )
 const LiveVulnerabilityResult =
   import.meta.env.VITE_APP_MODE === 'demo'
     ? null
@@ -168,6 +174,10 @@ const javaAnalysisResultState = shallowRef<TaskResultState>({
   status: 'loading',
 })
 const javaAnalysisBusy = shallowRef(false)
+const pythonAnalysisResultState = shallowRef<TaskResultState>({
+  status: 'loading',
+})
+const pythonAnalysisBusy = shallowRef(false)
 const liveDecompileResult = useTemplateRef<{
   refresh: () => void
   openResult: (resultId: string) => Promise<boolean>
@@ -184,6 +194,14 @@ const liveJavaAnalysisResult = useTemplateRef<{
   startProject: (projectId: string) => Promise<void>
 }>('liveJavaAnalysisResult')
 const pendingJavaAnalysisProject = shallowRef<{
+  taskId: string
+  projectId: string
+}>()
+const livePythonAnalysisResult = useTemplateRef<{
+  refresh: () => void
+  startProject: (projectId: string) => Promise<void>
+}>('livePythonAnalysisResult')
+const pendingPythonAnalysisProject = shallowRef<{
   taskId: string
   projectId: string
 }>()
@@ -257,6 +275,7 @@ const deferredResultStates = computed<TaskResultStates>(() => {
       decompile: decompileResultState.value,
       'c-analysis': cAnalysisResultState.value,
       'java-analysis': javaAnalysisResultState.value,
+      'python-analysis': pythonAnalysisResultState.value,
       vulnerabilities: vulnerabilityResultState.value,
       reports: reportResultState.value,
     }
@@ -280,6 +299,11 @@ const deferredResultStates = computed<TaskResultStates>(() => {
       status: 'unavailable',
       title: '界面预览不执行 Java 源码检测',
       description: '连接后端后可对已保存的 Java 源码项目发起检测。',
+    },
+    'python-analysis': {
+      status: 'unavailable',
+      title: '界面预览不执行 Python 源码检测',
+      description: '连接后端后可对已保存的 Python 源码项目发起检测。',
     },
     vulnerabilities: CONTAINER_PREVIEW_FORMATS.has(inputType)
       ? { status: 'ready' }
@@ -314,6 +338,14 @@ const resultCommands = computed<TaskResultCommandStates>(() =>
           pending:
             javaAnalysisResultState.value.status === 'loading' ||
             javaAnalysisBusy.value,
+        },
+        'refresh-python-analysis': {
+          enabled:
+            pythonAnalysisResultState.value.status !== 'loading' &&
+            !pythonAnalysisBusy.value,
+          pending:
+            pythonAnalysisResultState.value.status === 'loading' ||
+            pythonAnalysisBusy.value,
         },
         'refresh-vulnerabilities': {
           enabled: vulnerabilityResultState.value.status !== 'loading',
@@ -504,6 +536,8 @@ function handleTaskEvent(message: TaskEventMessage): void {
     void nextTick(() => liveCAnalysisResult.value?.refresh())
   } else if (logEntry && message.data.type.startsWith('java_analysis.')) {
     void nextTick(() => liveJavaAnalysisResult.value?.refresh())
+  } else if (logEntry && message.data.type.startsWith('python_analysis.')) {
+    void nextTick(() => livePythonAnalysisResult.value?.refresh())
   }
   if (
     !message.data.type.startsWith('task.') &&
@@ -548,12 +582,15 @@ async function load(): Promise<void> {
   cAnalysisBusy.value = false
   javaAnalysisResultState.value = { status: 'loading' }
   javaAnalysisBusy.value = false
+  pythonAnalysisResultState.value = { status: 'loading' }
+  pythonAnalysisBusy.value = false
   vulnerabilityResultState.value = { status: 'loading' }
   reportResultState.value = { status: 'loading' }
   activeResultTab.value = 'files'
   activeDetailTab.value = 'progress'
   pendingCAnalysisProjectId.value = ''
   pendingJavaAnalysisProject.value = undefined
+  pendingPythonAnalysisProject.value = undefined
   analysisTarget.value = null
   task.value = null
   try {
@@ -617,6 +654,8 @@ function handleResultCommand(command: TaskResultCommand): void {
     liveCAnalysisResult.value?.refresh()
   } else if (command === 'refresh-java-analysis') {
     liveJavaAnalysisResult.value?.refresh()
+  } else if (command === 'refresh-python-analysis') {
+    livePythonAnalysisResult.value?.refresh()
   }
 }
 
@@ -638,6 +677,7 @@ function handleDecompileProjectDeleted(): void {
   void nextTick(() => liveDecompileResult.value?.refresh())
   void nextTick(() => liveCAnalysisResult.value?.refresh())
   void nextTick(() => liveJavaAnalysisResult.value?.refresh())
+  void nextTick(() => livePythonAnalysisResult.value?.refresh())
 }
 
 function handleCAnalysisState(state: TaskResultState): void {
@@ -682,11 +722,51 @@ function handleJavaAnalysisBusy(busy: boolean): void {
   javaAnalysisBusy.value = busy
 }
 
+function handlePythonAnalysisState(state: TaskResultState): void {
+  pythonAnalysisResultState.value = state
+}
+
+function handlePythonAnalysisBusy(busy: boolean): void {
+  pythonAnalysisBusy.value = busy
+}
+
 async function openJavaAnalysisSource(resultId: string): Promise<void> {
   activeResultTab.value = 'decompile'
   await nextTick()
   await liveDecompileResult.value?.openResult(resultId)
 }
+
+async function openPythonAnalysisSource(resultId: string): Promise<void> {
+  activeResultTab.value = 'decompile'
+  await nextTick()
+  await liveDecompileResult.value?.openResult(resultId)
+}
+
+async function startPythonAnalysisProject(projectId: string): Promise<void> {
+  if (pythonAnalysisBusy.value) return
+  pendingPythonAnalysisProject.value = { taskId: props.taskId, projectId }
+  activeDetailTab.value = 'results'
+  activeResultTab.value = 'python-analysis'
+  await nextTick()
+  await startPendingPythonAnalysisProject()
+}
+
+async function startPendingPythonAnalysisProject(): Promise<void> {
+  const workspace = livePythonAnalysisResult.value
+  const pending = pendingPythonAnalysisProject.value
+  if (!pending) return
+  if (pending.taskId !== props.taskId) {
+    pendingPythonAnalysisProject.value = undefined
+    return
+  }
+  if (!workspace) return
+  pendingPythonAnalysisProject.value = undefined
+  await workspace.startProject(pending.projectId)
+}
+
+watch(livePythonAnalysisResult, () => {
+  void startPendingPythonAnalysisProject()
+})
 
 async function startJavaAnalysisProject(projectId: string): Promise<void> {
   if (javaAnalysisBusy.value) return
@@ -703,10 +783,12 @@ async function startPendingJavaAnalysisProject(): Promise<void> {
   if (!pending) return
   if (pending.taskId !== props.taskId) {
     pendingJavaAnalysisProject.value = undefined
+  pendingPythonAnalysisProject.value = undefined
     return
   }
   if (!workspace) return
   pendingJavaAnalysisProject.value = undefined
+  pendingPythonAnalysisProject.value = undefined
   await workspace.startProject(pending.projectId)
 }
 
@@ -836,7 +918,7 @@ function handleReportState(state: TaskResultState): void {
           :managed-tabs="
             isDemoMode
               ? []
-              : ['decompile', 'c-analysis', 'java-analysis', 'vulnerabilities', 'reports']
+              : ['decompile', 'c-analysis', 'java-analysis', 'python-analysis', 'vulnerabilities', 'reports']
           "
           @command="handleResultCommand"
         >
@@ -888,6 +970,17 @@ function handleReportState(state: TaskResultState): void {
               @busy-change="handleJavaAnalysisBusy"
               @state-change="handleJavaAnalysisState"
               @open-source="openJavaAnalysisSource"
+            />
+          </template>
+          <template #python-analysis>
+            <LivePythonAnalysisResult
+              v-if="!isDemoMode"
+              ref="livePythonAnalysisResult"
+              :task-id="task.id"
+              :user-role="session.user?.role ?? null"
+              @busy-change="handlePythonAnalysisBusy"
+              @state-change="handlePythonAnalysisState"
+              @open-source="openPythonAnalysisSource"
             />
           </template>
           <template #vulnerabilities>

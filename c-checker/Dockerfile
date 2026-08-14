@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 ARG C_CHECKER_BUILDER_IMAGE=binaryscan/c-checker-builder:0.1.0
 ARG C_CHECKER_JRE_IMAGE=eclipse-temurin:17-jre-jammy
 ARG BINARYSCAN_VERSION=0.1.0

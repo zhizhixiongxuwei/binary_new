@@ -2,6 +2,7 @@
 
 ARG BUILDER_IMAGE
 ARG JAVA_RUNTIME_IMAGE
+ARG PYCDC_TOOLS_IMAGE
 
 FROM ${BUILDER_IMAGE} AS build
 WORKDIR /src
@@ -22,12 +23,14 @@ RUN --network=none go build -buildvcs=false -trimpath \
     && go build -buildvcs=false -trimpath -ldflags="-s -w" \
       -o /out/binaryscan-bytecode-tool ./cmd/bytecode-tool
 
+FROM ${PYCDC_TOOLS_IMAGE} AS pycdc-tools
 FROM ${JAVA_RUNTIME_IMAGE}
 ARG BINARYSCAN_VERSION
 ARG BINARYSCAN_REVISION
 ARG BINARYSCAN_SOURCE_MANIFEST_SHA256
 USER root
 COPY --from=build --chmod=0555 /out/binaryscan-worker /usr/local/bin/binaryscan-worker
+COPY --from=pycdc-tools --chown=10001:10001 --chmod=0555 /opt/bytecode-tools/pycdc/pycdc /opt/bytecode-tools/pycdc/pycdc
 COPY --from=build --chmod=0555 /out/binaryscan-bytecode-tool /usr/local/bin/binaryscan-bytecode-tool
 COPY --chown=10001:10001 licenses/ /usr/share/licenses/binaryscan/
 ENV HOME=/tmp TMPDIR=/tmp LANG=C.UTF-8 LC_ALL=C.UTF-8

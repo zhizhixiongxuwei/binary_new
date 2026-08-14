@@ -2,6 +2,7 @@
 import { ChevronDown, Code2, LoaderCircle, SearchX } from 'lucide-vue-next'
 
 import type { JavaAnalysisFinding } from '@/api/types'
+import { javaFindingMessage } from '@/utils/analyzerMessages'
 
 defineProps<{
   findings: readonly JavaAnalysisFinding[]
@@ -83,7 +84,12 @@ function locationLabel(finding: JavaAnalysisFinding): string {
               </small>
             </td>
             <td><code>{{ locationLabel(finding) }}</code></td>
-            <td><span class="message" :title="finding.message">{{ finding.message }}</span></td>
+            <td>
+              <span
+                class="message"
+                :title="finding.message"
+              >{{ javaFindingMessage(finding.rule_id, finding.message) }}</span>
+            </td>
             <td class="finding-actions">
               <button
                 type="button"

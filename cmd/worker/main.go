@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -32,6 +33,7 @@ import (
 	"binaryscan/internal/ghidra"
 	"binaryscan/internal/healthcheck"
 	"binaryscan/internal/javaanalysis"
+	"binaryscan/internal/pythonanalysis"
 	"binaryscan/internal/logging"
 	"binaryscan/internal/queue"
 	"binaryscan/internal/report"
@@ -58,6 +60,7 @@ var validKinds = map[string]struct{}{
 	"trivy":          {},
 	"c_analysis":     {},
 	"java_analysis":  {},
+	"python_analysis": {},
 	"archive_import": {},
 }
 
@@ -430,7 +433,8 @@ func isAnalyzerWorker(kind string) bool {
 		kind == string(queue.KindImage) ||
 		kind == string(queue.KindTrivy) ||
 		kind == string(queue.KindCAnalysis) ||
-		kind == string(queue.KindJavaAnalysis)
+		kind == string(queue.KindJavaAnalysis) ||
+		kind == string(queue.KindPythonAnalysis)
 }
 
 func checkTrivyExecutable(ctx context.Context, cfg config.Config) error {
@@ -464,7 +468,7 @@ func parseCommand(args []string) (command, kind string, err error) {
 	flags := flag.NewFlagSet("worker", flag.ContinueOnError)
 	kindFlag := flags.String(
 		"kind", "",
-		"worker kind: scan, image, native, bytecode, trivy, c_analysis, java_analysis, or archive_import",
+		"worker kind: scan, image, native, bytecode, trivy, c_analysis, java_analysis, python_analysis, or archive_import",
 	)
 	if err := flags.Parse(args); err != nil {
 		return "", "", err
@@ -560,6 +564,13 @@ func analyzerReadinessRegistration(
 			AnalyzerName:    javaanalysis.AnalyzerName,
 			AnalyzerVersion: cfg.JavaCheckerVersion,
 			RuntimeName:     "spring-boot",
+		}, true
+	case string(queue.KindPythonAnalysis):
+		return workerreadiness.Registration{
+			Owner: owner, WorkerKind: kind,
+			AnalyzerName:    pythonanalysis.AnalyzerName,
+			AnalyzerVersion: cfg.PythonCheckerVersion,
+			RuntimeName:     "python",
 		}, true
 	default:
 		return workerreadiness.Registration{}, false
@@ -1020,6 +1031,50 @@ func assembleWorkerRunner(
 			return nil, fmt.Errorf("initialize Java analysis worker runner: %w", err)
 		}
 		return runner, nil
+	case string(queue.KindPythonAnalysis):
+		queueService, err := queue.NewService(
+			queue.NewMySQLRepository(db), workerQueueConfig(cfg),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("initialize Python analysis queue service: %w", err)
+		}
+		repository, err := pythonanalysis.NewMySQLRepository(
+			db, pythonanalysis.RepositoryConfig{
+				AnalyzerVersion: cfg.PythonCheckerVersion,
+			},
+		)
+		if err != nil {
+			return nil, fmt.Errorf("initialize Python analysis repository: %w", err)
+		}
+		client, err := pythonanalysis.NewHTTPClient(pythonanalysis.ClientConfig{
+			BaseURL:          cfg.PythonCheckerURL,
+			MaxDuration:      cfg.PythonAnalysisMaxDuration,
+			MaxResponseBytes: cfg.PythonAnalysisMaxResponseBytes,
+			MaxFindings:      cfg.PythonAnalysisMaxFindings,
+			MaxDiagnostics:   cfg.PythonAnalysisMaxDiagnostics,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("initialize Python checker client: %w", err)
+		}
+		processor, err := pythonanalysis.NewProcessor(
+			repository, client, pythonanalysis.ProcessorConfig{
+				RepositoryRoot: cfg.RepositoryRoot,
+				TaskWorkRoot:   cfg.TaskWorkRoot,
+			},
+		)
+		if err != nil {
+			return nil, fmt.Errorf("initialize Python analysis processor: %w", err)
+		}
+		runnerConfig := workerRunnerConfig(cfg, queue.KindPythonAnalysis, owner)
+		runnerConfig.ClaimGate = checkerClaimGate(client.Ready)
+		runner, err := workerrunner.New(
+			queueService, processor, logger,
+			runnerConfig,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("initialize Python analysis worker runner: %w", err)
+		}
+		return runner, nil
 	default:
 		return nil, fmt.Errorf("unsupported worker kind %q", kind)
 	}
@@ -1055,9 +1110,29 @@ func javaAnalysisRepositoryConfig(cfg config.Config) javaanalysis.RepositoryConf
 func assembleBytecodeEngine(
 	cfg config.Config,
 ) (*bytecode.RoutingEngine, []string, bytecode.ArtifactValidator, error) {
-	pycEngine, err := bytecode.NewPYCFallbackEngine(bytecode.PYCConfig{})
+	pycFallback, err := bytecode.NewPYCFallbackEngine(bytecode.PYCConfig{})
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("initialize PYC bytecode fallback: %w", err)
+	}
+	pycEngine := bytecode.Engine(pycFallback)
+	pycEngineNames := []string{decompile.EnginePythonBytecode}
+	if _, statErr := os.Lstat(bytecode.DefaultPYCDCSourceExecutable); statErr == nil {
+		pycSourceEngine, sourceErr := bytecode.NewPYCSourceEngine(
+			bytecode.DefaultPYCSourceEngineConfig(cfg.TaskWorkRoot),
+			pycFallback,
+		)
+		if sourceErr != nil {
+			return nil, nil, nil, fmt.Errorf(
+				"initialize PYC source engine: %w",
+				sourceErr,
+			)
+		}
+		pycEngine = pycSourceEngine
+	} else if !errors.Is(statErr, fs.ErrNotExist) {
+		return nil, nil, nil, fmt.Errorf(
+			"inspect PYC source executable: %w",
+			statErr,
+		)
 	}
 	available, err := bytecode.ExternalToolchainAvailable(cfg.TaskWorkRoot)
 	if err != nil {
@@ -1088,11 +1163,10 @@ func assembleBytecodeEngine(
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("initialize source artifact validator: %w", err)
 		}
-		return engine, []string{
+		return engine, append([]string{
 			decompile.EngineVineflower,
 			decompile.EngineJADX,
-			decompile.EnginePythonBytecode,
-		}, validator, nil
+		}, pycEngineNames...), validator, nil
 	}
 
 	jvmEngine, err := bytecode.NewJVMFallbackEngine(bytecode.JVMEngineConfig{
@@ -1113,10 +1187,9 @@ func assembleBytecodeEngine(
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("initialize bytecode artifact validator: %w", err)
 	}
-	return engine, []string{
+	return engine, append([]string{
 		decompile.EngineVineflower,
-		decompile.EnginePythonBytecode,
-	}, validator, nil
+	}, pycEngineNames...), validator, nil
 }
 
 func workerQueueConfig(cfg config.Config) queue.Config {
@@ -1160,7 +1233,8 @@ func isQueueWorker(kind string) bool {
 		kind == string(queue.KindBytecode) ||
 		kind == string(queue.KindTrivy) ||
 		kind == string(queue.KindCAnalysis) ||
-		kind == string(queue.KindJavaAnalysis)
+		kind == string(queue.KindJavaAnalysis) ||
+		kind == string(queue.KindPythonAnalysis)
 }
 
 type nativeQueue struct{ *queue.Service }

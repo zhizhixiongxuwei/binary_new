@@ -10,3 +10,7 @@ web/node_modules
 web/coverage/
 web/playwright-report*/
 web/test-results*/
+.reasonix/
+reasonix.toml
+worker
+api

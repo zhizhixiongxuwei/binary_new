@@ -27,6 +27,7 @@ var (
 		KindTrivy: {}, KindReport: {}, KindDecompile: {},
 		KindCAnalysis:    {},
 		KindJavaAnalysis: {},
+		KindPythonAnalysis: {},
 	}
 	activeTaskStatuses = map[string]struct{}{
 		"VALIDATING": {}, "IDENTIFYING": {}, "EXTRACTING": {},
@@ -287,7 +288,8 @@ func validLease(lease Lease, config Config) bool {
 			limit = config.TrivySlotLimit
 		} else if expectedPool == resourcePoolNative {
 			limit = config.NativeSlotLimit
-		} else if (lease.Kind == KindCAnalysis || lease.Kind == KindJavaAnalysis) &&
+		} else if (lease.Kind == KindCAnalysis || lease.Kind == KindJavaAnalysis ||
+			lease.Kind == KindPythonAnalysis) &&
 			expectedPool == resourcePoolGlobal {
 			limit = 1
 		}

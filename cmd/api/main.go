@@ -25,6 +25,7 @@ import (
 	"binaryscan/internal/filetree"
 	"binaryscan/internal/healthcheck"
 	"binaryscan/internal/javaanalysis"
+	"binaryscan/internal/pythonanalysis"
 	"binaryscan/internal/logging"
 	"binaryscan/internal/manualimagescan"
 	"binaryscan/internal/report"
@@ -332,6 +333,32 @@ func run(args []string) error {
 	if err != nil {
 		return fmt.Errorf("initialize Java analysis service: %w", err)
 	}
+	pythonAnalysisRepository, err := pythonanalysis.NewMySQLRepository(
+		db,
+		pythonanalysis.RepositoryConfig{
+			AnalyzerVersion: cfg.PythonCheckerVersion,
+			ReadyMaxAge:     3 * cfg.HeartbeatInterval,
+			InvalidateReports: func(ctx context.Context, tx *sql.Tx, taskID string) error {
+				return report.InvalidateTaskSourceAnalysisReports(ctx, tx, taskID)
+			},
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("initialize Python analysis repository: %w", err)
+	}
+	pythonAnalysisRunDeleter, err := report.NewJavaAnalysisRunCascadeDeleter(
+		db, cfg.RepositoryRoot,
+	)
+	if err != nil {
+		return fmt.Errorf("initialize Python analysis run deletion: %w", err)
+	}
+	pythonAnalysisService, err := pythonanalysis.NewService(
+		pythonAnalysisRepository,
+		pythonanalysis.Config{RunDeleter: pythonAnalysisRunDeleter},
+	)
+	if err != nil {
+		return fmt.Errorf("initialize Python analysis service: %w", err)
+	}
 	manualImageScanService, err := manualimagescan.NewService(
 		manualimagescan.NewMySQLRepository(db),
 		manualimagescan.Config{},
@@ -384,6 +411,7 @@ func run(args []string) error {
 		Decompile:           decompileService,
 		CAnalysis:           cAnalysisService,
 		JavaAnalysis:        javaAnalysisService,
+		PythonAnalysis:      pythonAnalysisService,
 		ManualImageScan:     manualImageScanService,
 		Vulnerabilities:     vulnerabilityService,
 		Reports:             reportService,

@@ -2,6 +2,7 @@
 import { ChevronDown, Code2, LoaderCircle, SearchX } from 'lucide-vue-next'
 
 import type { CAnalysisFinding } from '@/api/types'
+import { cFindingMessage } from '@/utils/analyzerMessages'
 
 defineProps<{
   findings: readonly CAnalysisFinding[]
@@ -68,7 +69,12 @@ function locationLabel(finding: CAnalysisFinding): string {
               <small>{{ finding.function.address }}</small>
             </td>
             <td><code>{{ locationLabel(finding) }}</code></td>
-            <td><span class="message" :title="finding.message">{{ finding.message }}</span></td>
+            <td>
+              <span
+                class="message"
+                :title="finding.message"
+              >{{ cFindingMessage(finding.rule_id, finding.message) }}</span>
+            </td>
             <td class="finding-actions">
               <button
                 type="button"

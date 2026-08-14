@@ -93,7 +93,36 @@ WHERE j.kind = ?
           )
       )
       OR (
-          j.kind NOT IN ('decompile', 'image', 'c_analysis', 'java_analysis')
+          j.kind = 'python_analysis'
+          AND task.status IN (
+              'SUCCEEDED', 'PARTIAL_SUCCEEDED', 'FAILED', 'CANCELLED'
+          )
+          AND task.deleted_at IS NULL
+          AND EXISTS (
+              SELECT 1
+              FROM python_analysis_runs analysis
+              JOIN decompile_source_projects project
+                ON project.task_id = analysis.task_id
+               AND project.id = analysis.source_project_id
+              WHERE analysis.task_id = j.task_id
+                AND analysis.job_id = j.id
+                AND analysis.status = 'queued'
+                AND project.deleted_at IS NULL
+                AND project.storage_deleted_at IS NULL
+                AND project.layout_version = 'project-v1'
+                AND project.source_kind = 'python'
+                AND project.status IN ('complete', 'partial')
+                AND project.manifest_sha256 = analysis.source_manifest_sha256
+                AND analysis.input_sha256 REGEXP '^[0-9a-f]{64}$'
+                AND analysis.source_size_bytes > 0
+                AND analysis.source_file_count > 0
+          )
+      )
+      OR (
+          j.kind NOT IN (
+              'decompile', 'image', 'c_analysis', 'java_analysis',
+              'python_analysis'
+          )
           AND task.status NOT IN (
               'SUCCEEDED', 'PARTIAL_SUCCEEDED', 'FAILED',
               'CANCEL_REQUESTED', 'CANCELLED', 'DELETING', 'DELETED'
@@ -505,7 +534,8 @@ func claimResourceRequirements(
 		case resourcePoolNative:
 			limit = request.NativeSlotLimit
 		}
-		if (request.Kind == KindCAnalysis || request.Kind == KindJavaAnalysis) &&
+		if (request.Kind == KindCAnalysis || request.Kind == KindJavaAnalysis ||
+			request.Kind == KindPythonAnalysis) &&
 			pool == resourcePoolGlobal {
 			limit = 1
 		}
@@ -520,7 +550,7 @@ func claimResourceRequirements(
 func heavyResourceKind(kind Kind) bool {
 	switch kind {
 	case KindScan, KindImage, KindNative, KindBytecode, KindTrivy,
-		KindDecompile, KindCAnalysis, KindJavaAnalysis:
+		KindDecompile, KindCAnalysis, KindJavaAnalysis, KindPythonAnalysis:
 		return true
 	default:
 		return false
@@ -676,6 +706,37 @@ FOR UPDATE`, lease.JobID, lease.TaskID, lease.Owner, lease.FencingToken).Scan(&v
 		}
 		if err != nil {
 			return fmt.Errorf("validate Java analysis job start: %w", err)
+		}
+	}
+	if lease.Kind == KindPythonAnalysis {
+		var valid uint8
+		err := transaction.QueryRowContext(ctx, `
+SELECT 1
+FROM jobs job
+JOIN tasks task ON task.id = job.task_id
+JOIN python_analysis_runs analysis
+  ON analysis.task_id = job.task_id AND analysis.job_id = job.id
+JOIN decompile_source_projects project
+  ON project.task_id = analysis.task_id
+ AND project.id = analysis.source_project_id
+WHERE job.id = ? AND job.task_id = ? AND job.kind = 'python_analysis'
+  AND job.status = 'leased' AND job.lease_owner = ?
+  AND job.fencing_token = ? AND job.lease_until > UTC_TIMESTAMP(6)
+  AND task.status IN ('SUCCEEDED', 'PARTIAL_SUCCEEDED', 'FAILED', 'CANCELLED')
+  AND task.deleted_at IS NULL AND analysis.status = 'queued'
+  AND project.deleted_at IS NULL AND project.storage_deleted_at IS NULL
+  AND project.layout_version = 'project-v1'
+  AND project.source_kind = 'python'
+  AND project.status IN ('complete', 'partial')
+  AND project.manifest_sha256 = analysis.source_manifest_sha256
+  AND analysis.input_sha256 REGEXP '^[0-9a-f]{64}$'
+  AND analysis.source_size_bytes > 0 AND analysis.source_file_count > 0
+FOR UPDATE`, lease.JobID, lease.TaskID, lease.Owner, lease.FencingToken).Scan(&valid)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrLeaseLost
+		}
+		if err != nil {
+			return fmt.Errorf("validate Python analysis job start: %w", err)
 		}
 	}
 
@@ -956,7 +1017,10 @@ SELECT EXISTS (
 	      AND job.fencing_token = ?
 	      AND job.status IN ('leased', 'running', 'cancel_requested')
 	      AND (
-	          job.kind IN ('decompile', 'image', 'c_analysis', 'java_analysis')
+	          job.kind IN (
+	              'decompile', 'image', 'c_analysis', 'java_analysis',
+	              'python_analysis'
+	          )
 	          OR attempt.fencing_token = ?
 	      )
 )`,

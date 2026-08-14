@@ -13,6 +13,7 @@ type Format string
 const (
 	FormatJSON Format = "json"
 	FormatHTML Format = "html"
+	FormatDOCX Format = "docx"
 )
 
 type Report struct {
@@ -49,11 +50,12 @@ type Claim struct {
 }
 
 type SnapshotRequest struct {
-	TaskID           string
-	ReportID         string
-	GeneratedAt      time.Time
-	Dependencies     *[]CAnalysisDependency
-	JavaDependencies *[]JavaAnalysisDependency
+	TaskID            string
+	ReportID          string
+	GeneratedAt       time.Time
+	Dependencies      *[]CAnalysisDependency
+	JavaDependencies  *[]JavaAnalysisDependency
+	PythonDependencies *[]PythonAnalysisDependency
 }
 
 // CAnalysisDependency binds a report snapshot to the immutable C-analysis
@@ -115,6 +117,7 @@ type Repository interface {
 	Claim(context.Context, Claim) (Report, bool, error)
 	WriteJSONSnapshot(context.Context, SnapshotRequest, io.Writer) error
 	WriteHTMLSnapshot(context.Context, SnapshotRequest, io.Writer) error
+	WriteDOCXSnapshot(context.Context, SnapshotRequest, io.Writer) error
 	Renew(context.Context, string, string, string, uint64, time.Duration) (bool, error)
 	AuthorizePublish(context.Context, string, string, string, uint64) error
 	Complete(context.Context, string, string, string, uint64, ArtifactMetadata) (Report, error)

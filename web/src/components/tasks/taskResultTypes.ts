@@ -3,6 +3,7 @@ export const TASK_RESULT_TABS = [
   'decompile',
   'c-analysis',
   'java-analysis',
+  'python-analysis',
   'vulnerabilities',
   'reports',
 ] as const
@@ -34,6 +35,7 @@ export type TaskResultCommand =
   | 'download-decompile'
   | 'refresh-c-analysis'
   | 'refresh-java-analysis'
+  | 'refresh-python-analysis'
   | 'refresh-vulnerabilities'
   | 'export-vulnerabilities'
   | 'refresh-reports'

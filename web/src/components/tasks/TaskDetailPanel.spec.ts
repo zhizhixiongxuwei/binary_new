@@ -560,7 +560,7 @@ describe('TaskDetailPanel', () => {
     const generateButtons = wrapper.findAll(
       'button[aria-label^="生成 "][disabled]',
     )
-    expect(generateButtons).toHaveLength(2)
+    expect(generateButtons).toHaveLength(3)
     expect(generateButtons[0]?.attributes('title')).toContain('任务完成')
 
     await generateButtons[0]?.trigger('click')

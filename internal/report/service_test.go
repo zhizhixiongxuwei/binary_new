@@ -29,6 +29,7 @@ type repositoryStub struct {
 	claimCalls        int
 	jsonWriter        func(context.Context, SnapshotRequest, io.Writer) error
 	htmlWriter        func(context.Context, SnapshotRequest, io.Writer) error
+	docxWriter        func(context.Context, SnapshotRequest, io.Writer) error
 	authorizeErr      error
 	authorizeCalls    int
 	complete          Report
@@ -82,6 +83,17 @@ func (s *repositoryStub) WriteHTMLSnapshot(
 		return nil
 	}
 	return s.htmlWriter(ctx, request, writer)
+}
+
+func (s *repositoryStub) WriteDOCXSnapshot(
+	ctx context.Context,
+	request SnapshotRequest,
+	writer io.Writer,
+) error {
+	if s.docxWriter == nil {
+		return nil
+	}
+	return s.docxWriter(ctx, request, writer)
 }
 
 func (s *repositoryStub) AuthorizePublish(

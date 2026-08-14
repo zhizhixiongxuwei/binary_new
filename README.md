@@ -24,7 +24,7 @@
 
 所有“新建任务”入口统一先选择 `01 二进制格式`、`02 压缩包格式` 或 `03 容器镜像格式`。浏览器只对能够高置信识别的文件头做提前拦截，服务端仍按文件内容执行最终格式校验；扩展名、MIME 和用户声明都不能覆盖检测结果。类别不匹配或不支持的文件不会创建任务，并可从上传队列直接删除。压缩包入口接受 ISO 9660 光盘镜像，只解第一层并对其中二进制成员批量创建检测任务。容器入口除 Docker/OCI 归档外，还接受 EXT2/3/4 文件系统映像与 MBR/GPT 磁盘映像，由 Trivy 的 `vm` 子命令离线扫描漏洞。
 
-`01` 支持 PE、ELF、Mach-O、CLASS、JAR、WAR、EAR、DEX、APK 和 PYC；`03` 支持 Docker Save TAR、OCI Image Layout TAR、EXT2/3/4 文件系统映像和 MBR/GPT 磁盘映像。两类都允许同类别多文件上传，校验通过后每个文件分别创建一个任务；MBR/GPT 磁盘映像在文件树中展示分区内容，同时由 Trivy `vm` 整盘扫描。SquashFS、UDF 等 Trivy 不支持的文件系统映像不属于新建任务支持范围。
+`01` 支持 PE、ELF、Mach-O、CLASS、JAR、WAR、EAR、DEX、APK 和 PYC。PYC 上传后由离线 pycdc 反编译为 Python 源码（失败时降级为字节码结构索引），保存的 Python 源码项目可发起 `python-checker` 静态检测（动态代码执行、命令注入、反序列化、弱摘要、证书校验等规则）。`03` 支持 Docker Save TAR、OCI Image Layout TAR、EXT2/3/4 文件系统映像和 MBR/GPT 磁盘映像。两类都允许同类别多文件上传，校验通过后每个文件分别创建一个任务；MBR/GPT 磁盘映像在文件树中展示分区内容，同时由 Trivy `vm` 整盘扫描。SquashFS、UDF 等 Trivy 不支持的文件系统映像不属于新建任务支持范围。
 
 `02` 支持 ZIP、7Z、RAR、TAR、GZIP、BZIP2、XZ、ZSTD、CAB、CPIO、AR、DEB、RPM 和 ISO 9660。每个外层压缩包作为独立导入批次异步解析，先展示内部候选文件，再由用户每次最多选择 20 项创建任务。TAR.GZ 和 DEB/RPM 可以展开格式固有包装，但成员中的普通嵌套压缩包不会递归；成员若识别为 JAR/APK 等二进制或 Docker/OCI 镜像，仍可创建对应任务。加密包、分卷包和无有效成员的压缩包不会创建任务，并提供删除入口。
 

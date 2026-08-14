@@ -5,6 +5,7 @@ import {
   FileArchive,
   FileCode2,
   FilePlus2,
+  FileText,
   LoaderCircle,
   RotateCw,
   ShieldAlert,
@@ -65,6 +66,12 @@ const formatDefinitions: readonly FormatDefinition[] = [
     label: 'HTML 报告',
     description: '可离线打开的审阅报告',
     icon: FileCode2,
+  },
+  {
+    format: 'docx',
+    label: 'Word 报告',
+    description: '可编辑的 Word 文档',
+    icon: FileText,
   },
 ]
 
@@ -137,7 +144,7 @@ const sampleRelationLabels: Readonly<
       </div>
       <div class="report-workspace__tools">
         <span class="report-workspace__count">
-          {{ completeCount }}/2 已完成
+          {{ completeCount }}/3 已完成
         </span>
         <button
           v-if="hasDecompileSources"

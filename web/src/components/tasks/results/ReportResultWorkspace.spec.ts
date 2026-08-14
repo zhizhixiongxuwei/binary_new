@@ -60,20 +60,26 @@ function mountWorkspace(
 }
 
 describe('ReportResultWorkspace', () => {
-  it('renders two explicit formats and emits generation commands', async () => {
+  it('renders three explicit formats and emits generation commands', async () => {
     const wrapper = mountWorkspace()
     const reportRows = wrapper.findAll('.report-row')
 
-    expect(reportRows).toHaveLength(2)
+    expect(reportRows).toHaveLength(3)
     expect(reportRows[0]?.text()).toContain('JSON 报告')
     expect(reportRows[0]?.text()).toContain('未生成')
     expect(reportRows[1]?.text()).toContain('HTML 报告')
-    expect(wrapper.text()).toContain('0/2 已完成')
+    expect(reportRows[2]?.text()).toContain('Word 报告')
+    expect(wrapper.text()).toContain('0/3 已完成')
 
     await wrapper.get('button[aria-label="生成 JSON 报告"]').trigger('click')
     await wrapper.get('button[aria-label="生成 HTML 报告"]').trigger('click')
+    await wrapper.get('button[aria-label="生成 Word 报告"]').trigger('click')
 
-    expect(wrapper.emitted('generate')).toEqual([['json'], ['html']])
+    expect(wrapper.emitted('generate')).toEqual([
+      ['json'],
+      ['html'],
+      ['docx'],
+    ])
   })
 
   it('shows status, schema, size, hash, completion time, and failure reason as text', () => {
@@ -93,7 +99,7 @@ describe('ReportResultWorkspace', () => {
       ],
     })
 
-    expect(wrapper.text()).toContain('1/2 已完成')
+    expect(wrapper.text()).toContain('1/3 已完成')
     expect(wrapper.get('[aria-label="JSON 报告"]').text()).toContain(
       '已完成',
     )

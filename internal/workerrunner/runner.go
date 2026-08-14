@@ -356,7 +356,7 @@ func validKind(kind queue.Kind) bool {
 	switch kind {
 	case queue.KindScan, queue.KindImage, queue.KindNative, queue.KindBytecode,
 		queue.KindTrivy, queue.KindReport, queue.KindDecompile,
-		queue.KindCAnalysis, queue.KindJavaAnalysis:
+		queue.KindCAnalysis, queue.KindJavaAnalysis, queue.KindPythonAnalysis:
 		return true
 	default:
 		return false

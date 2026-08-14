@@ -56,6 +56,7 @@ describe('taskResultProfile', () => {
       'decompile',
       'c-analysis',
       'java-analysis',
+      'python-analysis',
       'vulnerabilities',
       'reports',
     ])

@@ -24,6 +24,7 @@ const currentKey = computed(() =>
 const pending = computed(() => props.pendingKey === currentKey.value)
 const disabled = computed(() => props.pendingKey !== '')
 const downloadLabel = computed(() => {
+  if (props.report.format === 'docx') return '下载 Word 报告'
   const suffix = encoding.value === 'gzip' ? '压缩 JSON 报告' : `${props.report.format.toUpperCase()} 报告`
   return `下载 ${suffix}`
 })

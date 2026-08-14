@@ -3,6 +3,7 @@ import { Code2, ExternalLink, FileCode2, MapPin, ShieldAlert } from 'lucide-vue-
 import { computed, onBeforeUnmount, onMounted, shallowRef } from 'vue'
 
 import type { JavaAnalysisFinding } from '@/api/types'
+import { javaFindingMessage } from '@/utils/analyzerMessages'
 
 const props = defineProps<{
   finding: JavaAnalysisFinding | undefined
@@ -93,7 +94,7 @@ const snippetLines = computed<readonly SnippetLine[]>(() => {
 
       <section>
         <h3><ShieldAlert :size="15" aria-hidden="true" />检测结论</h3>
-        <p>{{ finding.message }}</p>
+        <p>{{ javaFindingMessage(finding.rule_id, finding.message) }}</p>
       </section>
 
       <dl>

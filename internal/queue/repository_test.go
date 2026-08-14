@@ -830,7 +830,7 @@ func TestWorkspaceLeaseActiveUsesExactFenceWithoutUnsafeEarlyPredicates(t *testi
 			// An exact fenced lease in an active state remains conservatively
 			// active even when lease_until looks stale or cancellation was
 			// requested. Neither event synchronously stops a running worker.
-			mock.ExpectQuery(`(?s)SELECT EXISTS.*FROM jobs job.*JOIN task_attempts attempt.*job\.task_attempt_id = \?.*job\.kind = \?.*job\.fencing_token = \?.*status IN \('leased', 'running', 'cancel_requested'\).*job\.kind IN \('decompile', 'image', 'c_analysis', 'java_analysis'\)\s+OR attempt\.fencing_token = \?`).
+			mock.ExpectQuery(`(?s)SELECT EXISTS.*FROM jobs job.*JOIN task_attempts attempt.*job\.task_attempt_id = \?.*job\.kind = \?.*job\.fencing_token = \?.*status IN \('leased', 'running', 'cancel_requested'\).*job\.kind IN \(\s*'decompile', 'image', 'c_analysis', 'java_analysis', 'python_analysis'\s*\)\s+OR attempt\.fencing_token = \?`).
 				WithArgs(
 					testJobID, testTaskID, uint64(19),
 					KindScan, uint64(2), uint64(2),

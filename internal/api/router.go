@@ -32,6 +32,7 @@ type Dependencies struct {
 	Decompile           DecompileService
 	CAnalysis           CAnalysisService
 	JavaAnalysis        JavaAnalysisService
+	PythonAnalysis      PythonAnalysisService
 	ManualImageScan     ManualImageScanService
 	Vulnerabilities     VulnerabilityService
 	Reports             ReportService
@@ -111,6 +112,9 @@ func NewRouter(deps Dependencies) (*gin.Engine, error) {
 		}
 		if deps.CAnalysis != nil {
 			registerCAnalysisRoutes(v1, deps.Auth, deps.CAnalysis)
+		}
+		if deps.PythonAnalysis != nil {
+			registerPythonAnalysisRoutes(v1, deps.Auth, deps.PythonAnalysis)
 		}
 		if deps.JavaAnalysis != nil {
 			registerJavaAnalysisRoutes(v1, deps.Auth, deps.JavaAnalysis)

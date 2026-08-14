@@ -676,7 +676,7 @@ export interface VulnerabilityFindingPage {
   next_cursor?: string
 }
 
-export type ReportFormat = 'json' | 'html'
+export type ReportFormat = 'json' | 'html' | 'docx'
 export type ReportDownloadEncoding = 'identity' | 'gzip'
 export type TaskReportSampleRelation = 'retained' | 'expired' | 'deleted'
 
@@ -1073,3 +1073,116 @@ export interface ApiErrorBody {
   message?: string
   details?: unknown
 }
+
+export type PythonAnalysisRunStatus =
+  | 'queued'
+  | 'running'
+  | 'succeeded'
+  | 'partial'
+  | 'failed'
+  | 'cancel_requested'
+  | 'cancelled'
+
+export type PythonAnalysisSeverity = 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'
+
+export type PythonAnalysisSeverityCounts = Readonly<
+  Record<PythonAnalysisSeverity, number>
+>
+
+export interface PythonAnalysisProjectSummary {
+  id: string
+  target_path: string
+  status: 'complete' | 'partial'
+  engine_name: string
+  engine_version: string
+}
+
+export interface PythonAnalysisCoverage {
+  total_files: number
+  analyzed_files: number
+  parsed_files: number
+  recovered_files: number
+  failed_files: number
+}
+
+export interface PythonAnalysisRun {
+  id: string
+  task_id: string
+  source_project_id: string
+  source_project: PythonAnalysisProjectSummary
+  job_id: string
+  status: PythonAnalysisRunStatus
+  analyzer_name: string
+  analyzer_version: string
+  ruleset_version: string
+  source_manifest_sha256: string
+  input_sha256: string
+  bundle_sha256: string
+  source_size_bytes: number
+  source_file_count: number
+  finding_count: number
+  diagnostic_count: number
+  coverage: PythonAnalysisCoverage
+  severity_counts: PythonAnalysisSeverityCounts
+  findings_truncated: boolean
+  diagnostics_truncated: boolean
+  error_code: string | null
+  error_message: string | null
+  started_at: string | null
+  completed_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface PythonAnalysisRunListQuery {
+  project_id?: string
+  cursor?: string
+  page_size?: number
+}
+
+export type PythonAnalysisRunPage = CursorPage<PythonAnalysisRun>
+
+export interface PythonAnalysisFileIdentity {
+  result_id: string
+  logical_path: string
+  binary_name: string
+}
+
+export interface PythonAnalysisCallableIdentity {
+  kind: string
+  type_name: string
+  name: string
+  signature: string
+}
+
+export interface PythonAnalysisLocation {
+  start_line: number
+  start_column: number
+  end_line: number
+  end_column: number
+}
+
+export interface PythonAnalysisFinding {
+  id: string
+  cwe: string
+  rule_id: string
+  severity: PythonAnalysisSeverity
+  file: PythonAnalysisFileIdentity
+  callable: PythonAnalysisCallableIdentity
+  location: PythonAnalysisLocation
+  message: string
+  snippet?: string
+  snippet_start_line?: number
+  created_at?: string
+}
+
+export interface PythonAnalysisFindingListQuery {
+  cursor?: string
+  page_size?: number
+  cwe?: string
+  severity?: PythonAnalysisSeverity
+  file?: string
+  callable?: string
+}
+
+export type PythonAnalysisFindingPage = CursorPage<PythonAnalysisFinding>

@@ -460,7 +460,9 @@ func executePYCFixture(
 
 func mustPYCValidator(t *testing.T) ArtifactValidator {
 	t.Helper()
-	validator, err := NewFileArtifactValidator(nil)
+	validator, err := NewFileArtifactValidator(map[string]SourceInspector{
+		"text/x-python": SourceInspectorFunc(InspectUTF8Source),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

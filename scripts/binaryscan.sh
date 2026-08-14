@@ -36,7 +36,7 @@ doctor() {
 	verify_source_manifest
 	services=$(compose config --services)
 	count=$(printf '%s\n' "$services" | awk 'NF {count++} END {print count+0}')
-	[ "$count" -eq 7 ] || fail "compose service count is $count, want exactly 7"
+	[ "$count" -eq 8 ] || fail "compose service count is $count, want exactly 8"
 	printf '%s\n' "$services"
 	note "doctor check passed"
 }
@@ -134,6 +134,22 @@ build_c_checker() {
 		"$PROJECT_ROOT/c-checker"
 }
 
+build_python_checker() {
+	tag=${BINARYSCAN_PYTHON_CHECKER_IMAGE:-binaryscan/python-checker:$version}
+	note "building python-checker as $tag"
+	docker build \
+		--pull=false \
+		--network=none \
+		--platform "$BINARYSCAN_PLATFORM" \
+		--file "$PROJECT_ROOT/python-checker/Dockerfile" \
+		--tag "$tag" \
+		--build-arg "PYTHON_RUNTIME_IMAGE=$BINARYSCAN_PYTHON_RUNTIME_IMAGE" \
+		--build-arg "BINARYSCAN_VERSION=$version" \
+		--build-arg "BINARYSCAN_REVISION=$revision" \
+		--build-arg "BINARYSCAN_SOURCE_MANIFEST_SHA256=$manifest_hash" \
+		"$PROJECT_ROOT/python-checker"
+}
+
 build_java_checker() {
 	tag=${BINARYSCAN_JAVA_CHECKER_IMAGE:-binaryscan/java-checker:$version}
 	note "building java-checker as $tag"
@@ -166,11 +182,13 @@ build_images() {
 		--build-arg "TRIVY_RUNTIME_DB_IMAGE=$BINARYSCAN_TRIVY_RUNTIME_DB_IMAGE" \
 		--build-arg "ARCHIVE_TOOLS_IMAGE=$BINARYSCAN_ARCHIVE_TOOLS_IMAGE"
 	build_one java docker/java.Dockerfile "${BINARYSCAN_JAVA_IMAGE:-binaryscan/java:$version}" \
-		--build-arg "JAVA_RUNTIME_IMAGE=$BINARYSCAN_JAVA_RUNTIME_IMAGE"
+		--build-arg "JAVA_RUNTIME_IMAGE=$BINARYSCAN_JAVA_RUNTIME_IMAGE" \
+		--build-arg "PYCDC_TOOLS_IMAGE=$BINARYSCAN_PYCDC_TOOLS_IMAGE"
 	build_one ghidra docker/ghidra.Dockerfile "${BINARYSCAN_GHIDRA_IMAGE:-binaryscan/ghidra:$version}" \
 		--build-arg "GHIDRA_RUNTIME_IMAGE=$BINARYSCAN_GHIDRA_RUNTIME_IMAGE"
 	build_c_checker
 	build_java_checker
+	build_python_checker
 	docker run --rm --network none \
 		--entrypoint /usr/local/bin/binaryscan-bundle-check \
 		"${BINARYSCAN_SCANNER_IMAGE:-binaryscan/scanner:$version}"
@@ -263,6 +281,7 @@ verify_running() {
 	compose exec --no-TTY ghidra /usr/local/bin/binaryscan-worker healthcheck --role native
 	compose exec --no-TTY c-checker /opt/binaryscan/bin/c-checker-healthcheck
 	compose exec --no-TTY java-checker /opt/binaryscan/bin/java-checker-healthcheck
+	compose exec --no-TTY python-checker python3 /opt/binaryscan/python-checker/healthcheck.py http://127.0.0.1:8080
 	note "runtime verification passed"
 }
 

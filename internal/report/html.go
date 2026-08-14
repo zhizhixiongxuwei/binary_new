@@ -29,6 +29,10 @@ var reportHTML = template.Must(template.New("report").Funcs(template.FuncMap{
 		return value.UTC().Format(time.RFC3339Nano)
 	},
 	"jsonText": readableReportJSON,
+	"cMessage": cFindingMessage,
+	"jMessage": javaFindingMessage,
+	"pMessage": pythonFindingMessage,
+	"dMessage": diagnosticMessage,
 }).Parse(`<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -83,7 +87,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8f9fa;border:1px so
 	{{range .CAnalysisRuns}}<tr data-report-c-analysis-run-id="{{.ID}}" data-source-project-id="{{.SourceProjectID}}"><td>{{.SourceProjectID}}</td><td>{{.ID}}</td><td>{{.AnalyzerName}} {{.AnalyzerVersion}}</td><td>{{.Status}}</td><td>{{.FindingCount}}{{if .FindingsTruncated}}+{{end}}</td><td>{{.DiagnosticCount}}{{if .DiagnosticsTruncated}}+{{end}}</td><td>{{.SourceSHA256}}</td></tr>{{else}}<tr><td colspan="7">无 C 伪源码静态分析结果</td></tr>{{end}}
 	</tbody></table>
 	<h3>C 伪源码发现</h3><table><thead><tr><th>CWE / 规则</th><th>级别</th><th>函数</th><th>位置</th><th>说明</th><th>证据片段</th></tr></thead><tbody>
-	{{range .CAnalysisFindings}}<tr data-report-c-analysis-finding-id="{{.ID}}" data-c-analysis-run-id="{{.RunID}}"><td>{{.CWE}}<br><code>{{.RuleID}}</code></td><td class="severity-{{.Severity}}">{{.Severity}}</td><td>{{.FunctionName}}<br><code>{{.FunctionAddress}}</code></td><td>{{.StartLine}}:{{.StartColumn}}-{{.EndLine}}:{{.EndColumn}}</td><td>{{.Message}}</td><td><pre>{{nullable .Snippet}}</pre></td></tr>{{else}}<tr><td colspan="6">无 C 伪源码发现</td></tr>{{end}}
+	{{range .CAnalysisFindings}}<tr data-report-c-analysis-finding-id="{{.ID}}" data-c-analysis-run-id="{{.RunID}}"><td>{{.CWE}}<br><code>{{.RuleID}}</code></td><td class="severity-{{.Severity}}">{{.Severity}}</td><td>{{.FunctionName}}<br><code>{{.FunctionAddress}}</code></td><td>{{.StartLine}}:{{.StartColumn}}-{{.EndLine}}:{{.EndColumn}}</td><td>{{cMessage .RuleID .Message}}</td><td><pre>{{nullable .Snippet}}</pre></td></tr>{{else}}<tr><td colspan="6">无 C 伪源码发现</td></tr>{{end}}
 	</tbody></table>
 	{{if .CAnalysisFindingsTruncated}}<p class="muted">C 伪源码发现仅展示前 {{.CAnalysisFindingLimit}} 项；更多记录及截断状态请查看 JSON 报告。</p>{{end}}
 	<h2>Java 反编译源码静态分析</h2>
@@ -92,9 +96,15 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8f9fa;border:1px so
 	{{range .JavaAnalysisRuns}}<tr data-report-java-analysis-run-id="{{.ID}}" data-source-project-id="{{.SourceProjectID}}"><td>{{.SourceProjectID}}</td><td>{{.ID}}</td><td>{{.AnalyzerName}} {{.AnalyzerVersion}}<br><code>{{.RulesetVersion}}</code></td><td>{{.Status}}</td><td>{{.SourceFileCount}}</td><td>{{.FindingCount}}{{if .FindingsTruncated}}+{{end}}</td><td>{{.DiagnosticCount}}{{if .DiagnosticsTruncated}}+{{end}}</td><td>{{.InputSHA256}}</td></tr>{{else}}<tr><td colspan="8">无 Java 反编译源码静态分析结果</td></tr>{{end}}
 	</tbody></table>
 	<h3>Java 源码发现</h3><table><thead><tr><th>CWE / 规则</th><th>级别</th><th>文件</th><th>类型 / 方法</th><th>位置</th><th>说明</th><th>证据片段</th></tr></thead><tbody>
-	{{range .JavaAnalysisFindings}}<tr data-report-java-analysis-finding-id="{{.ID}}" data-java-analysis-run-id="{{.RunID}}"><td>{{.CWE}}<br><code>{{.RuleID}}</code></td><td class="severity-{{.Severity}}">{{.Severity}}</td><td>{{.LogicalPath}}<br><code>{{.BinaryName}}</code></td><td>{{.TypeName}}<br>{{.CallableName}}<br><code>{{nullable .CallableSignature}}</code></td><td>{{.StartLine}}:{{.StartColumn}}-{{.EndLine}}:{{.EndColumn}}</td><td>{{.Message}}</td><td><pre>{{nullable .Snippet}}</pre></td></tr>{{else}}<tr><td colspan="7">无 Java 源码发现</td></tr>{{end}}
+	{{range .JavaAnalysisFindings}}<tr data-report-java-analysis-finding-id="{{.ID}}" data-java-analysis-run-id="{{.RunID}}"><td>{{.CWE}}<br><code>{{.RuleID}}</code></td><td class="severity-{{.Severity}}">{{.Severity}}</td><td>{{.LogicalPath}}<br><code>{{.BinaryName}}</code></td><td>{{.TypeName}}<br>{{.CallableName}}<br><code>{{nullable .CallableSignature}}</code></td><td>{{.StartLine}}:{{.StartColumn}}-{{.EndLine}}:{{.EndColumn}}</td><td>{{jMessage .RuleID .Message}}</td><td><pre>{{nullable .Snippet}}</pre></td></tr>{{else}}<tr><td colspan="7">无 Java 源码发现</td></tr>{{end}}
 	</tbody></table>
 	{{if .JavaAnalysisFindingsTruncated}}<p class="muted">Java 源码发现仅展示前 {{.JavaAnalysisFindingLimit}} 项；更多记录及截断状态请查看 JSON 报告。</p>{{end}}
+	<h2>Python 反编译源码静态分析</h2>
+	{{range .PythonAnalysisRuns}}<table><thead><tr><th>运行 ID</th><th>项目</th><th>分析器</th><th>规则集</th><th>状态</th><th>文件</th><th>发现</th><th>诊断</th></tr></thead><tbody><tr><td>{{.ID}}</td><td>{{.SourceProjectID}}</td><td>{{.AnalyzerName}} {{.AnalyzerVersion}}</td><td>{{.RulesetVersion}}</td><td>{{.Status}}</td><td>{{.SourceFileCount}}</td><td>{{.FindingCount}}{{if .FindingsTruncated}}+{{end}}</td><td>{{.DiagnosticCount}}{{if .DiagnosticsTruncated}}+{{end}}</td></tr></tbody></table>{{else}}<p>无 Python 反编译源码静态分析结果</p>{{end}}
+	{{if .PythonAnalysisRuns}}<table><thead><tr><th>CWE</th><th>严重度</th><th>文件</th><th>位置</th><th>检测结论</th><th>代码片段</th></tr></thead><tbody>
+	{{range .PythonAnalysisFindings}}<tr data-report-python-analysis-finding-id="{{.ID}}" data-python-analysis-run-id="{{.RunID}}"><td>{{.CWE}}<br><code>{{.RuleID}}</code></td><td class="severity-{{.Severity}}">{{.Severity}}</td><td>{{.LogicalPath}}<br><code>{{.BinaryName}}</code></td><td>{{.StartLine}}:{{.StartColumn}}-{{.EndLine}}:{{.EndColumn}}</td><td>{{pMessage .RuleID .Message}}</td><td><pre>{{nullable .Snippet}}</pre></td></tr>{{else}}<tr><td colspan="6">无 Python 源码发现</td></tr>{{end}}
+	</tbody></table>{{end}}
+	{{if .PythonAnalysisFindingsTruncated}}<p class="muted">Python 源码发现仅展示前 {{.PythonAnalysisFindingLimit}} 项；更多记录及截断状态请查看 JSON 报告。</p>{{end}}
 	<h2>分析器运行</h2><table><thead><tr><th>分析器</th><th>版本</th><th>状态</th><th>文件节点</th><th>错误</th></tr></thead><tbody>
 	{{range .Analyzers}}<tr><td>{{.AnalyzerName}}</td><td>{{.AnalyzerVersion}}</td><td>{{.Status}}</td><td>{{nullable .FileNodeID}}</td><td>{{nullable .ErrorCode}} {{nullable .ErrorMessage}}</td></tr>{{else}}<tr><td colspan="5">无分析器记录</td></tr>{{end}}
 	</tbody></table>
@@ -110,7 +120,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f8f9fa;border:1px so
 	</tbody></table>
 		{{if .DatabasesTruncated}}<p class="muted">数据库 Bundle 仅展示前 {{.DatabaseLimit}} 项；完整数据请使用 JSON 报告。</p>{{end}}
 		<h2>警告、限制、未支持与失败</h2><table><thead><tr><th>类别</th><th>代码</th><th>来源</th><th>路径</th><th>消息</th></tr></thead><tbody>
-		{{range .Issues}}<tr data-report-issue-category="{{.Category}}" data-report-issue-code="{{.Code}}"><td>{{.Category}}</td><td>{{.Code}}</td><td>{{nullable .Source}}</td><td>{{nullable .LogicalPath}}</td><td>{{.Message}}</td></tr>{{else}}<tr><td colspan="5">无诊断项</td></tr>{{end}}
+		{{range .Issues}}<tr data-report-issue-category="{{.Category}}" data-report-issue-code="{{.Code}}"><td>{{.Category}}</td><td>{{.Code}}</td><td>{{nullable .Source}}</td><td>{{nullable .LogicalPath}}</td><td>{{dMessage .Code .Message}}</td></tr>{{else}}<tr><td colspan="5">无诊断项</td></tr>{{end}}
 	</tbody></table>
 	{{if .IssuesTruncated}}<p class="muted">诊断项仅展示前 {{.IssueLimit}} 项；完整数据请使用 JSON 报告。</p>{{end}}
 	<p class="muted">此 HTML 报告完全离线生成，不包含脚本、外部资源、完整反编译源码或全部文件节点清单。</p>
@@ -120,6 +130,7 @@ const (
 	htmlVulnerabilityDetailLimit = 1000
 	htmlCAnalysisFindingLimit    = 1000
 	htmlJavaAnalysisFindingLimit = 1000
+	htmlPythonAnalysisFindingLimit = 1000
 	htmlAnalyzerRunLimit         = 1000
 	htmlDecompileResultLimit     = 3000
 	htmlDatabaseVersionLimit     = 100
@@ -145,6 +156,8 @@ type htmlReportData struct {
 	CAnalysisFindings             []cAnalysisFindingSnapshot
 	JavaAnalysisRuns              []javaAnalysisRunSnapshot
 	JavaAnalysisFindings          []javaAnalysisFindingSnapshot
+	PythonAnalysisRuns            []pythonAnalysisRunSnapshot
+	PythonAnalysisFindings        []pythonAnalysisFindingSnapshot
 	Analyzers                     []analyzerRunSnapshot
 	Decompilations                []htmlDecompileResult
 	Databases                     []databaseBundleSnapshot
@@ -152,6 +165,7 @@ type htmlReportData struct {
 	VulnerabilitiesTruncated      bool
 	CAnalysisFindingsTruncated    bool
 	JavaAnalysisFindingsTruncated bool
+	PythonAnalysisFindingsTruncated bool
 	AnalyzersTruncated            bool
 	DecompilationsTruncated       bool
 	DatabasesTruncated            bool
@@ -159,6 +173,7 @@ type htmlReportData struct {
 	VulnerabilityLimit            int
 	CAnalysisFindingLimit         int
 	JavaAnalysisFindingLimit      int
+	PythonAnalysisFindingLimit    int
 	AnalyzerLimit                 int
 	DecompilationLimit            int
 	DatabaseLimit                 int
@@ -264,96 +279,12 @@ func (r *MySQLRepository) WriteHTMLSnapshot(
 	writer io.Writer,
 ) error {
 	return r.withReadSnapshot(ctx, func(transaction *sql.Tx) error {
-		task, err := loadTaskSnapshot(ctx, transaction, request.TaskID)
-		if err != nil {
-			return err
-		}
-		execution, err := loadExecutionSnapshot(ctx, transaction, task)
-		if err != nil {
-			return err
-		}
-		data := htmlReportData{
-			SchemaVersion:            SchemaVersion,
-			ReportID:                 request.ReportID,
-			GeneratedAt:              request.GeneratedAt.UTC().Format("2006-01-02T15:04:05.999999999Z07:00"),
-			Task:                     task,
-			Execution:                execution,
-			SampleRelation:           sampleRelationAt(task, request.GeneratedAt),
-			Statistics:               string(execution.Statistics),
-			VulnerabilityLimit:       htmlVulnerabilityDetailLimit,
-			CAnalysisFindingLimit:    htmlCAnalysisFindingLimit,
-			JavaAnalysisFindingLimit: htmlJavaAnalysisFindingLimit,
-			AnalyzerLimit:            htmlAnalyzerRunLimit,
-			DecompilationLimit:       htmlDecompileResultLimit,
-			DatabaseLimit:            htmlDatabaseVersionLimit,
-			IssueLimit:               htmlDiagnosticLimit,
-		}
-		data.SampleRelationMessage = sampleRelationMessage(
-			task,
-			data.SampleRelation,
+		data, dependencies, javaDependencies, pythonDependencies, err := loadHTMLReportData(
+			ctx,
+			transaction,
+			request,
 		)
-		encodedLimits, err := json.Marshal(task.LimitsSnapshot)
 		if err != nil {
-			return fmt.Errorf("encode HTML limits snapshot: %w", err)
-		}
-		data.Limits = string(encodedLimits)
-		if data.FileTypes, err = loadHTMLFileTypes(ctx, transaction, request.TaskID); err != nil {
-			return err
-		}
-		for _, fileType := range data.FileTypes {
-			data.FileCount += fileType.Count
-		}
-		if data.ImageStructures, err = loadHTMLImageStructures(
-			ctx, transaction, request.TaskID,
-		); err != nil {
-			return err
-		}
-		if data.VulnerabilitySummary, err = loadHTMLVulnerabilitySummary(
-			ctx, transaction, request.TaskID,
-		); err != nil {
-			return err
-		}
-		if data.Vulnerabilities, data.VulnerabilitiesTruncated, err = loadHTMLVulnerabilities(
-			ctx, transaction, request.TaskID,
-		); err != nil {
-			return err
-		}
-		var dependencies []CAnalysisDependency
-		if data.CAnalysisRuns, dependencies, err = loadLatestCAnalysisRuns(
-			ctx, transaction, request.TaskID,
-		); err != nil {
-			return err
-		}
-		if data.CAnalysisFindings, data.CAnalysisFindingsTruncated, err =
-			loadHTMLCAnalysisFindings(ctx, transaction, request.TaskID); err != nil {
-			return err
-		}
-		var javaDependencies []JavaAnalysisDependency
-		if data.JavaAnalysisRuns, javaDependencies, err =
-			loadLatestJavaAnalysisRuns(ctx, transaction, request.TaskID); err != nil {
-			return err
-		}
-		if data.JavaAnalysisFindings, data.JavaAnalysisFindingsTruncated, err =
-			loadHTMLJavaAnalysisFindings(ctx, transaction, request.TaskID); err != nil {
-			return err
-		}
-		if data.Analyzers, data.AnalyzersTruncated, err = loadHTMLAnalyzers(
-			ctx, transaction, request.TaskID,
-		); err != nil {
-			return err
-		}
-		if data.Decompilations, data.DecompilationsTruncated, err =
-			loadHTMLDecompilations(ctx, transaction, request.TaskID); err != nil {
-			return err
-		}
-		if data.Databases, data.DatabasesTruncated, err = loadHTMLDatabases(
-			ctx, transaction, request.TaskID,
-		); err != nil {
-			return err
-		}
-		if data.Issues, data.IssuesTruncated, err = loadHTMLIssues(
-			ctx, transaction, request.TaskID,
-		); err != nil {
 			return err
 		}
 		if err := ctx.Err(); err != nil {
@@ -364,8 +295,124 @@ func (r *MySQLRepository) WriteHTMLSnapshot(
 		}
 		recordSnapshotDependencies(request, dependencies)
 		recordJavaSnapshotDependencies(request, javaDependencies)
+		recordPythonSnapshotDependencies(request, pythonDependencies)
 		return nil
 	})
+}
+
+// loadHTMLReportData builds the shared presentation view used by both the
+// static HTML report and the Word document export.
+func loadHTMLReportData(
+	ctx context.Context,
+	transaction *sql.Tx,
+	request SnapshotRequest,
+) (htmlReportData, []CAnalysisDependency, []JavaAnalysisDependency, []PythonAnalysisDependency, error) {
+	task, err := loadTaskSnapshot(ctx, transaction, request.TaskID)
+	if err != nil {
+		return htmlReportData{}, nil, nil, nil, err
+	}
+	execution, err := loadExecutionSnapshot(ctx, transaction, task)
+	if err != nil {
+		return htmlReportData{}, nil, nil, nil, err
+	}
+	data := htmlReportData{
+		SchemaVersion:            SchemaVersion,
+		ReportID:                 request.ReportID,
+		GeneratedAt:              request.GeneratedAt.UTC().Format("2006-01-02T15:04:05.999999999Z07:00"),
+		Task:                     task,
+		Execution:                execution,
+		SampleRelation:           sampleRelationAt(task, request.GeneratedAt),
+		Statistics:               string(execution.Statistics),
+		VulnerabilityLimit:       htmlVulnerabilityDetailLimit,
+		CAnalysisFindingLimit:    htmlCAnalysisFindingLimit,
+		JavaAnalysisFindingLimit: htmlJavaAnalysisFindingLimit,
+		PythonAnalysisFindingLimit: htmlPythonAnalysisFindingLimit,
+		AnalyzerLimit:            htmlAnalyzerRunLimit,
+		DecompilationLimit:       htmlDecompileResultLimit,
+		DatabaseLimit:            htmlDatabaseVersionLimit,
+		IssueLimit:               htmlDiagnosticLimit,
+	}
+	data.SampleRelationMessage = sampleRelationMessage(
+		task,
+		data.SampleRelation,
+	)
+	encodedLimits, err := json.Marshal(task.LimitsSnapshot)
+	if err != nil {
+		return htmlReportData{}, nil, nil, nil, fmt.Errorf(
+			"encode HTML limits snapshot: %w",
+			err,
+		)
+	}
+	data.Limits = string(encodedLimits)
+	if data.FileTypes, err = loadHTMLFileTypes(ctx, transaction, request.TaskID); err != nil {
+		return htmlReportData{}, nil, nil, nil, err
+	}
+	for _, fileType := range data.FileTypes {
+		data.FileCount += fileType.Count
+	}
+	if data.ImageStructures, err = loadHTMLImageStructures(
+		ctx, transaction, request.TaskID,
+	); err != nil {
+		return htmlReportData{}, nil, nil, nil, err
+	}
+	if data.VulnerabilitySummary, err = loadHTMLVulnerabilitySummary(
+		ctx, transaction, request.TaskID,
+	); err != nil {
+		return htmlReportData{}, nil, nil, nil, err
+	}
+	if data.Vulnerabilities, data.VulnerabilitiesTruncated, err = loadHTMLVulnerabilities(
+		ctx, transaction, request.TaskID,
+	); err != nil {
+		return htmlReportData{}, nil, nil, nil, err
+	}
+	var dependencies []CAnalysisDependency
+	if data.CAnalysisRuns, dependencies, err = loadLatestCAnalysisRuns(
+		ctx, transaction, request.TaskID,
+	); err != nil {
+		return htmlReportData{}, nil, nil, nil, err
+	}
+	if data.CAnalysisFindings, data.CAnalysisFindingsTruncated, err =
+		loadHTMLCAnalysisFindings(ctx, transaction, request.TaskID); err != nil {
+		return htmlReportData{}, nil, nil, nil, err
+	}
+	var javaDependencies []JavaAnalysisDependency
+	if data.JavaAnalysisRuns, javaDependencies, err =
+		loadLatestJavaAnalysisRuns(ctx, transaction, request.TaskID); err != nil {
+		return htmlReportData{}, nil, nil, nil, err
+	}
+	if data.JavaAnalysisFindings, data.JavaAnalysisFindingsTruncated, err =
+		loadHTMLJavaAnalysisFindings(ctx, transaction, request.TaskID); err != nil {
+		return htmlReportData{}, nil, nil, nil, err
+	}
+	var pythonDependencies []PythonAnalysisDependency
+	if data.PythonAnalysisRuns, pythonDependencies, err =
+		loadLatestPythonAnalysisRuns(ctx, transaction, request.TaskID); err != nil {
+		return htmlReportData{}, nil, nil, nil, err
+	}
+	if data.PythonAnalysisFindings, data.PythonAnalysisFindingsTruncated, err =
+		loadHTMLPythonAnalysisFindings(ctx, transaction, request.TaskID); err != nil {
+		return htmlReportData{}, nil, nil, nil, err
+	}
+	if data.Analyzers, data.AnalyzersTruncated, err = loadHTMLAnalyzers(
+		ctx, transaction, request.TaskID,
+	); err != nil {
+		return htmlReportData{}, nil, nil, nil, err
+	}
+	if data.Decompilations, data.DecompilationsTruncated, err =
+		loadHTMLDecompilations(ctx, transaction, request.TaskID); err != nil {
+		return htmlReportData{}, nil, nil, nil, err
+	}
+	if data.Databases, data.DatabasesTruncated, err = loadHTMLDatabases(
+		ctx, transaction, request.TaskID,
+	); err != nil {
+		return htmlReportData{}, nil, nil, nil, err
+	}
+	if data.Issues, data.IssuesTruncated, err = loadHTMLIssues(
+		ctx, transaction, request.TaskID,
+	); err != nil {
+		return htmlReportData{}, nil, nil, nil, err
+	}
+	return data, dependencies, javaDependencies, pythonDependencies, nil
 }
 
 func sampleRelationAt(task taskSnapshot, generatedAt time.Time) string {

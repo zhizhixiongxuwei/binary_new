@@ -21,6 +21,12 @@ import type {
   JavaAnalysisRun,
   JavaAnalysisRunListQuery,
   JavaAnalysisRunPage,
+  PythonAnalysisRun,
+  PythonAnalysisRunListQuery,
+  PythonAnalysisRunPage,
+  PythonAnalysisFinding,
+  PythonAnalysisFindingListQuery,
+  PythonAnalysisFindingPage,
   CompletedUpload,
   CreatedTask,
   CreateArchiveTaskBatchInput,
@@ -157,6 +163,23 @@ export interface ApiClient {
   ): Promise<JavaAnalysisFindingPage>
   cancelJavaAnalysisRun(taskId: string, runId: string): Promise<JavaAnalysisRun>
   deleteJavaAnalysisRun(taskId: string, runId: string): Promise<void>
+  createPythonAnalysisRun(
+    taskId: string,
+    projectId: string,
+    idempotencyKey: string,
+  ): Promise<PythonAnalysisRun>
+  listPythonAnalysisRuns(
+    taskId: string,
+    query?: PythonAnalysisRunListQuery,
+  ): Promise<PythonAnalysisRunPage>
+  getPythonAnalysisRun(taskId: string, runId: string): Promise<PythonAnalysisRun>
+  listPythonAnalysisFindings(
+    taskId: string,
+    runId: string,
+    query?: PythonAnalysisFindingListQuery,
+  ): Promise<PythonAnalysisFindingPage>
+  cancelPythonAnalysisRun(taskId: string, runId: string): Promise<PythonAnalysisRun>
+  deletePythonAnalysisRun(taskId: string, runId: string): Promise<void>
   createManualImageScanRequest(
     taskId: string,
     fileId: string,

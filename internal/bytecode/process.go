@@ -289,9 +289,33 @@ func (runner *ProcessRunner) Run(
 	command.Stderr = stderr
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := command.Start(); err != nil {
-		return ProcessResult{}, runner.preparationError(
-			ctx, runCtx, fmt.Errorf("%w: %v", ErrProcessStart, err),
-		)
+		// Some container runtimes reject exec through /proc/self/fd. Both the
+		// bind case (immutable root-owned path) and the snapshot case (private
+		// copy beneath the work root) have a direct path that is
+		// security-equivalent, so retry through it once.
+		fallbackPath := executableSnapshot.path
+		if fallbackPath == "" {
+			fallbackPath = runner.executable
+		}
+		if descriptorBound && fallbackPath != "" {
+			fallback := exec.Command(fallbackPath, arguments...)
+			fallback.Dir = command.Dir
+			fallback.Env = command.Env
+			fallback.Stdout = stdout
+			fallback.Stderr = stderr
+			fallback.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			if startErr := fallback.Start(); startErr == nil {
+				command = fallback
+			} else {
+				return ProcessResult{}, runner.preparationError(
+					ctx, runCtx, fmt.Errorf("%w: %v", ErrProcessStart, startErr),
+				)
+			}
+		} else {
+			return ProcessResult{}, runner.preparationError(
+				ctx, runCtx, fmt.Errorf("%w: %v", ErrProcessStart, err),
+			)
+		}
 	}
 	if runtime.GOOS != "linux" && !executableSnapshot.pathIsBound() {
 		_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)

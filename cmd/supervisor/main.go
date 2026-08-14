@@ -116,7 +116,7 @@ func scannerCommands() []commandSpec {
 }
 
 func scannerWorkerKinds() []string {
-	return []string{"scan", "image", "trivy", "c_analysis", "java_analysis", "archive_import"}
+	return []string{"scan", "image", "trivy", "c_analysis", "java_analysis", "python_analysis", "archive_import"}
 }
 
 func runOnce(spec commandSpec) error {

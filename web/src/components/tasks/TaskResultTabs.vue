@@ -82,6 +82,11 @@ const slots = defineSlots<{
     state: TaskResultState
     mode: TaskResultMode
   }) => unknown
+  'python-analysis'?: (props: {
+    taskId: string
+    state: TaskResultState
+    mode: TaskResultMode
+  }) => unknown
   reports?: (props: {
     taskId: string
     state: TaskResultState
@@ -100,6 +105,7 @@ const tabDefinitions: readonly TabDefinition[] = [
   { id: 'decompile', label: '反编译', icon: CodeXml },
   { id: 'c-analysis', label: 'C 源码检测', icon: ScanSearch },
   { id: 'java-analysis', label: 'Java 源码检测', icon: FileCode2 },
+  { id: 'python-analysis', label: 'Python 源码检测', icon: FileCode2 },
   { id: 'vulnerabilities', label: '容器漏洞', icon: ShieldCheck },
   { id: 'reports', label: '报告', icon: FileJson2 },
 ]
@@ -135,6 +141,11 @@ const unavailableStates: Readonly<Record<TaskResultTab, TaskResultState>> = {
     status: 'unavailable',
     title: 'Java 源码检测未接入',
     description: '当前任务没有可读取的 Java 源码检测结果。',
+  },
+  'python-analysis': {
+    status: 'unavailable',
+    title: 'Python 源码检测未接入',
+    description: '当前任务没有可读取的 Python 源码检测结果。',
   },
   vulnerabilities: {
     status: 'unavailable',
@@ -174,6 +185,7 @@ const paneStates = computed<Readonly<Record<TaskResultTab, TaskResultState>>>(()
   decompile: resolveState('decompile'),
   'c-analysis': resolveState('c-analysis'),
   'java-analysis': resolveState('java-analysis'),
+  'python-analysis': resolveState('python-analysis'),
   vulnerabilities: resolveState('vulnerabilities'),
   reports: resolveState('reports'),
 }))
@@ -222,6 +234,9 @@ const actions = computed<Readonly<Record<TaskResultTab, readonly TaskResultPaneA
   ],
   'java-analysis': [
     action('refresh-java-analysis', '刷新 Java 源码检测结果', 'refresh'),
+  ],
+  'python-analysis': [
+    action('refresh-python-analysis', '刷新 Python 源码检测结果', 'refresh'),
   ],
   vulnerabilities: [
     action('refresh-vulnerabilities', '刷新容器漏洞结果', 'refresh'),
@@ -355,6 +370,24 @@ watch(
           name="files"
           :task-id="taskId"
           :state="paneStates.files"
+          :mode="mode"
+        />
+      </TaskResultPane>
+
+      <TaskResultPane
+        v-else-if="activeTab === 'python-analysis'"
+        kind="python-analysis"
+        :state="paneStates['python-analysis']"
+        :actions="actions['python-analysis']"
+        :preview="mode === 'preview'"
+        :content-owns-state="contentOwnsState('python-analysis')"
+        @command="emit('command', $event)"
+      >
+        <slot
+          v-if="slots['python-analysis']"
+          name="python-analysis"
+          :task-id="taskId"
+          :state="paneStates['python-analysis']"
           :mode="mode"
         />
       </TaskResultPane>

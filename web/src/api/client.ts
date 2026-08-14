@@ -22,6 +22,12 @@ import type {
   JavaAnalysisRun,
   JavaAnalysisRunListQuery,
   JavaAnalysisRunPage,
+  PythonAnalysisRun,
+  PythonAnalysisRunListQuery,
+  PythonAnalysisRunPage,
+  PythonAnalysisFinding,
+  PythonAnalysisFindingListQuery,
+  PythonAnalysisFindingPage,
   CompletedUpload,
   CreatedTask,
   CreateArchiveTaskBatchInput,
@@ -83,6 +89,12 @@ import {
   parseJavaAnalysisRun,
   parseJavaAnalysisRunPage,
 } from '@/api/javaAnalysisContract'
+import {
+  PythonAnalysisContractError,
+  parsePythonAnalysisFindingPage,
+  parsePythonAnalysisRun,
+  parsePythonAnalysisRunPage,
+} from '@/api/pythonAnalysisContract'
 import {
   DecompileProjectContractError,
   parseDecompileProject,
@@ -578,6 +590,99 @@ function invalidJavaAnalysisResponse(error: unknown): never {
   })
 }
 
+function invalidPythonAnalysisResponse(error: unknown): never {
+  if (!(error instanceof PythonAnalysisContractError)) throw error
+  throw new ApiError('Python 检测响应不符合接口契约', 502, {
+    code: 'INVALID_PYTHON_ANALYSIS_RESPONSE',
+  })
+}
+
+function buildPythonAnalysisRunQuery(query: PythonAnalysisRunListQuery): string {
+  const params = new URLSearchParams()
+  if (query.project_id) params.set('project_id', query.project_id)
+  if (query.cursor) params.set('cursor', query.cursor)
+  if (query.page_size !== undefined) params.set('page_size', String(query.page_size))
+  const value = params.toString()
+  return value ? `?${value}` : ''
+}
+
+function buildPythonAnalysisFindingQuery(
+  query: PythonAnalysisFindingListQuery,
+): string {
+  const params = new URLSearchParams()
+  if (query.cursor) params.set('cursor', query.cursor)
+  if (query.page_size !== undefined) params.set('page_size', String(query.page_size))
+  if (query.cwe) params.set('cwe', query.cwe)
+  if (query.severity) params.set('severity', query.severity)
+  if (query.file) params.set('file', query.file)
+  if (query.callable) params.set('callable', query.callable)
+  const value = params.toString()
+  return value ? `?${value}` : ''
+}
+
+async function createPythonAnalysisRun(
+  taskId: string,
+  projectId: string,
+  idempotencyKey: string,
+): Promise<PythonAnalysisRun> {
+  try {
+    const payload = await request<unknown>(
+      `/tasks/${encodeURIComponent(taskId)}/decompile-projects/${encodeURIComponent(projectId)}/python-analysis-runs`,
+      {
+        method: 'POST',
+        headers: { 'Idempotency-Key': idempotencyKey },
+      },
+    )
+    return parsePythonAnalysisRun(payload)
+  } catch (error) {
+    return invalidPythonAnalysisResponse(error)
+  }
+}
+
+async function listPythonAnalysisRuns(
+  taskId: string,
+  query: PythonAnalysisRunListQuery = {},
+): Promise<PythonAnalysisRunPage> {
+  try {
+    const payload = await request<unknown>(
+      `/tasks/${encodeURIComponent(taskId)}/python-analysis-runs${buildPythonAnalysisRunQuery(query)}`,
+    )
+    return parsePythonAnalysisRunPage(payload)
+  } catch (error) {
+    return invalidPythonAnalysisResponse(error)
+  }
+}
+
+async function getPythonAnalysisRun(
+  taskId: string,
+  runId: string,
+): Promise<PythonAnalysisRun> {
+  try {
+    const payload = await request<unknown>(
+      `/tasks/${encodeURIComponent(taskId)}/python-analysis-runs/${encodeURIComponent(runId)}`,
+    )
+    return parsePythonAnalysisRun(payload)
+  } catch (error) {
+    return invalidPythonAnalysisResponse(error)
+  }
+}
+
+async function listPythonAnalysisFindings(
+  taskId: string,
+  runId: string,
+  query: PythonAnalysisFindingListQuery = {},
+): Promise<PythonAnalysisFindingPage> {
+  try {
+    const payload = await request<unknown>(
+      `/tasks/${encodeURIComponent(taskId)}/python-analysis-runs/${encodeURIComponent(runId)}/findings${buildPythonAnalysisFindingQuery(query)}`,
+    )
+    return parsePythonAnalysisFindingPage(payload)
+  } catch (error) {
+    return invalidPythonAnalysisResponse(error)
+  }
+}
+
+
 function buildJavaAnalysisRunQuery(query: JavaAnalysisRunListQuery): string {
   const params = new URLSearchParams()
   if (query.project_id) params.set('project_id', query.project_id)
@@ -1003,6 +1108,26 @@ export const httpApi: ApiClient = {
       return invalidJavaAnalysisResponse(error)
     }
   },
+  createPythonAnalysisRun,
+  listPythonAnalysisRuns,
+  getPythonAnalysisRun,
+  listPythonAnalysisFindings,
+  cancelPythonAnalysisRun: async (taskId: string, runId: string) => {
+    try {
+      const payload = await request<unknown>(
+        `/tasks/${encodeURIComponent(taskId)}/python-analysis-runs/${encodeURIComponent(runId)}/cancel`,
+        { method: 'POST' },
+      )
+      return parsePythonAnalysisRun(payload)
+    } catch (error) {
+      return invalidPythonAnalysisResponse(error)
+    }
+  },
+  deletePythonAnalysisRun: (taskId: string, runId: string) =>
+    request<void>(
+      `/tasks/${encodeURIComponent(taskId)}/python-analysis-runs/${encodeURIComponent(runId)}`,
+      { method: 'DELETE' },
+    ),
   deleteJavaAnalysisRun: (taskId: string, runId: string) =>
     request<void>(
       `/tasks/${encodeURIComponent(taskId)}/java-analysis-runs/${encodeURIComponent(runId)}`,
@@ -1224,6 +1349,18 @@ export const api: ApiClient = {
     activeApi.cancelJavaAnalysisRun(taskId, runId),
   deleteJavaAnalysisRun: (taskId, runId) =>
     activeApi.deleteJavaAnalysisRun(taskId, runId),
+  createPythonAnalysisRun: (taskId, projectId, idempotencyKey) =>
+    activeApi.createPythonAnalysisRun(taskId, projectId, idempotencyKey),
+  listPythonAnalysisRuns: (taskId, query) =>
+    activeApi.listPythonAnalysisRuns(taskId, query),
+  getPythonAnalysisRun: (taskId, runId) =>
+    activeApi.getPythonAnalysisRun(taskId, runId),
+  listPythonAnalysisFindings: (taskId, runId, query) =>
+    activeApi.listPythonAnalysisFindings(taskId, runId, query),
+  cancelPythonAnalysisRun: (taskId, runId) =>
+    activeApi.cancelPythonAnalysisRun(taskId, runId),
+  deletePythonAnalysisRun: (taskId, runId) =>
+    activeApi.deletePythonAnalysisRun(taskId, runId),
   createManualImageScanRequest: (taskId, fileId, idempotencyKey) =>
     activeApi.createManualImageScanRequest(
       taskId,

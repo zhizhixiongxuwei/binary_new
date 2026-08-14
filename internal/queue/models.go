@@ -17,6 +17,7 @@ const (
 	KindDecompile    Kind = "decompile"
 	KindCAnalysis    Kind = "c_analysis"
 	KindJavaAnalysis Kind = "java_analysis"
+	KindPythonAnalysis Kind = "python_analysis"
 )
 
 type Outcome string

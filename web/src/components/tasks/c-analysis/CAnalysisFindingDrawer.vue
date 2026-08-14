@@ -3,6 +3,7 @@ import { Code2, ExternalLink, MapPin, ShieldAlert } from 'lucide-vue-next'
 import { computed, onBeforeUnmount, onMounted, shallowRef } from 'vue'
 
 import type { CAnalysisFinding } from '@/api/types'
+import { cFindingMessage } from '@/utils/analyzerMessages'
 
 const props = defineProps<{
   finding: CAnalysisFinding | undefined
@@ -91,7 +92,7 @@ const snippetLines = computed<readonly SnippetLine[]>(() => {
 
       <section>
         <h3><ShieldAlert :size="15" aria-hidden="true" />检测结论</h3>
-        <p>{{ finding.message }}</p>
+        <p>{{ cFindingMessage(finding.rule_id, finding.message) }}</p>
       </section>
 
       <dl>

@@ -79,6 +79,14 @@ const paneDefinitions: Record<TaskResultTab, PaneDefinition> = {
     unavailableTitle: 'Java 源码检测未接入',
     errorTitle: 'Java 源码检测读取失败',
   },
+  'python-analysis': {
+    title: 'Python 源码检测',
+    icon: FileCode2,
+    loadingTitle: '正在读取 Python 源码检测',
+    emptyTitle: '暂无 Python 源码检测结果',
+    unavailableTitle: 'Python 源码检测未接入',
+    errorTitle: 'Python 源码检测读取失败',
+  },
   vulnerabilities: {
     title: '容器漏洞',
     icon: ShieldCheck,
