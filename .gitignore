@@ -16,3 +16,6 @@ worker
 api
 docker/pycdc
 __pycache__/
+
+# IDE
+.idea/
