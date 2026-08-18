@@ -52,7 +52,7 @@ async function confirmDeleteRun(): Promise<void> {
   try {
     await ElMessageBox.confirm(
       `将删除检测版本 ${run.id.slice(-8)} 的全部发现和关联报告，不会删除反编译源码项目。`,
-      '删除 Java 源码检测记录？',
+      '删除 Python 源码检测记录？',
       {
         confirmButtonText: '删除记录',
         cancelButtonText: '保留记录',

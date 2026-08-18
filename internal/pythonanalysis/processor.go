@@ -274,7 +274,7 @@ func (p *Processor) loadSources(
 		}
 		sources = append(sources, SourceFile{
 			FileIdentity: FileIdentity{
-				ResultID:    cleaned,
+				ResultID:    file.ResultID,
 				LogicalPath: cleaned,
 				BinaryName:  cleaned,
 			},

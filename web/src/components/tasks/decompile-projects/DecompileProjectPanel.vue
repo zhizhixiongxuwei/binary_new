@@ -36,6 +36,7 @@ const emit = defineEmits<{
   deleted: [projectId: string]
   analyze: [projectId: string]
   analyzeJava: [projectId: string]
+  analyzePython: [projectId: string]
 }>()
 
 const selectedProject = shallowRef<DecompileProject | null>(null)
@@ -223,11 +224,13 @@ defineExpose({ refresh })
         :deleting-project-id="projects.deletingProjectId.value"
         :latest-c-analysis-by-project="projects.latestCAnalysisByProject.value"
         :latest-java-analysis-by-project="projects.latestJavaAnalysisByProject.value"
+        :latest-python-analysis-by-project="projects.latestPythonAnalysisByProject.value"
         :can-analyze="projects.canDelete.value"
         @download="projects.downloadProject($event.id)"
         @delete="openDelete"
         @analyze="emit('analyze', $event.id)"
         @analyze-java="emit('analyzeJava', $event.id)"
+        @analyze-python="emit('analyzePython', $event.id)"
         @load-more="projects.loadMore"
       />
     </template>

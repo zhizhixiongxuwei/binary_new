@@ -53,7 +53,7 @@ function runLabel(run: PythonAnalysisRun): string {
         <el-select
           :model-value="selectedProjectId"
           :disabled="creating || cancelling || deleting"
-          aria-label="选择 Java 源码项目"
+          aria-label="选择 Python 源码项目"
           @update:model-value="$emit('projectChange', String($event))"
         >
           <el-option
@@ -71,7 +71,7 @@ function runLabel(run: PythonAnalysisRun): string {
           :disabled="creating || cancelling || deleting"
           clearable
           placeholder="尚未检测"
-          aria-label="选择 Java 源码检测版本"
+          aria-label="选择 Python 源码检测版本"
           @update:model-value="$emit('runChange', String($event ?? ''))"
         >
           <el-option
@@ -84,7 +84,7 @@ function runLabel(run: PythonAnalysisRun): string {
       </label>
     </div>
 
-    <div class="analysis-toolbar__actions" aria-label="Java 源码检测操作">
+    <div class="analysis-toolbar__actions" aria-label="Python 源码检测操作">
       <el-button
         type="primary"
         :disabled="!canCreate"
@@ -117,8 +117,8 @@ function runLabel(run: PythonAnalysisRun): string {
       <button
         class="analysis-toolbar__refresh"
         type="button"
-        title="刷新 Java 源码检测"
-        aria-label="刷新 Java 源码检测"
+        title="刷新 Python 源码检测"
+        aria-label="刷新 Python 源码检测"
         :disabled="creating || cancelling || deleting"
         @click="$emit('refresh')"
       >

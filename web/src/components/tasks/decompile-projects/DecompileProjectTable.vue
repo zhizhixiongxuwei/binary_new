@@ -7,6 +7,7 @@ import type {
   DecompileProjectStatus,
   CAnalysisRun,
   JavaAnalysisRun,
+  PythonAnalysisRun,
 } from '@/api/types'
 import { formatBytes, formatDateTime } from '@/utils/formatters'
 
@@ -19,6 +20,7 @@ defineProps<{
   deletingProjectId: string
   latestCAnalysisByProject: Readonly<Record<string, CAnalysisRun>>
   latestJavaAnalysisByProject: Readonly<Record<string, JavaAnalysisRun>>
+  latestPythonAnalysisByProject: Readonly<Record<string, PythonAnalysisRun>>
   canAnalyze: boolean
 }>()
 
@@ -27,6 +29,7 @@ defineEmits<{
   delete: [project: DecompileProject]
   analyze: [project: DecompileProject]
   analyzeJava: [project: DecompileProject]
+  analyzePython: [project: DecompileProject]
   loadMore: []
 }>()
 
@@ -58,6 +61,10 @@ const javaAnalysisStatusLabels: Readonly<
   Record<JavaAnalysisRun['status'], string>
 > = analysisStatusLabels
 
+const pythonAnalysisStatusLabels: Readonly<
+  Record<PythonAnalysisRun['status'], string>
+> = analysisStatusLabels
+
 function supportsCAnalysis(project: DecompileProject): boolean {
   return project.layout_version === 'project-v1' &&
     project.source_kind === 'ghidra-pseudoc' &&
@@ -73,11 +80,23 @@ function supportsJavaAnalysis(project: DecompileProject): boolean {
     (project.status === 'complete' || project.status === 'partial')
 }
 
+function supportsPythonAnalysis(project: DecompileProject): boolean {
+  return project.layout_version === 'project-v1' &&
+    project.manifest_available &&
+    project.source_kind === 'python' &&
+    (project.language === 'python' || project.language === 'mixed') &&
+    (project.status === 'complete' || project.status === 'partial')
+}
+
 function analysisActive(run: CAnalysisRun | undefined): boolean {
   return Boolean(run && ['queued', 'running', 'cancel_requested'].includes(run.status))
 }
 
 function javaAnalysisActive(run: JavaAnalysisRun | undefined): boolean {
+  return Boolean(run && ['queued', 'running', 'cancel_requested'].includes(run.status))
+}
+
+function pythonAnalysisActive(run: PythonAnalysisRun | undefined): boolean {
   return Boolean(run && ['queued', 'running', 'cancel_requested'].includes(run.status))
 }
 
@@ -141,6 +160,11 @@ function engineLabel(project: DecompileProject): string {
             ? javaAnalysisStatusLabels[latestJavaAnalysisByProject[project.id]!.status]
             : '未执行' }}
         </small>
+        <small v-else-if="supportsPythonAnalysis(project)" class="analysis-status">
+          Python 检测：{{ latestPythonAnalysisByProject[project.id]
+            ? pythonAnalysisStatusLabels[latestPythonAnalysisByProject[project.id]!.status]
+            : '未执行' }}
+        </small>
         <small v-else class="analysis-status">
           源码检测：不适用
         </small>
@@ -182,6 +206,20 @@ function engineLabel(project: DecompileProject): string {
               Boolean(downloadingProjectId)
           "
           @click="$emit('analyzeJava', project)"
+        >
+          <FileCode2 :size="14" aria-hidden="true" />
+        </button>
+        <button
+          v-if="canAnalyze && supportsPythonAnalysis(project)"
+          type="button"
+          title="对该源码项目执行 Python 检测"
+          :aria-label="`对源码项目 ${project.id} 执行 Python 检测`"
+          :disabled="
+            pythonAnalysisActive(latestPythonAnalysisByProject[project.id]) ||
+              Boolean(deletingProjectId) ||
+              Boolean(downloadingProjectId)
+          "
+          @click="$emit('analyzePython', project)"
         >
           <FileCode2 :size="14" aria-hidden="true" />
         </button>

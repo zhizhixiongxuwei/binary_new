@@ -8,4 +8,4 @@ RUN mkdir -p /opt/bytecode-tools/pycdc \
 LABEL org.opencontainers.image.title="BinaryScan pycdc tools" \
       com.binaryscan.product="binaryscan" \
       com.binaryscan.dependency-role="pycdc-tools" \
-      com.binaryscan.pycdc-version="1.1.1"
+      com.binaryscan.pycdc-version="1.2.0"

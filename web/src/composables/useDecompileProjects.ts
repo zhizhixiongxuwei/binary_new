@@ -12,6 +12,7 @@ import { api, ApiError } from '@/api/client'
 import type {
   CAnalysisRun,
   JavaAnalysisRun,
+  PythonAnalysisRun,
   ConfirmDecompileProjectDeletionInput,
   DecompileProject,
   DecompileProjectDeletionOperation,
@@ -55,6 +56,9 @@ export function useDecompileProjects(options: UseDecompileProjectsOptions) {
   >({})
   const latestJavaAnalysisByProject = shallowRef<
     Readonly<Record<string, JavaAnalysisRun>>
+  >({})
+  const latestPythonAnalysisByProject = shallowRef<
+    Readonly<Record<string, PythonAnalysisRun>>
   >({})
   const blobReleaseTimers = new Map<
     string,
@@ -108,6 +112,7 @@ export function useDecompileProjects(options: UseDecompileProjectsOptions) {
     deletionOperations.value = {}
     latestCAnalysisByProject.value = {}
     latestJavaAnalysisByProject.value = {}
+    latestPythonAnalysisByProject.value = {}
     for (const timer of deletionPollTimers.values()) {
       globalThis.clearTimeout(timer)
     }
@@ -246,6 +251,38 @@ export function useDecompileProjects(options: UseDecompileProjectsOptions) {
     }
   }
 
+  async function loadLatestPythonAnalysis(
+    taskId: string,
+    currentScope: number,
+  ): Promise<void> {
+    const latest: Record<string, PythonAnalysisRun> = {}
+    let cursor = ''
+    try {
+      do {
+        const page = await api.listPythonAnalysisRuns(taskId, {
+          page_size: 100,
+          ...(cursor ? { cursor } : {}),
+        })
+        if (
+          currentScope !== scopeGeneration ||
+          taskId !== toValue(options.taskId) ||
+          !isEnabled()
+        ) {
+          return
+        }
+        for (const run of page.items) {
+          latest[run.source_project_id] ??= run
+        }
+        cursor = page.next_cursor ?? ''
+      } while (cursor && Object.keys(latest).length < 1_000)
+      latestPythonAnalysisByProject.value = latest
+    } catch {
+      if (currentScope === scopeGeneration) {
+        latestPythonAnalysisByProject.value = {}
+      }
+    }
+  }
+
   async function load(append = false): Promise<void> {
     const taskId = toValue(options.taskId)
     if (!taskId || !isEnabled()) return
@@ -288,6 +325,7 @@ export function useDecompileProjects(options: UseDecompileProjectsOptions) {
       nextCursor.value = page.next_cursor ?? ''
       void loadLatestCAnalysis(taskId, currentScope)
       void loadLatestJavaAnalysis(taskId, currentScope)
+      void loadLatestPythonAnalysis(taskId, currentScope)
     } catch (caught) {
       if (
         currentScope !== scopeGeneration ||
@@ -545,6 +583,7 @@ export function useDecompileProjects(options: UseDecompileProjectsOptions) {
     activeDeletionOperationCount,
     latestCAnalysisByProject: readonly(latestCAnalysisByProject),
     latestJavaAnalysisByProject: readonly(latestJavaAnalysisByProject),
+    latestPythonAnalysisByProject: readonly(latestPythonAnalysisByProject),
     canDelete,
     hasMore,
     clearOperationError,

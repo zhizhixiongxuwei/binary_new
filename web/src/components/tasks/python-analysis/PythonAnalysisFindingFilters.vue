@@ -99,7 +99,7 @@ function reset(): void {
       class="finding-filters__reset"
       type="button"
       title="重置筛选"
-      aria-label="重置 Java 源码检测筛选"
+      aria-label="重置 Python 源码检测筛选"
       :disabled="disabled"
       @click="reset"
     >

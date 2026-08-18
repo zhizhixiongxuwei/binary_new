@@ -18,13 +18,17 @@ describe('taskResultProfile', () => {
     },
   )
 
-  it('keeps Python bytecode on the decompile-only result profile', () => {
-    expect(taskResultTabsForInputType('pyc')).toEqual([
-      'files',
-      'decompile',
-      'reports',
-    ])
-  })
+  it.each(['pyc', 'python-bytecode'])(
+    'adds Python source analysis for %s tasks',
+    (inputType) => {
+      expect(taskResultTabsForInputType(inputType)).toEqual([
+        'files',
+        'decompile',
+        'python-analysis',
+        'reports',
+      ])
+    },
+  )
 
   it.each(['pe32+', 'elf64', 'macho-thin'])(
     'adds C source analysis for native %s tasks',

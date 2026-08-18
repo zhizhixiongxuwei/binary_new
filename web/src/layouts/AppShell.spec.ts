@@ -66,10 +66,10 @@ describe('AppShell', () => {
     expect(wrapper.get('.nav-item[href="/"]').attributes('aria-current')).toBe('page')
     expect(wrapper.text()).toContain('系统管理员')
     expect(wrapper.get('.brand').attributes('aria-label')).toBe(
-      '库博二进制静态分析平台',
+      '库博二进制代码静态分析工具系统V1.0',
     )
     expect(wrapper.get('.brand-copy').text()).toContain('库博')
-    expect(wrapper.get('.brand-copy').text()).toContain('二进制静态分析平台')
+    expect(wrapper.get('.brand-copy').text()).toContain('二进制代码静态分析工具系统V1.0')
 
     wrapper.unmount()
   })

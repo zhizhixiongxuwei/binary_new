@@ -32,7 +32,7 @@ export interface PythonAnalysisFilters {
 }
 
 const PROJECT_PAGE_SIZE = 100
-const RUN_PAGE_SIZE = 200
+const RUN_PAGE_SIZE = 100
 const FINDING_PAGE_SIZE = 100
 const MAX_SELECTOR_ITEMS = 1_000
 const POLL_INTERVAL_MS = 2_000
@@ -60,8 +60,8 @@ function eligibleProject(project: DecompileProject): boolean {
   return (
     project.layout_version === 'project-v1' &&
     project.manifest_available &&
-    project.source_kind === 'java' &&
-    (project.language === 'java' || project.language === 'mixed') &&
+    project.source_kind === 'python' &&
+    (project.language === 'python' || project.language === 'mixed') &&
     (project.status === 'complete' || project.status === 'partial')
   )
 }
@@ -148,14 +148,14 @@ export function usePythonAnalysis(options: UsePythonAnalysisOptions) {
     if (loading.value) {
       return {
         status: 'loading',
-        title: '正在读取 Java 源码检测',
-        description: '正在加载可检测的 Java 源码项目和历史运行。',
+        title: '正在读取 Python 源码检测',
+        description: '正在加载可检测的 Python 源码项目和历史运行。',
       }
     }
     if (error.value) {
       return {
         status: 'error',
-        title: 'Java 源码检测读取失败',
+        title: 'Python 源码检测读取失败',
         description: error.value,
         ...(errorCode.value ? { errorCode: errorCode.value } : {}),
       }
@@ -163,8 +163,8 @@ export function usePythonAnalysis(options: UsePythonAnalysisOptions) {
     if (projects.value.length === 0) {
       return {
         status: 'empty',
-        title: '暂无可检测的 Java 源码项目',
-        description: '请先完成 Java 反编译并保存 project-v1 源码项目。',
+        title: '暂无可检测的 Python 源码项目',
+        description: '请先完成 PYC 反编译并保存 project-v1 源码项目。',
       }
     }
     return { status: 'ready' }
@@ -324,7 +324,7 @@ export function usePythonAnalysis(options: UsePythonAnalysisOptions) {
       if (currentGeneration !== generation || taskId !== toValue(options.taskId)) {
         return
       }
-      error.value = messageFor(caught, 'Java 源码检测读取失败')
+      error.value = messageFor(caught, 'Python 源码检测读取失败')
       errorCode.value = caught instanceof ApiError ? (caught.code ?? '') : ''
       projects.value = []
       runs.value = []

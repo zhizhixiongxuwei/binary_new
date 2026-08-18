@@ -55,9 +55,9 @@ describe('LoginView', () => {
       global: { stubs: { LoginForm: LoginFormStub } },
     })
 
-    expect(wrapper.get('h1').text()).toBe('库博二进制静态分析平台')
+    expect(wrapper.get('h1').text()).toBe('库博二进制代码静态分析工具系统V1.0')
     expect(wrapper.get('.login-footer').text()).toContain(
-      '库博二进制静态分析平台',
+      '库博二进制代码静态分析工具系统V1.0',
     )
   })
 

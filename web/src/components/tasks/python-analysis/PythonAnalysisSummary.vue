@@ -39,7 +39,7 @@ const coveragePercent = computed(() =>
 </script>
 
 <template>
-  <section class="analysis-summary" aria-label="Java 源码检测汇总">
+  <section class="analysis-summary" aria-label="Python 源码检测汇总">
     <div class="analysis-summary__identity">
       <CircleCheck
         v-if="run.status === 'succeeded'"
@@ -75,7 +75,7 @@ const coveragePercent = computed(() =>
     </div>
   </section>
 
-  <section class="analysis-meta" aria-label="Java 源码检测版本信息">
+  <section class="analysis-meta" aria-label="Python 源码检测版本信息">
     <span><small>检测器</small><code>{{ run.analyzer_name }} {{ run.analyzer_version }}</code></span>
     <span><small>规则集</small><code>{{ run.ruleset_version || '等待引擎返回' }}</code></span>
     <span><small>源码</small><code>{{ formatBytes(run.source_size_bytes) }} · {{ run.source_file_count }} 文件</code></span>

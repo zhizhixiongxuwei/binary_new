@@ -1065,6 +1065,7 @@ function handleReportState(state: TaskResultState): void {
           @deleted="handleDecompileProjectDeleted"
           @analyze="startCAnalysisProject"
           @analyze-java="startJavaAnalysisProject"
+          @analyze-python="startPythonAnalysisProject"
         />
       </template>
     </TaskDetailTabs>

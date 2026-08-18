@@ -93,6 +93,7 @@ func (result Result) SeverityCounts() (low, medium, high, critical int) {
 
 // ManifestFile is one manifest-verified source file of the project.
 type ManifestFile struct {
+	ResultID    string
 	LogicalPath string
 	SHA256      string
 	SizeBytes   uint64

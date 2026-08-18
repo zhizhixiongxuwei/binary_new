@@ -351,7 +351,6 @@ ORDER BY result.storage_key ASC, result.id ASC`,
 		); err != nil {
 			return nil, fmt.Errorf("scan python source file: %w", err)
 		}
-		_ = resultID
 		if !logicalPath.Valid || logicalPath.String == "" ||
 			!validRelativePath(logicalPath.String) ||
 			logicalPath.String == previousPath ||
@@ -360,6 +359,7 @@ ORDER BY result.storage_key ASC, result.id ASC`,
 			return nil, ErrSourceUnavailable
 		}
 		previousPath = logicalPath.String
+		file.ResultID = resultID
 		file.LogicalPath = logicalPath.String
 		file.SHA256 = digest.String
 		file.SizeBytes = size.V
@@ -462,11 +462,13 @@ INSERT INTO python_analysis_findings (
     logical_path, binary_name, callable_kind, type_name, callable_name,
     callable_signature, start_line, start_column, end_line, end_column,
     message, snippet, snippet_start_line, created_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'module', '', '', '',
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
     ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(6))`,
 		lease.TaskID, metadata.RunID, finding.CWE, finding.RuleID,
 		finding.Severity, fileResultID, finding.File.LogicalPath,
-		finding.File.BinaryName, finding.Location.StartLine,
+		finding.File.BinaryName, finding.Callable.Kind,
+		finding.Callable.TypeName, finding.Callable.Name,
+		finding.Callable.Signature, finding.Location.StartLine,
 		finding.Location.StartColumn, finding.Location.EndLine,
 		finding.Location.EndColumn, finding.Message,
 		snippet, snippetLine,

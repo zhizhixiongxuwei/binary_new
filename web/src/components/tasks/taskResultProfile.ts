@@ -62,6 +62,11 @@ const JAVA_DECOMPILE_FORMATS = new Set([
   'apk',
 ])
 
+const PYTHON_DECOMPILE_FORMATS = new Set([
+  'pyc',
+  'python-bytecode',
+])
+
 const DECOMPILE_RESULT_TABS = [
   'files',
   'decompile',
@@ -79,6 +84,13 @@ const JAVA_DECOMPILE_RESULT_TABS = [
   'files',
   'decompile',
   'java-analysis',
+  'reports',
+] as const satisfies readonly TaskResultTab[]
+
+const PYTHON_DECOMPILE_RESULT_TABS = [
+  'files',
+  'decompile',
+  'python-analysis',
   'reports',
 ] as const satisfies readonly TaskResultTab[]
 
@@ -106,6 +118,9 @@ export function taskResultTabsForInputType(
   }
   if (JAVA_DECOMPILE_FORMATS.has(normalized)) {
     return JAVA_DECOMPILE_RESULT_TABS
+  }
+  if (PYTHON_DECOMPILE_FORMATS.has(normalized)) {
+    return PYTHON_DECOMPILE_RESULT_TABS
   }
   if (DECOMPILE_FORMATS.has(normalized)) return DECOMPILE_RESULT_TABS
 

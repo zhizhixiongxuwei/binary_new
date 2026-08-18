@@ -1,6 +1,7 @@
 package bytecode
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -42,7 +43,7 @@ type PYCSourceConfig struct {
 
 const (
 	PYCSourceEngineName    = "pycdc"
-	PYCSourceEngineVersion = "1.1.1"
+	PYCSourceEngineVersion = "1.2.0"
 	pycSourceArtifactName  = "main.py"
 	pycSourceModuleName    = "main"
 
@@ -208,6 +209,19 @@ func (engine *PYCSourceEngine) Decompile(
 		return engine.fallback.Decompile(ctx, request)
 	}
 
+	// pycdc reports partial decompilation with an embedded marker or via
+	// stderr diagnostics even when it exits successfully. Keep the usable
+	// source and surface the caveat through warnings instead of silently
+	// treating the output as complete.
+	warnings := []string{}
+	if bytes.Contains(result.Stdout, []byte("# WARNING: Decompyle incomplete")) ||
+		bytes.Contains(result.Stderr, []byte("Unsupported opcode")) ||
+		bytes.Contains(result.Stderr, []byte("Something TERRIBLE happened")) {
+		warnings = append(warnings,
+			"pycdc decompilation is incomplete: the saved source may omit code sections",
+		)
+	}
+
 	artifactID := pycStableKey("source", request.Input.SHA256, pycSourceArtifactName)
 	digestBytes := sha256.Sum256(result.Stdout)
 	moduleKey := pycStableKey("module", request.Input.SHA256, pycSourceModuleName)
@@ -244,7 +258,7 @@ func (engine *PYCSourceEngine) Decompile(
 		}},
 		Artifacts:   []Artifact{artifact},
 		ClassErrors: []ClassError{},
-		Warnings:    []string{},
+		Warnings:    warnings,
 		Execution: &Execution{
 			DurationMS: result.Duration.Milliseconds(), ExitCode: result.ExitCode,
 			OutputBytes: result.OutputBytes, OutputFiles: result.OutputFiles,

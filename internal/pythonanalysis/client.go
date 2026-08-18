@@ -158,7 +158,9 @@ func (c *HTTPClient) Analyze(
 		rejection := parseRejection(response.StatusCode, body)
 		return Result{}, rejection
 	}
-	return parseResult(body, c.maxFindings, c.maxDiagnostics)
+	return parseResult(
+		body, c.maxFindings, c.maxDiagnostics, request.Source,
+	)
 }
 
 // Ready verifies the checker health endpoint.
@@ -221,7 +223,16 @@ func parseRejection(status int, body []byte) error {
 	}
 }
 
-func parseResult(body []byte, maxFindings int, maxDiagnostics int) (Result, error) {
+func parseResult(
+	body []byte,
+	maxFindings int,
+	maxDiagnostics int,
+	sources []SourceFile,
+) (Result, error) {
+	resultIDByPath := make(map[string]string, len(sources))
+	for _, source := range sources {
+		resultIDByPath[source.LogicalPath] = source.ResultID
+	}
 	if len(body) == 0 {
 		return Result{}, ErrInvalidResponse
 	}
@@ -274,16 +285,22 @@ func parseResult(body []byte, maxFindings int, maxDiagnostics int) (Result, erro
 			!validSeverity(raw.Severity) {
 			return Result{}, ErrInvalidResponse
 		}
+		resultID := resultIDByPath[raw.File.LogicalPath]
+		if resultID == "" {
+			return Result{}, ErrInvalidResponse
+		}
 		line := uint32(raw.Line)
 		result.Findings = append(result.Findings, Finding{
 			RuleID: raw.RuleID, CWE: raw.CWE, Severity: raw.Severity,
 			File: FileIdentity{
-				ResultID:    raw.File.LogicalPath,
+				ResultID:    resultID,
 				LogicalPath: raw.File.LogicalPath,
 				BinaryName:  raw.File.LogicalPath,
 			},
 			Callable: CallableIdentity{
-				Kind: "module", Name: raw.File.LogicalPath,
+				Kind:     "module",
+				TypeName: "module",
+				Name:     raw.File.LogicalPath,
 			},
 			Location: Location{
 				StartLine: line, StartColumn: 1,
@@ -297,11 +314,15 @@ func parseResult(body []byte, maxFindings int, maxDiagnostics int) (Result, erro
 			raw.Message == "" || len(raw.Message) > MaxMessageBytes {
 			return Result{}, ErrInvalidResponse
 		}
+		resultID := resultIDByPath[raw.File.LogicalPath]
+		if resultID == "" {
+			return Result{}, ErrInvalidResponse
+		}
 		line := uint32(raw.Line)
 		result.Diagnostics = append(result.Diagnostics, Diagnostic{
 			Code: raw.Code, Message: raw.Message, Severity: raw.Severity,
 			File: &DiagnosticFile{
-				ResultID:    raw.File.LogicalPath,
+				ResultID:    resultID,
 				LogicalPath: raw.File.LogicalPath,
 				BinaryName:  raw.File.LogicalPath,
 			},

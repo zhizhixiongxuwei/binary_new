@@ -78,7 +78,7 @@ const snippetLines = computed<readonly SnippetLine[]>(() => {
 <template>
   <el-drawer
     :model-value="finding !== undefined"
-    title="Java 源码检测详情"
+    title="Python 源码检测详情"
     :size="drawerSize"
     append-to-body
     @update:model-value="handleVisibility"
@@ -132,7 +132,7 @@ const snippetLines = computed<readonly SnippetLine[]>(() => {
           class="snippet-code"
           role="region"
           tabindex="0"
-          aria-label="Java 源码检测片段"
+          aria-label="Python 源码检测片段"
         >
           <div
             v-for="line in snippetLines"
@@ -154,7 +154,7 @@ const snippetLines = computed<readonly SnippetLine[]>(() => {
         @click="emit('openSource', finding.file.result_id)"
       >
         <ExternalLink :size="14" aria-hidden="true" />
-        打开 Java 源码
+        打开 Python 源码
       </el-button>
     </article>
   </el-drawer>

@@ -59,10 +59,10 @@ async function login(page: Page, target = '/'): Promise<void> {
   await expect(
     page.getByRole('heading', {
       level: 1,
-      name: '库博二进制静态分析平台',
+      name: '库博二进制代码静态分析工具系统V1.0',
     }),
   ).toBeVisible()
-  await expect(page).toHaveTitle('库博二进制静态分析平台')
+  await expect(page).toHaveTitle('库博二进制代码静态分析工具系统V1.0')
 
   await page.getByLabel('用户名').fill(username)
   await page.getByLabel('密码').fill(password)
@@ -77,7 +77,7 @@ async function login(page: Page, target = '/'): Promise<void> {
   )
   await expect(
     page.locator('.brand').getAttribute('aria-label'),
-  ).resolves.toBe('库博二进制静态分析平台')
+  ).resolves.toBe('库博二进制代码静态分析工具系统V1.0')
 }
 
 test('真实登录、首页、系统管理 API 与退出链路可用', async ({ page }) => {

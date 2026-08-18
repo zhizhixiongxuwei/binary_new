@@ -14,3 +14,5 @@ web/test-results*/
 reasonix.toml
 worker
 api
+docker/pycdc
+__pycache__/

@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest'
 import type {
   DecompileProject,
   JavaAnalysisRun,
+  PythonAnalysisRun,
 } from '@/api/types'
 import DecompileProjectTable from '@/components/tasks/decompile-projects/DecompileProjectTable.vue'
 
@@ -25,6 +26,60 @@ function project(id: string): DecompileProject {
     manifest_available: true,
     created_at: '2026-08-10T01:00:00Z',
     completed_at: '2026-08-10T01:01:00Z',
+  }
+}
+
+function pythonProject(id: string): DecompileProject {
+  return {
+    ...project(id),
+    target_path: `/app/${id}.py`,
+    source_kind: 'python',
+    language: 'python',
+    engine_name: 'pycdc',
+    engine_version: '1.2.0',
+  }
+}
+
+function pythonRun(projectId: string): PythonAnalysisRun {
+  return {
+    id: 'run-py-1',
+    task_id: 'task-1',
+    source_project_id: projectId,
+    source_project: {
+      id: projectId,
+      target_path: `/app/${projectId}.py`,
+      status: 'complete',
+      engine_name: 'pycdc',
+      engine_version: '1.2.0',
+    },
+    job_id: 'job-py-1',
+    status: 'running',
+    analyzer_name: 'binaryscan-python-checker',
+    analyzer_version: '0.1.0',
+    ruleset_version: '',
+    source_manifest_sha256: 'a'.repeat(64),
+    input_sha256: 'b'.repeat(64),
+    bundle_sha256: 'c'.repeat(64),
+    source_size_bytes: 4096,
+    source_file_count: 1,
+    finding_count: 0,
+    diagnostic_count: 0,
+    coverage: {
+      total_files: 1,
+      analyzed_files: 0,
+      parsed_files: 0,
+      recovered_files: 0,
+      failed_files: 0,
+    },
+    severity_counts: { LOW: 0, MEDIUM: 0, HIGH: 0, CRITICAL: 0 },
+    findings_truncated: false,
+    diagnostics_truncated: false,
+    error_code: null,
+    error_message: null,
+    started_at: '2026-08-10T01:02:00Z',
+    completed_at: null,
+    created_at: '2026-08-10T01:02:00Z',
+    updated_at: '2026-08-10T01:02:00Z',
   }
 }
 
@@ -92,6 +147,7 @@ describe('DecompileProjectTable Java analysis action', () => {
         latestJavaAnalysisByProject: {
           [active.id]: activeRun(active.id),
         },
+        latestPythonAnalysisByProject: {},
       },
       global: {
         stubs: {
@@ -120,5 +176,58 @@ describe('DecompileProjectTable Java analysis action', () => {
 
     await readyButton.trigger('click')
     expect(wrapper.emitted('analyzeJava')).toEqual([[available]])
+  })
+})
+
+describe('DecompileProjectTable Python analysis action', () => {
+  it('offers Python detection only for eligible pyc projects', async () => {
+    const available = pythonProject('project-py-ready')
+    const active = pythonProject('project-py-active')
+    const unavailable = {
+      ...pythonProject('project-py-no-manifest'),
+      manifest_available: false,
+    }
+    const wrapper = mount(DecompileProjectTable, {
+      props: {
+        projects: [available, active, unavailable],
+        canDelete: true,
+        canAnalyze: true,
+        loadingMore: false,
+        hasMore: false,
+        downloadingProjectId: '',
+        deletingProjectId: '',
+        latestCAnalysisByProject: {},
+        latestJavaAnalysisByProject: {},
+        latestPythonAnalysisByProject: {
+          [active.id]: pythonRun(active.id),
+        },
+      },
+      global: {
+        stubs: {
+          ElButton: {
+            template: '<button type="button"><slot /></button>',
+          },
+        },
+      },
+    })
+
+    const readyButton = wrapper.get(
+      `button[aria-label="对源码项目 ${available.id} 执行 Python 检测"]`,
+    )
+    const activeButton = wrapper.get(
+      `button[aria-label="对源码项目 ${active.id} 执行 Python 检测"]`,
+    )
+    expect(readyButton.attributes('disabled')).toBeUndefined()
+    expect(activeButton.attributes('disabled')).toBeDefined()
+    expect(
+      wrapper.find(
+        `button[aria-label="对源码项目 ${unavailable.id} 执行 Python 检测"]`,
+      ).exists(),
+    ).toBe(false)
+    expect(wrapper.text()).toContain('Python 检测：未执行')
+    expect(wrapper.text()).toContain('Python 检测：检测中')
+
+    await readyButton.trigger('click')
+    expect(wrapper.emitted('analyzePython')).toEqual([[available]])
   })
 })
